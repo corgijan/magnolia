@@ -20,6 +20,7 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(handlers::health))
         .route("/api/v1/whoami", get(handlers::whoami))
+        .route("/api/v1/config", get(handlers::config))
         .route("/api/v1/upload", post(handlers::upload_sbom))
         .route(
             "/api/v1/tree-head/latest",
@@ -46,6 +47,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/manifests/current",
             get(handlers::current_manifests),
+        )
+        .route(
+            "/api/v1/namespaces/hidden",
+            get(handlers::list_hidden_namespaces).post(handlers::set_namespace_hidden),
         )
         .route(
             "/api/v1/keys",

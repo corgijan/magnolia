@@ -5,6 +5,7 @@ import {
   ApiKeyInfo,
   AuditEntry,
   ConsistencyProof,
+  BackendConfig,
   CreateKeyResponse,
   CreateTenantResponse,
   CurrentManifest,
@@ -62,9 +63,9 @@ function useTenantOverride(): string | undefined {
 type TabGroup = 'workspace' | 'admin';
 
 const TABS: { id: Tab; label: string; requires: RbacAction; group: TabGroup }[] = [
-  { id: 'dashboard', label: 'Dashboard', requires: 'read', group: 'workspace' },
+  { id: 'leaves', label: 'Dashboard', requires: 'read', group: 'workspace' },
+  { id: 'dashboard', label: 'Info', requires: 'read', group: 'workspace' },
   { id: 'upload', label: 'Upload SBOM', requires: 'upload', group: 'workspace' },
-  { id: 'leaves', label: 'SBOM Explorer', requires: 'read', group: 'workspace' },
   { id: 'proofs', label: 'Proofs', requires: 'read', group: 'workspace' },
   { id: 'keys', label: 'API Keys', requires: 'manage_keys', group: 'admin' },
   { id: 'tenants', label: 'Tenants', requires: 'manage_tenants', group: 'admin' },
@@ -198,21 +199,44 @@ function Dashboard({
   headError: string;
 }) {
   const [health, setHealth] = useState<boolean | null>(null);
+  const [config, setConfig] = useState<BackendConfig | null>(null);
 
   useEffect(() => {
     let mounted = true;
     api.health().then((ok) => mounted && setHealth(ok));
+    api.config().then((c) => mounted && setConfig(c)).catch(() => mounted && setConfig(null));
     return () => {
       mounted = false;
     };
   }, []);
 
   return (
-    <div className="card">
-      <div className="card-header">
-        <h2>Signed Tree Head</h2>
-        <button className="btn" onClick={onRefresh}>Refresh</button>
-      </div>
+    <>
+      {config && (
+        <div className="card">
+          <h2>Backend Configuration</h2>
+          <div className="kv-row">
+            <span className="kv-label">Storage backend</span>
+            <Badge ok={config.storage_backend !== 'in-memory'}>{config.storage_backend}</Badge>
+            {config.storage_backend === 'in-memory' && (
+              <span className="muted"> — uploaded SBOM content will not survive a server restart</span>
+            )}
+          </div>
+          <div className="kv-row">
+            <span className="kv-label">Signer backend</span>
+            <span>{config.signer_backend}</span>
+          </div>
+          <div className="kv-row">
+            <span className="kv-label">DEV_MODE</span>
+            <Badge ok={!config.dev_mode}>{config.dev_mode ? 'on — RBAC relaxed' : 'off'}</Badge>
+          </div>
+        </div>
+      )}
+      <div className="card">
+        <div className="card-header">
+          <h2>Signed Tree Head</h2>
+          <button className="btn" onClick={onRefresh}>Refresh</button>
+        </div>
       <div className="kv-row">
         <span className="kv-label">Server</span>
         {health === null ? <span>checking…</span> : <Badge ok={health}>{health ? 'online' : 'offline'}</Badge>}
@@ -259,7 +283,8 @@ function Dashboard({
           No tree head yet — this tenant hasn't uploaded an SBOM.
         </div>
       )}
-    </div>
+      </div>
+    </>
   );
 }
 
@@ -871,16 +896,30 @@ function NamespaceFolderRow({
   node,
   depth,
   onViewSbom,
+  hiddenNamespaces,
+  onToggleHidden,
 }: {
   node: NamespaceTreeNode;
   depth: number;
   onViewSbom: (hash: string) => void;
+  hiddenNamespaces: Set<string>;
+  onToggleHidden: (namespace: string, hidden: boolean) => void;
 }) {
   // depth 0 is now the org/domain root, so expand it and its immediate
   // children by default — otherwise everything would start collapsed
   // behind one extra click.
   const [open, setOpen] = useState(depth < 2);
   const hasContent = node.children.length > 0 || node.leaves.length > 0;
+  // Only nodes with leaves directly on them are real namespaces (something
+  // was actually uploaded there) — purely structural path segments (e.g.
+  // "products" grouping "products/v1", "products/v2") aren't toggleable,
+  // since "current" tracking is per exact namespace, not per path prefix.
+  // depth 0 (the domain root) is excluded too: buildNamespaceTree gives it
+  // `id = domain`, not the literal namespace "/", so toggling from here
+  // would target the wrong key — a namespace of exactly "/" can't be
+  // toggled from the tree view yet.
+  const isRealNamespace = node.leaves.length > 0 && depth > 0;
+  const isHidden = isRealNamespace && hiddenNamespaces.has(node.id);
   return (
     <div>
       <div
@@ -896,6 +935,20 @@ function NamespaceFolderRow({
           ({node.leaves.length} SBOM{node.leaves.length === 1 ? '' : 's'}
           {node.children.length > 0 ? `, ${node.children.length} sub` : ''})
         </span>
+        {isRealNamespace && (
+          <label
+            className="checkbox-field namespace-hidden-toggle"
+            onClick={(e) => e.stopPropagation()}
+            title="Show this namespace in the 'Currently running' view"
+          >
+            <input
+              type="checkbox"
+              checked={!isHidden}
+              onChange={(e) => onToggleHidden(node.id, !e.target.checked)}
+            />
+            in "Currently running"
+          </label>
+        )}
       </div>
       {open && (
         <>
@@ -903,7 +956,14 @@ function NamespaceFolderRow({
             <SbomLeafRow key={leaf.seq_id} leaf={leaf} depth={depth + 1} onViewSbom={onViewSbom} />
           ))}
           {node.children.map((child) => (
-            <NamespaceFolderRow key={child.id} node={child} depth={depth + 1} onViewSbom={onViewSbom} />
+            <NamespaceFolderRow
+              key={child.id}
+              node={child}
+              depth={depth + 1}
+              onViewSbom={onViewSbom}
+              hiddenNamespaces={hiddenNamespaces}
+              onToggleHidden={onToggleHidden}
+            />
           ))}
         </>
       )}
@@ -911,7 +971,17 @@ function NamespaceFolderRow({
   );
 }
 
-function NamespaceTree({ leaves, onViewSbom }: { leaves: Leaf[]; onViewSbom: (hash: string) => void }) {
+function NamespaceTree({
+  leaves,
+  onViewSbom,
+  hiddenNamespaces,
+  onToggleHidden,
+}: {
+  leaves: Leaf[];
+  onViewSbom: (hash: string) => void;
+  hiddenNamespaces: Set<string>;
+  onToggleHidden: (namespace: string, hidden: boolean) => void;
+}) {
   // All leaves in one call belong to one tenant, so they share one domain —
   // shown as the tree's root folder, e.g. "myorg.example" > "products" >
   // "v1" > (SBOM), which reads the same as "myorg.example/products/v1".
@@ -922,7 +992,13 @@ function NamespaceTree({ leaves, onViewSbom }: { leaves: Leaf[]; onViewSbom: (ha
   }
   return (
     <div className="sbom-tree">
-      <NamespaceFolderRow node={root} depth={0} onViewSbom={onViewSbom} />
+      <NamespaceFolderRow
+        node={root}
+        depth={0}
+        onViewSbom={onViewSbom}
+        hiddenNamespaces={hiddenNamespaces}
+        onToggleHidden={onToggleHidden}
+      />
     </div>
   );
 }
@@ -941,6 +1017,11 @@ function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
   const [view, setView] = useState<'tree' | 'table' | 'current'>('tree');
   const [showRevoked, setShowRevoked] = useState(false);
   const [current, setCurrent] = useState<CurrentManifest[] | null>(null);
+  const [hiddenNamespaces, setHiddenNamespaces] = useState<Set<string>>(new Set());
+
+  const loadHidden = useCallback(() => {
+    api.hiddenNamespaces(tenantId).then((ns) => setHiddenNamespaces(new Set(ns))).catch(() => {});
+  }, [tenantId]);
 
   const load = useCallback(() => {
     setError('');
@@ -949,7 +1030,17 @@ function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
     // Non-fatal: the tree/table views still work if this fails.
     api.currentManifests(tenantId).then(setCurrent).catch(() => {});
-  }, [tenantId]);
+    loadHidden();
+  }, [tenantId, loadHidden]);
+
+  const toggleNamespaceHidden = useCallback(
+    async (namespace: string, hidden: boolean) => {
+      await api.setNamespaceHidden(namespace, hidden, tenantId);
+      loadHidden();
+      api.currentManifests(tenantId).then(setCurrent).catch(() => {});
+    },
+    [tenantId, loadHidden]
+  );
 
   useEffect(load, [load]);
 
@@ -990,7 +1081,12 @@ function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
         {visibleLeaves === null && !error && <Spinner label="Loading leaves…" />}
         {visibleLeaves && visibleLeaves.length === 0 && <div className="muted">No leaves yet.</div>}
         {visibleLeaves && visibleLeaves.length > 0 && view === 'tree' && (
-          <NamespaceTree leaves={visibleLeaves} onViewSbom={setSelectedHash} />
+          <NamespaceTree
+            leaves={visibleLeaves}
+            onViewSbom={setSelectedHash}
+            hiddenNamespaces={hiddenNamespaces}
+            onToggleHidden={toggleNamespaceHidden}
+          />
         )}
         {visibleLeaves && visibleLeaves.length > 0 && view === 'table' && (
           <table className="table">
@@ -1463,6 +1559,7 @@ function Tenants({ isPlatform }: { isPlatform: boolean }) {
   const [error, setError] = useState('');
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState('');
+  const [devMode, setDevMode] = useState(false);
 
   const load = useCallback(() => {
     api.listTenants()
@@ -1471,13 +1568,15 @@ function Tenants({ isPlatform }: { isPlatform: boolean }) {
   }, []);
 
   useEffect(load, [load]);
+  useEffect(() => {
+    api.config().then((c) => setDevMode(c.dev_mode)).catch(() => setDevMode(false));
+  }, []);
 
   const deleteTenant = async (t: Tenant) => {
-    if (
-      !window.confirm(
-        `Delete tenant "${t.name}" (${t.domain})?\n\nThis is final and cannot be undone. It permanently removes ALL of that tenant's data: every API key, every uploaded SBOM, its entire Merkle tree/signed-tree-head history, and its audit log.\n\nType nothing needed — click OK only if you're certain.`
-      )
-    ) {
+    const confirmMessage = devMode
+      ? `Delete tenant "${t.name}" (${t.domain})?\n\nDEV_MODE is on: this is final and cannot be undone. It permanently removes ALL of that tenant's data: every API key, every uploaded SBOM, its entire Merkle tree/signed-tree-head history, and its audit log.\n\nType nothing needed — click OK only if you're certain.`
+      : `Hide tenant "${t.name}" (${t.domain})?\n\nThis removes it from tenant listings/selectors, but its data is NOT deleted — every API key, SBOM, and the Merkle tree/audit log stay fully intact and still reachable directly. (Full deletion is only available with DEV_MODE=true.)`;
+    if (!window.confirm(confirmMessage)) {
       return;
     }
     setDeletingId(t.id);
@@ -1592,7 +1691,7 @@ function Tenants({ isPlatform }: { isPlatform: boolean }) {
                           disabled={deletingId === t.id}
                           onClick={() => deleteTenant(t)}
                         >
-                          {deletingId === t.id ? 'Deleting…' : 'Delete'}
+                          {deletingId === t.id ? (devMode ? 'Deleting…' : 'Hiding…') : devMode ? 'Delete' : 'Hide'}
                         </button>
                       )}
                     </td>
@@ -1724,8 +1823,22 @@ function ConnectionGate({
 
 // ---------- App ----------
 
+// Reads ?tab=&tenant= from the current URL so the active tab/tenant survive
+// a refresh or a shared link. Only trusted at startup — `tenant` is only
+// ever actually applied once `whoami` confirms the key is a platform
+// super_admin (see the whoami-success handler below); otherwise a stale or
+// tampered URL param could make a non-platform key send an override the
+// backend will reject on every request.
+function readUrlState(): { tab: Tab | null; tenant: string | null } {
+  const params = new URLSearchParams(window.location.search);
+  const tabParam = params.get('tab');
+  const validTabIds: string[] = TABS.map((t) => t.id);
+  const tab = tabParam && validTabIds.includes(tabParam) ? (tabParam as Tab) : null;
+  return { tab, tenant: params.get('tenant') };
+}
+
 export default function App() {
-  const [tab, setTab] = useState<Tab>('dashboard');
+  const [tab, setTab] = useState<Tab>(() => readUrlState().tab ?? 'leaves');
   const [apiKey, setKey] = useState('');
   const [treeHead, setTreeHead] = useState<TreeHead | null>(null);
   const [headError, setHeadError] = useState('');
@@ -1734,6 +1847,21 @@ export default function App() {
   const [checkingKey, setCheckingKey] = useState(false);
   const [keyError, setKeyError] = useState('');
   const [viewTenantId, setViewTenantId] = useState('');
+
+  // Keeps the URL in sync with the active tab/tenant (via replaceState, so
+  // switching tabs doesn't spam browser history) — makes the current view
+  // bookmarkable, shareable, and refresh-safe.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    params.set('tab', tab);
+    if (viewTenantId) {
+      params.set('tenant', viewTenantId);
+    } else {
+      params.delete('tenant');
+    }
+    const newUrl = `${window.location.pathname}?${params.toString()}`;
+    window.history.replaceState(null, '', newUrl);
+  }, [tab, viewTenantId]);
 
   useEffect(() => {
     try {
@@ -1760,10 +1888,14 @@ export default function App() {
         setWhoami(w);
         setKeyError('');
         // Only the platform super_admin has a tenant selector at all — for
-        // everyone else this must stay empty (no override ever sent).
-        // Default the selector to the key's own tenant, shown as a real
-        // entry in the list rather than a separate "My tenant" option.
-        setViewTenantId(w.is_platform_tenant ? w.tenant_id : '');
+        // everyone else this must stay empty (no override ever sent), a URL
+        // ?tenant= param included. A URL-supplied tenant is honored only
+        // once that's confirmed here — trusting it before whoami resolves
+        // would let a stale/tampered link make a non-platform key send an
+        // override the backend rejects on every request. Falls back to the
+        // key's own tenant, shown as a real entry in the list rather than a
+        // separate "My tenant" option.
+        setViewTenantId(w.is_platform_tenant ? readUrlState().tenant ?? w.tenant_id : '');
       })
       .catch((e) => {
         if (!mounted) return;

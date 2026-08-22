@@ -6,7 +6,7 @@ use magnolia_audit::AuditLogger;
 use magnolia_core::MerkleTree;
 use magnolia_db::Database;
 use magnolia_signer::LocalFileSigner;
-use magnolia_storage::{InMemoryStore, ObjectStore};
+use magnolia_storage::{FileStore, InMemoryStore, ObjectStore};
 use tokio::sync::Mutex;
 
 #[tokio::main]
@@ -31,7 +31,23 @@ async fn main() {
     ensure_signing_key(&key_path);
     let signer = Arc::new(LocalFileSigner::new(std::path::PathBuf::from(&key_path)));
 
-    let storage: Arc<dyn ObjectStore> = Arc::new(InMemoryStore::new());
+    // Dev/test convenience: InMemoryStore loses all SBOM content on every
+    // restart (only the Postgres metadata survives), which makes "locked"
+    // leaves permanently unfetchable across `docker compose restart`. Set
+    // STORAGE_PATH to persist SBOM bytes to disk instead — production still
+    // wants S3Store (not built yet), but this closes the dev-data-loss gap
+    // cheaply in the meantime.
+    let (storage, storage_backend): (Arc<dyn ObjectStore>, &'static str) =
+        match std::env::var("STORAGE_PATH") {
+            Ok(path) => {
+                tracing::info!(path = %path, "using file-based object storage");
+                (Arc::new(FileStore::new(path)), "file")
+            }
+            Err(_) => {
+                tracing::warn!("STORAGE_PATH not set — using in-memory storage; SBOM content will not survive a restart");
+                (Arc::new(InMemoryStore::new()), "in-memory")
+            }
+        };
 
     let mut trees: HashMap<uuid::Uuid, MerkleTree> = HashMap::new();
     match db.load_all_leaf_hashes_by_tenant().await {
@@ -60,6 +76,7 @@ async fn main() {
         trees: Arc::new(Mutex::new(trees)),
         audit: Arc::new(AuditLogger::new()),
         dev_mode,
+        storage_backend,
     };
 
     let app = create_router(state);

@@ -21,6 +21,12 @@ pub struct AppState {
     /// for local testing convenience (currently: who can revoke a
     /// manifest) — never set this in production.
     pub dev_mode: bool,
+    /// Human-readable label for which `ObjectStore` impl is active
+    /// ("file" or "in-memory") — surfaced via `GET /api/v1/config` so the
+    /// UI can warn when uploads won't survive a restart. Not derived from
+    /// `storage` itself since trait objects can't be introspected; set
+    /// once at startup alongside the actual backend choice.
+    pub storage_backend: &'static str,
 }
 
 impl Clone for AppState {
@@ -32,6 +38,7 @@ impl Clone for AppState {
             trees: Arc::clone(&self.trees),
             audit: Arc::clone(&self.audit),
             dev_mode: self.dev_mode,
+            storage_backend: self.storage_backend,
         }
     }
 }

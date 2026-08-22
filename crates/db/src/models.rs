@@ -34,6 +34,7 @@ pub struct TenantRecord {
     pub created_by: String,
     pub created_at: DateTime<Utc>,
     pub is_platform: bool,
+    pub hidden: bool,
 }
 
 #[derive(Debug, Clone, FromRow)]

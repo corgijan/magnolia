@@ -1,7 +1,9 @@
 mod errors;
+mod file;
 mod in_memory;
 
 pub use errors::StorageError;
+pub use file::FileStore;
 pub use in_memory::InMemoryStore;
 
 use async_trait::async_trait;

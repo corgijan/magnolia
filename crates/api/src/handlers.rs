@@ -394,6 +394,26 @@ pub async fn whoami(grant: AuthGrant) -> Json<WhoAmIJson> {
     })
 }
 
+#[derive(serde::Serialize)]
+pub struct ConfigJson {
+    pub storage_backend: String,
+    pub signer_backend: String,
+    pub dev_mode: bool,
+}
+
+/// Server-operational info, not tenant data — safe for any authenticated
+/// key to see (no RBAC action required, same as `whoami`). Deliberately
+/// excludes anything sensitive like file paths or connection strings;
+/// exists so the UI can warn when running against a non-durable dev setup
+/// (e.g. in-memory storage) rather than a silent trap.
+pub async fn config(State(state): State<AppState>, _grant: AuthGrant) -> Json<ConfigJson> {
+    Json(ConfigJson {
+        storage_backend: state.storage_backend.to_string(),
+        signer_backend: "local_file".to_string(),
+        dev_mode: state.dev_mode,
+    })
+}
+
 pub async fn upload_sbom(
     State(state): State<AppState>,
     grant: AuthGrant,
@@ -484,14 +504,37 @@ pub async fn upload_sbom(
         }
     }
 
+    let target_tenant = if cross_tenant {
+        Some(
+            state
+                .db
+                .get_tenant(tenant_id)
+                .await
+                .map_err(db_err)?
+                .ok_or_else(|| ApiError::BadRequest("unknown tenant_id".to_string()))?,
+        )
+    } else {
+        None
+    };
+
+    // The platform tenant exists to hold the bootstrap/admin key that
+    // manages every other tenant — it's not a product tenant, and letting
+    // real SBOM data accumulate there defeats the "keep it clean and
+    // administrative only" separation the whole multi-tenancy model relies
+    // on. Blocked unconditionally, even for the platform super_admin.
+    let is_platform_target = if cross_tenant {
+        target_tenant.as_ref().map(|t| t.is_platform).unwrap_or(false)
+    } else {
+        grant.is_platform_tenant
+    };
+    if is_platform_target {
+        return Err(ApiError::BadRequest(
+            "uploads are not allowed to the platform tenant".to_string(),
+        ));
+    }
+
     let domain = if cross_tenant {
-        state
-            .db
-            .get_tenant(tenant_id)
-            .await
-            .map_err(db_err)?
-            .ok_or_else(|| ApiError::BadRequest("unknown tenant_id".to_string()))?
-            .domain
+        target_tenant.map(|t| t.domain).unwrap_or_default()
     } else {
         grant.domain.clone()
     };
@@ -894,6 +937,59 @@ pub async fn current_manifests(
     ))
 }
 
+/// Namespaces currently opted out of the "current" view for this tenant
+/// (scoped to the caller's `namespace_scope`, or the full tenant when
+/// acting cross-tenant).
+pub async fn list_hidden_namespaces(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+) -> Result<Json<Vec<String>>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    let scope = if cross_tenant { "/" } else { &grant.namespace_scope };
+
+    let rows = state
+        .db
+        .list_hidden_namespaces(tenant_id, scope)
+        .await
+        .map_err(db_err)?;
+    Ok(Json(rows))
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetNamespaceHiddenRequest {
+    pub namespace: String,
+    pub hidden: bool,
+}
+
+/// Toggles whether a namespace is excluded from the "current" view — a
+/// display filter only (declutter test/staging namespaces from "what's
+/// running in prod"), not a tracking pause: uploads, revocation, and the
+/// Merkle log/proofs are entirely unaffected either way. Gated the same as
+/// manifest revocation (`Action::Annotate`) since it's curatorial, not a
+/// destructive or security-sensitive action.
+pub async fn set_namespace_hidden(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+    Json(body): Json<SetNamespaceHiddenRequest>,
+) -> Result<StatusCode, ApiError> {
+    require(&grant, Action::Annotate, &grant.namespace_scope)?;
+    let namespace = normalize_namespace(&body.namespace)?;
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    if !cross_tenant && !magnolia_auth::namespace_in_scope(&namespace, &grant.namespace_scope) {
+        return Err(ApiError::Forbidden("namespace out of scope".to_string()));
+    }
+
+    state
+        .db
+        .set_namespace_hidden(tenant_id, &namespace, body.hidden, &grant.principal())
+        .await
+        .map_err(db_err)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Marks a manifest revoked — a status flag, not a delete: the manifest
 /// row, its signature, and the Merkle leaf/hash it's chained from are
 /// untouched, so the append-only log and tamper-evidence are unaffected.
@@ -1127,14 +1223,19 @@ pub async fn list_tenants(
     ))
 }
 
-/// Deletes a tenant and everything scoped to it (cascades at the DB layer
-/// to keys, leaves, manifests, signed tree heads, audit log). Irreversible.
+/// Outside `DEV_MODE`, "deleting" a tenant only hides it — everything it
+/// owns (keys, leaves, manifests, signed tree heads, audit log) stays
+/// fully intact and still reachable directly (e.g. via `?tenant_id=`
+/// override); it just disappears from listings/selectors. A compliance
+/// archive shouldn't let one admin action permanently erase years of SBOM
+/// history with no retention floor. The hard, cascading delete is only
+/// available when `DEV_MODE=true`, for local test cleanup.
 ///
 /// Gated more strictly than `create_tenant`/`list_tenants`: those allow any
-/// super_admin (`Action::ManageTenants`), but deleting another tenant's
-/// entire history is a cross-tenant destructive action, so this requires
-/// the platform super_admin specifically — the same bar as the `?tenant_id`
-/// override elsewhere. The platform tenant itself can never be deleted
+/// super_admin (`Action::ManageTenants`), but this is a cross-tenant action
+/// on another tenant's entire history, so it requires the platform
+/// super_admin specifically — the same bar as the `?tenant_id` override
+/// elsewhere. The platform tenant itself can never be deleted or hidden
 /// (it's the one tenant capable of managing all the others).
 pub async fn delete_tenant(
     State(state): State<AppState>,
@@ -1160,18 +1261,32 @@ pub async fn delete_tenant(
         ));
     }
 
-    state.db.delete_tenant(tenant_id).await.map_err(db_err)?;
-    state.trees.lock().await.remove(&tenant_id);
+    if state.dev_mode {
+        state.db.delete_tenant(tenant_id).await.map_err(db_err)?;
+        state.trees.lock().await.remove(&tenant_id);
 
-    let _ = record_audit(
-        &state,
-        &grant,
-        "tenant_delete",
-        &format!("{} ({})", tenant_id, target.domain),
-        true,
-        None,
-    )
-    .await;
+        let _ = record_audit(
+            &state,
+            &grant,
+            "tenant_delete",
+            &format!("{} ({})", tenant_id, target.domain),
+            true,
+            None,
+        )
+        .await;
+    } else {
+        state.db.hide_tenant(tenant_id).await.map_err(db_err)?;
+
+        let _ = record_audit(
+            &state,
+            &grant,
+            "tenant_hide",
+            &format!("{} ({})", tenant_id, target.domain),
+            true,
+            None,
+        )
+        .await;
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }

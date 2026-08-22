@@ -87,7 +87,7 @@ impl Database {
 
     pub async fn get_tenant(&self, id: Uuid) -> Result<Option<TenantRecord>, DbError> {
         sqlx::query_as::<_, TenantRecord>(
-            "SELECT id, domain, name, created_by, created_at, is_platform FROM tenants WHERE id = $1",
+            "SELECT id, domain, name, created_by, created_at, is_platform, hidden FROM tenants WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -100,7 +100,7 @@ impl Database {
         domain: &str,
     ) -> Result<Option<TenantRecord>, DbError> {
         sqlx::query_as::<_, TenantRecord>(
-            "SELECT id, domain, name, created_by, created_at, is_platform FROM tenants WHERE domain = $1",
+            "SELECT id, domain, name, created_by, created_at, is_platform, hidden FROM tenants WHERE domain = $1",
         )
         .bind(domain)
         .fetch_optional(&self.pool)
@@ -108,13 +108,29 @@ impl Database {
         .map_err(|e| DbError::QueryError(e.to_string()))
     }
 
+    /// Excludes hidden tenants — this backs the tenant listing/selector, so
+    /// a tenant "deleted" outside DEV_MODE (hidden, not dropped) correctly
+    /// disappears from view while its data stays fully intact and still
+    /// reachable directly (e.g. `?tenant_id=` override), just not listed.
     pub async fn list_tenants(&self) -> Result<Vec<TenantRecord>, DbError> {
         sqlx::query_as::<_, TenantRecord>(
-            "SELECT id, domain, name, created_by, created_at, is_platform FROM tenants ORDER BY created_at DESC",
+            "SELECT id, domain, name, created_by, created_at, is_platform, hidden FROM tenants WHERE hidden = FALSE ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
         .await
         .map_err(|e| DbError::QueryError(e.to_string()))
+    }
+
+    /// Marks a tenant hidden instead of deleting it — used outside
+    /// DEV_MODE so "delete tenant" can never destroy a compliance archive's
+    /// data. Returns `true` if a row existed and was updated.
+    pub async fn hide_tenant(&self, id: Uuid) -> Result<bool, DbError> {
+        let result = sqlx::query("UPDATE tenants SET hidden = TRUE WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DbError::QueryError(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
     }
 
     // ---- Signed tree heads ----
@@ -517,6 +533,10 @@ impl Database {
             WHERE tenant_id = $1
               AND revoked = FALSE
               AND ($2 = '/' OR namespace = $2 OR starts_with(namespace, $2 || '/'))
+              AND NOT EXISTS (
+                  SELECT 1 FROM namespace_current_hidden h
+                  WHERE h.tenant_id = manifests.tenant_id AND h.namespace = manifests.namespace
+              )
             ORDER BY namespace, created_at DESC, leaf_seq_id DESC
             "#,
         )
@@ -525,6 +545,68 @@ impl Database {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| DbError::QueryError(e.to_string()))
+    }
+
+    /// Namespaces opted out of the "current" view for a tenant, scoped the
+    /// same way as `latest_manifests_by_namespace` so a narrowly-scoped key
+    /// only sees toggles within its own reach.
+    pub async fn list_hidden_namespaces(
+        &self,
+        tenant_id: Uuid,
+        namespace_scope: &str,
+    ) -> Result<Vec<String>, DbError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            r#"
+            SELECT namespace FROM namespace_current_hidden
+            WHERE tenant_id = $1
+              AND ($2 = '/' OR namespace = $2 OR starts_with(namespace, $2 || '/'))
+            ORDER BY namespace
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(namespace_scope)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbError::QueryError(e.to_string()))?;
+        Ok(rows.into_iter().map(|(n,)| n).collect())
+    }
+
+    /// Toggles whether a namespace is excluded from the "current" view.
+    /// `hidden = true` upserts (refreshing `hidden_by`/`hidden_at` if
+    /// already hidden); `hidden = false` deletes the row — namespaces are
+    /// visible by default, so "not hidden" means "no row," not a row with
+    /// a false flag.
+    pub async fn set_namespace_hidden(
+        &self,
+        tenant_id: Uuid,
+        namespace: &str,
+        hidden: bool,
+        hidden_by: &str,
+    ) -> Result<(), DbError> {
+        if hidden {
+            sqlx::query(
+                r#"
+                INSERT INTO namespace_current_hidden (tenant_id, namespace, hidden_by, hidden_at)
+                VALUES ($1, $2, $3, now())
+                ON CONFLICT (tenant_id, namespace)
+                DO UPDATE SET hidden_by = EXCLUDED.hidden_by, hidden_at = EXCLUDED.hidden_at
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(namespace)
+            .bind(hidden_by)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DbError::QueryError(e.to_string()))?;
+        } else {
+            sqlx::query("DELETE FROM namespace_current_hidden WHERE tenant_id = $1 AND namespace = $2")
+                .bind(tenant_id)
+                .bind(namespace)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DbError::QueryError(e.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Marks a manifest revoked, scoped to `tenant_id` so it can only be

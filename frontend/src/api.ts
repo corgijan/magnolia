@@ -138,6 +138,12 @@ export interface WhoAmI {
   is_platform_tenant: boolean;
 }
 
+export interface BackendConfig {
+  storage_backend: string;
+  signer_backend: string;
+  dev_mode: boolean;
+}
+
 export interface AuditEntry {
   id: string;
   tenant_id: string;
@@ -213,6 +219,8 @@ export const api = {
 
   whoami: (): Promise<WhoAmI> => request('/api/v1/whoami'),
 
+  config: (): Promise<BackendConfig> => request('/api/v1/config'),
+
   treeHead: (tenantId?: string): Promise<TreeHead> =>
     request(`/api/v1/tree-head/latest${tenantQs(tenantId)}`),
 
@@ -255,6 +263,16 @@ export const api = {
 
   currentManifests: (tenantId?: string): Promise<CurrentManifest[]> =>
     request(`/api/v1/manifests/current${tenantQs(tenantId)}`),
+
+  hiddenNamespaces: (tenantId?: string): Promise<string[]> =>
+    request(`/api/v1/namespaces/hidden${tenantQs(tenantId)}`),
+
+  setNamespaceHidden: (namespace: string, hidden: boolean, tenantId?: string): Promise<void> =>
+    request(`/api/v1/namespaces/hidden${tenantQs(tenantId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ namespace, hidden }),
+    }),
 
   listKeys: (tenantId?: string): Promise<ApiKeyInfo[]> =>
     request(`/api/v1/keys${tenantQs(tenantId)}`),

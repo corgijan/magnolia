@@ -84,14 +84,21 @@ export async function verifyInclusion(
 }
 
 /** Canonical (level, leaf_start) pairs for a tree of `size` leaves,
- *  in left-to-right leaf order (descending level). */
+ *  in left-to-right leaf order (descending level). Mirrors
+ *  `MerkleTree::frontier_ranges` in crates/core/src/merkle.rs (u64, levels
+ *  0..64). Must use BigInt, not JS's `<<`/`&`, which operate on 32-bit ints
+ *  and silently wrap at shift amounts >= 32 (e.g. `1 << 32 === 1 << 0`) —
+ *  that wraparound spuriously matched a phantom "level 32" peak for any
+ *  size with bit 0 set, corrupting every consistency-proof verification. */
 export function frontierRanges(size: number): { level: number; start: number }[] {
   const out: { level: number; start: number }[] = [];
-  let start = 0;
-  for (let level = 47; level >= 0; level -= 1) {
-    if (size & (1 << level)) {
-      out.push({ level, start });
-      start += 1 << level;
+  const s = BigInt(size);
+  let start = BigInt(0);
+  for (let level = 63; level >= 0; level -= 1) {
+    const bit = BigInt(1) << BigInt(level);
+    if (s & bit) {
+      out.push({ level, start: Number(start) });
+      start += bit;
     }
   }
   return out;
