@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "crates/api",
+    "crates/core",
+    "crates/auth",
+    "crates/signer",
+    "crates/storage",
+    "crates/db",
+    "crates/audit",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+axum = { version = "0.7", features = ["multipart"] }
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.7", features = ["postgres", "runtime-tokio", "macros", "chrono", "uuid"] }
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+argon2 = { version = "0.5", features = ["rand"] }
+password-hash = { version = "0.5", features = ["getrandom"] }
+hex = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower-http = { version = "0.5", features = ["cors"] }

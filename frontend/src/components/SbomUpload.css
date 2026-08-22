@@ -1,0 +1,261 @@
+.sbom-upload {
+  padding: 30px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.upload-section {
+  background: white;
+  border-radius: 12px;
+  padding: 30px;
+  margin-bottom: 30px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+.upload-section h2 {
+  color: #333;
+  margin-bottom: 25px;
+  font-size: 24px;
+  border-bottom: 2px solid #667eea;
+  padding-bottom: 15px;
+}
+
+.form-group {
+  margin-bottom: 20px;
+}
+
+.form-group label {
+  display: block;
+  color: #555;
+  font-weight: 600;
+  margin-bottom: 8px;
+  font-size: 14px;
+}
+
+.form-group select {
+  width: 100%;
+  padding: 10px 12px;
+  border: 2px solid #ddd;
+  border-radius: 6px;
+  font-size: 14px;
+  transition: border-color 0.3s;
+}
+
+.form-group select:focus {
+  outline: none;
+  border-color: #667eea;
+}
+
+.file-input-wrapper {
+  position: relative;
+  margin-bottom: 15px;
+}
+
+.file-input-wrapper input[type='file'] {
+  position: absolute;
+  opacity: 0;
+  width: 100%;
+  height: 100%;
+  cursor: pointer;
+  top: 0;
+  left: 0;
+}
+
+.file-preview {
+  border: 2px dashed #667eea;
+  border-radius: 8px;
+  padding: 20px;
+  text-align: center;
+  background: #f5f7fa;
+  cursor: pointer;
+  transition: all 0.3s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 80px;
+}
+
+.file-preview:hover {
+  background: #eef2ff;
+  border-color: #5568d3;
+}
+
+.file-preview span {
+  color: #555;
+  font-weight: 500;
+}
+
+.file-preview .placeholder {
+  color: #aaa;
+}
+
+.file-size {
+  color: #999;
+  font-size: 12px;
+}
+
+.btn-large {
+  width: 100%;
+  padding: 12px;
+  font-size: 16px;
+}
+
+.result-details {
+  background: #e8f5e9;
+  border-radius: 6px;
+  padding: 15px;
+  margin-top: 10px;
+  font-size: 13px;
+}
+
+.result-details p {
+  margin: 8px 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.result-details strong {
+  min-width: 120px;
+}
+
+.result-details code {
+  background: white;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-family: 'Courier New', monospace;
+  color: #333;
+  word-break: break-all;
+}
+
+.history-section {
+  background: white;
+  border-radius: 12px;
+  padding: 30px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+.history-section h2 {
+  color: #333;
+  margin-bottom: 20px;
+  font-size: 24px;
+  border-bottom: 2px solid #667eea;
+  padding-bottom: 15px;
+}
+
+.history-list {
+  display: grid;
+  gap: 12px;
+}
+
+.history-item {
+  background: #f9f9f9;
+  border-left: 4px solid #667eea;
+  border-radius: 6px;
+  padding: 15px;
+  display: flex;
+  gap: 15px;
+  align-items: flex-start;
+  transition: all 0.3s;
+}
+
+.history-item:hover {
+  box-shadow: 0 4px 12px rgba(102, 126, 234, 0.15);
+}
+
+.item-number {
+  background: #667eea;
+  color: white;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.item-details {
+  flex: 1;
+}
+
+.item-details p {
+  margin: 8px 0;
+  font-size: 13px;
+  color: #555;
+}
+
+.item-details .hash {
+  font-family: 'Courier New', monospace;
+  color: #333;
+}
+
+.item-details code {
+  background: white;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 12px;
+  color: #333;
+}
+
+.item-details .meta {
+  color: #999;
+  font-size: 12px;
+}
+
+.alert {
+  padding: 15px;
+  border-radius: 6px;
+  margin-bottom: 20px;
+  font-size: 14px;
+  border-left: 4px solid;
+}
+
+.alert-warning {
+  background: #fff3cd;
+  color: #856404;
+  border-color: #ffc107;
+}
+
+.alert-error {
+  background: #f8d7da;
+  color: #721c24;
+  border-color: #f5c6cb;
+}
+
+.alert-success {
+  background: #d4edda;
+  color: #155724;
+  border-color: #c3e6cb;
+}
+
+.btn {
+  padding: 10px 16px;
+  border: none;
+  border-radius: 6px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-size: 14px;
+}
+
+.btn-primary {
+  background: #667eea;
+  color: white;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: #5568d3;
+  transform: translateY(-2px);
+  box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+}
+
+.btn-primary:disabled {
+  background: #ccc;
+  cursor: not-allowed;
+}

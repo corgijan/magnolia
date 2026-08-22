@@ -1,0 +1,13 @@
+[package]
+name = "sbomstash-db"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sqlx = { version = "0.7", features = ["postgres", "runtime-tokio", "macros", "chrono", "uuid"] }
+uuid.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

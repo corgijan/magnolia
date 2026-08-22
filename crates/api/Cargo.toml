@@ -1,0 +1,30 @@
+[package]
+name = "sbomstash-api"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "sbomstash-server"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+sha2.workspace = true
+hex.workspace = true
+tower-http.workspace = true
+async-trait = "0.1"
+
+sbomstash-core = { path = "../core" }
+sbomstash-auth = { path = "../auth" }
+sbomstash-signer = { path = "../signer" }
+sbomstash-storage = { path = "../storage" }
+sbomstash-db = { path = "../db" }
+sbomstash-audit = { path = "../audit" }

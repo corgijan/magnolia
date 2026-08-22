@@ -1,0 +1,46 @@
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: sbomstash
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@db:5432/sbomstash
+      SERVER_ADDR: 0.0.0.0:3000
+      RUST_LOG: info
+      SIGNING_KEY_PATH: /data/.sbomstash_key
+      # Dev/test convenience: on startup, ensures this exact <key_id>:<secret>
+      # exists as a super_admin key (creating its tenant if needed), so a
+      # fresh `docker compose up` is immediately usable with a known key —
+      # no manual SQL bootstrap step. Idempotent; never overwrites an
+      # existing key. Change or unset this for anything beyond local testing.
+      BOOTSTRAP_SUPER_ADMIN_KEY: "deadbeef-dead-dead-dead-deadbeefdead:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+      BOOTSTRAP_TENANT_DOMAIN: test.example
+      BOOTSTRAP_TENANT_NAME: "Test Tenant"
+    ports:
+      - "3000:3000"
+    volumes:
+      - signing_key:/data
+
+volumes:
+  db_data:
+  signing_key:
