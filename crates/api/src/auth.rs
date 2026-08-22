@@ -22,6 +22,11 @@ pub struct AuthGrant {
     pub role: Role,
     pub expires_at: Option<DateTime<Utc>>,
     pub revoked: bool,
+    /// Whether this key's own tenant is the platform/bootstrap tenant. Only
+    /// super_admin keys in that specific tenant may act across other
+    /// tenants — a super_admin key self-minted by some other tenant's
+    /// domain_admin does NOT get that reach.
+    pub is_platform_tenant: bool,
 }
 
 impl AuthGrant {
@@ -91,6 +96,19 @@ impl FromRequestParts<AppState> for AuthGrant {
             }
         }
 
+        // Only matters (and is only worth the extra lookup) for super_admin.
+        let is_platform_tenant = if role == Role::SuperAdmin {
+            state
+                .db
+                .get_tenant(row.tenant_id)
+                .await
+                .map_err(|e| ApiError::InternalError(e.to_string()))?
+                .map(|t| t.is_platform)
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
         Ok(AuthGrant {
             key_id: row.id,
             tenant_id: row.tenant_id,
@@ -99,6 +117,7 @@ impl FromRequestParts<AppState> for AuthGrant {
             role,
             expires_at: row.expires_at,
             revoked: row.revoked,
+            is_platform_tenant,
         })
     }
 }

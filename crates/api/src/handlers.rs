@@ -53,6 +53,9 @@ pub struct LeafJson {
     pub leaf_hash: String,
     pub status: String,
     pub created_at: DateTime<Utc>,
+    pub manifest_hash: Option<String>,
+    pub revoked: bool,
+    pub domain: String,
 }
 
 #[derive(serde::Serialize)]
@@ -71,6 +74,9 @@ pub struct ManifestJson {
     pub created_by: String,
     pub created_at: DateTime<Utc>,
     pub sbom_hex: String,
+    pub revoked: bool,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub revoked_by: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -112,6 +118,7 @@ pub struct TenantJson {
     pub name: String,
     pub created_by: String,
     pub created_at: DateTime<Utc>,
+    pub is_platform: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -181,16 +188,23 @@ pub struct TenantOverrideQuery {
 }
 
 /// Resolves which tenant a request should act on: the grant's own tenant by
-/// default, or an explicit override — only ever honored for super_admin.
+/// default, or an explicit override — only ever honored for a super_admin
+/// key belonging to the platform/bootstrap tenant (`is_platform_tenant`).
+/// A super_admin key self-minted by some other tenant's domain_admin does
+/// NOT get this reach, even though the role string is the same — otherwise
+/// any tenant could grant itself platform-wide access to every other
+/// tenant just by creating a key with role="super_admin" for itself.
 /// The second element is `true` when acting on a tenant other than the
 /// grant's own, in which case the grant's `namespace_scope` does not apply
 /// (there's no meaningful "my namespace scope" in someone else's tenant —
 /// a cross-tenant super_admin sees/manages that tenant in full).
 fn effective_tenant(grant: &AuthGrant, requested: Option<Uuid>) -> Result<(Uuid, bool), ApiError> {
     match requested {
-        Some(id) if grant.role == Role::SuperAdmin => Ok((id, id != grant.tenant_id)),
+        Some(id) if grant.role == Role::SuperAdmin && grant.is_platform_tenant => {
+            Ok((id, id != grant.tenant_id))
+        }
         Some(_) => Err(ApiError::Forbidden(
-            "only super_admin can act on another tenant".to_string(),
+            "only the platform super_admin can act on another tenant".to_string(),
         )),
         None => Ok((grant.tenant_id, false)),
     }
@@ -337,6 +351,11 @@ pub struct WhoAmIJson {
     pub domain: String,
     pub namespace_scope: String,
     pub role: String,
+    /// Whether this key's tenant is the platform tenant — only then can it
+    /// pass `?tenant_id=` to act on another tenant. The UI uses this to
+    /// decide whether to offer that at all (the backend enforces it
+    /// independently either way).
+    pub is_platform_tenant: bool,
 }
 
 /// Confirms the caller's key is authenticated (not revoked/expired,
@@ -350,12 +369,14 @@ pub async fn whoami(grant: AuthGrant) -> Json<WhoAmIJson> {
         domain: grant.domain,
         namespace_scope: grant.namespace_scope,
         role: grant.role.to_string(),
+        is_platform_tenant: grant.is_platform_tenant,
     })
 }
 
 pub async fn upload_sbom(
     State(state): State<AppState>,
     grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
     mut multipart: Multipart,
 ) -> Result<Json<UploadResponse>, ApiError> {
     let field = multipart
@@ -420,18 +441,39 @@ pub async fn upload_sbom(
     }
     validate_sbom_content(&sbom_bytes, &format)?;
 
-    if let Err(e) = require(&grant, Action::Upload, &namespace) {
-        let _ = record_audit(
-            &state,
-            &grant,
-            "upload",
-            &format!("{}:{}", grant.domain, namespace),
-            false,
-            Some(e.to_string()),
-        )
-        .await;
-        return Err(e);
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+
+    // Cross-tenant uploads are only reachable at all if `effective_tenant`
+    // already proved this is the platform super_admin — that implies full
+    // access to the target tenant, so the grant's own namespace_scope
+    // (which describes ITS tenant, not the target's) doesn't apply. Normal
+    // same-tenant uploads still go through the regular RBAC/scope check.
+    if !cross_tenant {
+        if let Err(e) = require(&grant, Action::Upload, &namespace) {
+            let _ = record_audit(
+                &state,
+                &grant,
+                "upload",
+                &format!("{}:{}", grant.domain, namespace),
+                false,
+                Some(e.to_string()),
+            )
+            .await;
+            return Err(e);
+        }
     }
+
+    let domain = if cross_tenant {
+        state
+            .db
+            .get_tenant(tenant_id)
+            .await
+            .map_err(db_err)?
+            .ok_or_else(|| ApiError::BadRequest("unknown tenant_id".to_string()))?
+            .domain
+    } else {
+        grant.domain.clone()
+    };
 
     let sbom_format = match format.as_str() {
         "cyclonedx" => SbomFormat::CycloneDx,
@@ -439,10 +481,7 @@ pub async fn upload_sbom(
     };
 
     let sbom_hash = hex::encode(Sha256::digest(&sbom_bytes));
-    let s3_key = format!(
-        "tenants/{}/sboms/{}.sbom",
-        grant.tenant_id, sbom_hash
-    );
+    let s3_key = format!("tenants/{}/sboms/{}.sbom", tenant_id, sbom_hash);
 
     state
         .storage
@@ -452,7 +491,7 @@ pub async fn upload_sbom(
 
     let (leaf_hash, tree_size, tenant_leaf_index, sth) = {
         let mut trees = state.trees.lock().await;
-        let tree = trees.entry(grant.tenant_id).or_insert_with(MerkleTree::new);
+        let tree = trees.entry(tenant_id).or_insert_with(MerkleTree::new);
         let leaf_hash = tree.add_leaf(&sbom_bytes);
         let tree_size = tree.tree_size();
         let mut sth = SignedTreeHead::new(
@@ -473,7 +512,7 @@ pub async fn upload_sbom(
     let leaf_seq_id = state
         .db
         .insert_merkle_leaf(
-            grant.tenant_id,
+            tenant_id,
             tenant_leaf_index,
             &namespace,
             &s3_key,
@@ -486,7 +525,7 @@ pub async fn upload_sbom(
     state
         .db
         .insert_signed_tree_head(
-            grant.tenant_id,
+            tenant_id,
             tree_size as i64,
             &sth.root_hash,
             &sth.signature,
@@ -495,7 +534,7 @@ pub async fn upload_sbom(
         .await
         .map_err(db_err)?;
 
-    let previous = state.db.latest_manifest(grant.tenant_id).await.map_err(db_err)?;
+    let previous = state.db.latest_manifest(tenant_id).await.map_err(db_err)?;
     let previous_manifest_hash = previous.as_ref().map(|m| m.manifest_hash.clone());
 
     let manifest_created_at = Utc::now();
@@ -504,9 +543,9 @@ pub async fn upload_sbom(
         sbom_hash.clone(),
         sbom_format,
         s3_key.clone(),
-        grant.tenant_id,
+        tenant_id,
         namespace.clone(),
-        grant.domain.clone(),
+        domain.clone(),
     );
     if let Some(ref prev) = previous_manifest_hash {
         manifest = manifest.with_previous(prev.clone());
@@ -528,7 +567,7 @@ pub async fn upload_sbom(
         .insert_manifest(
             &manifest_hash,
             leaf_seq_id,
-            grant.tenant_id,
+            tenant_id,
             &version,
             &sbom_hash,
             &format,
@@ -558,7 +597,7 @@ pub async fn upload_sbom(
         manifest_hash,
         version,
         namespace,
-        domain: grant.domain.clone(),
+        domain,
         tree_size,
         leaf_index: tree_size - 1,
         leaf_seq_id,
@@ -714,6 +753,9 @@ pub async fn leaves(
                 sbom_s3_key: row.sbom_s3_key,
                 status: row.status,
                 created_at: row.created_at,
+                manifest_hash: row.manifest_hash,
+                revoked: row.revoked,
+                domain: row.domain,
             })
             .collect(),
     ))
@@ -778,7 +820,64 @@ pub async fn manifest(
         signature: hex::encode(&record.signature),
         created_by: record.created_by,
         created_at: record.created_at,
+        revoked: record.revoked,
+        revoked_at: record.revoked_at,
+        revoked_by: record.revoked_by,
     }))
+}
+
+/// Marks a manifest revoked — a status flag, not a delete: the manifest
+/// row, its signature, and the Merkle leaf/hash it's chained from are
+/// untouched, so the append-only log and tamper-evidence are unaffected.
+///
+/// Normally requires `Action::Annotate` (super_admin, domain_admin,
+/// auditor). If the server has `DEV_MODE=true` set, an `uploader`-role key
+/// may also revoke — for local testing where the same pipeline that
+/// uploaded a bad SBOM wants to retract it without a separate admin key.
+/// Never relies on DEV_MODE for anything beyond that one relaxation.
+pub async fn revoke_manifest(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Path(manifest_hash): Path<String>,
+    Query(q): Query<TenantOverrideQuery>,
+) -> Result<StatusCode, ApiError> {
+    if let Err(e) = require(&grant, Action::Annotate, &grant.namespace_scope) {
+        if state.dev_mode {
+            require(&grant, Action::Upload, &grant.namespace_scope)?;
+        } else {
+            return Err(e);
+        }
+    }
+
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+
+    let record = state
+        .db
+        .get_manifest(&manifest_hash)
+        .await
+        .map_err(db_err)?
+        .ok_or(ApiError::NotFound)?;
+
+    if record.tenant_id != tenant_id
+        || (!cross_tenant
+            && !sbomstash_auth::namespace_in_scope(&record.namespace, &grant.namespace_scope))
+    {
+        return Err(ApiError::NotFound);
+    }
+
+    let updated = state
+        .db
+        .revoke_manifest(tenant_id, &manifest_hash, &grant.principal())
+        .await
+        .map_err(db_err)?;
+
+    if !updated {
+        return Err(ApiError::BadRequest("manifest already revoked".to_string()));
+    }
+
+    let _ = record_audit(&state, &grant, "manifest_revoke", &manifest_hash, true, None).await;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Mints a key for `tenant_id`/`domain`. Shared by `create_key` (caller
@@ -897,7 +996,7 @@ pub async fn create_tenant(
     let created_at = Utc::now();
     state
         .db
-        .insert_tenant(tenant_id, &domain, name, &grant.principal())
+        .insert_tenant(tenant_id, &domain, name, &grant.principal(), false)
         .await
         .map_err(|e| match e {
             sbomstash_db::DbError::Conflict(_) => {
@@ -933,6 +1032,7 @@ pub async fn create_tenant(
             name: name.to_string(),
             created_by: grant.principal(),
             created_at,
+            is_platform: false,
         },
         initial_key,
     }))
@@ -953,9 +1053,59 @@ pub async fn list_tenants(
                 name: row.name,
                 created_by: row.created_by,
                 created_at: row.created_at,
+                is_platform: row.is_platform,
             })
             .collect(),
     ))
+}
+
+/// Deletes a tenant and everything scoped to it (cascades at the DB layer
+/// to keys, leaves, manifests, signed tree heads, audit log). Irreversible.
+///
+/// Gated more strictly than `create_tenant`/`list_tenants`: those allow any
+/// super_admin (`Action::ManageTenants`), but deleting another tenant's
+/// entire history is a cross-tenant destructive action, so this requires
+/// the platform super_admin specifically — the same bar as the `?tenant_id`
+/// override elsewhere. The platform tenant itself can never be deleted
+/// (it's the one tenant capable of managing all the others).
+pub async fn delete_tenant(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Path(tenant_id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    if !(grant.role == Role::SuperAdmin && grant.is_platform_tenant) {
+        return Err(ApiError::Forbidden(
+            "only the platform super_admin can delete a tenant".to_string(),
+        ));
+    }
+
+    let target = state
+        .db
+        .get_tenant(tenant_id)
+        .await
+        .map_err(db_err)?
+        .ok_or(ApiError::NotFound)?;
+
+    if target.is_platform {
+        return Err(ApiError::BadRequest(
+            "cannot delete the platform tenant".to_string(),
+        ));
+    }
+
+    state.db.delete_tenant(tenant_id).await.map_err(db_err)?;
+    state.trees.lock().await.remove(&tenant_id);
+
+    let _ = record_audit(
+        &state,
+        &grant,
+        "tenant_delete",
+        &format!("{} ({})", tenant_id, target.domain),
+        true,
+        None,
+    )
+    .await;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn list_keys(

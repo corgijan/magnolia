@@ -7,7 +7,7 @@ pub use errors::ApiError;
 pub use state::AppState;
 pub use auth::AuthGrant;
 
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -40,6 +40,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/leaves", get(handlers::leaves))
         .route("/api/v1/manifest/:manifest_hash", get(handlers::manifest))
         .route(
+            "/api/v1/manifest/:manifest_hash/revoke",
+            post(handlers::revoke_manifest),
+        )
+        .route(
             "/api/v1/keys",
             get(handlers::list_keys).post(handlers::create_key),
         )
@@ -48,6 +52,7 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/tenants",
             get(handlers::list_tenants).post(handlers::create_tenant),
         )
+        .route("/api/v1/tenants/:tenant_id", delete(handlers::delete_tenant))
         .route("/api/v1/audit-logs", get(handlers::audit_logs))
         .layer(cors)
         .with_state(state)

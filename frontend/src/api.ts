@@ -31,6 +31,9 @@ export interface Leaf {
   leaf_hash: string;
   status: string;
   created_at: string;
+  manifest_hash: string | null;
+  revoked: boolean;
+  domain: string;
 }
 
 export interface ProofStep {
@@ -76,6 +79,9 @@ export interface Manifest {
   created_by: string;
   created_at: string;
   sbom_hex: string;
+  revoked: boolean;
+  revoked_at: string | null;
+  revoked_by: string | null;
 }
 
 export interface ApiKeyInfo {
@@ -105,6 +111,7 @@ export interface Tenant {
   name: string;
   created_by: string;
   created_at: string;
+  is_platform: boolean;
 }
 
 export interface CreateTenantResponse {
@@ -118,6 +125,7 @@ export interface WhoAmI {
   domain: string;
   namespace_scope: string;
   role: string;
+  is_platform_tenant: boolean;
 }
 
 export interface AuditEntry {
@@ -205,14 +213,15 @@ export const api = {
     file: File,
     format: 'cyclonedx' | 'spdx',
     namespace: string,
-    version: string
+    version: string,
+    tenantId?: string
   ): Promise<UploadResult> => {
     const form = new FormData();
     form.append('sbom_file', file);
     form.append('format', format);
     form.append('namespace', namespace);
     form.append('version', version);
-    return request('/api/v1/upload', { method: 'POST', body: form });
+    return request(`/api/v1/upload${tenantQs(tenantId)}`, { method: 'POST', body: form });
   },
 
   leaves: (limit = 50, offset = 0, tenantId?: string): Promise<Leaf[]> =>
@@ -230,6 +239,9 @@ export const api = {
 
   manifest: (manifestHash: string, tenantId?: string): Promise<Manifest> =>
     request(`/api/v1/manifest/${manifestHash}${tenantQs(tenantId)}`),
+
+  revokeManifest: (manifestHash: string, tenantId?: string): Promise<void> =>
+    request(`/api/v1/manifest/${manifestHash}/revoke${tenantQs(tenantId)}`, { method: 'POST' }),
 
   listKeys: (tenantId?: string): Promise<ApiKeyInfo[]> =>
     request(`/api/v1/keys${tenantQs(tenantId)}`),
@@ -257,6 +269,9 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     }),
+
+  deleteTenant: (tenantId: string): Promise<void> =>
+    request(`/api/v1/tenants/${tenantId}`, { method: 'DELETE' }),
 
   auditLogs: (limit = 100, tenantId?: string): Promise<AuditEntry[]> =>
     request(`/api/v1/audit-logs${tenantQs(tenantId, { limit })}`),

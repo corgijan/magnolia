@@ -41,6 +41,7 @@ See **[ARCHITECTURE.md](./ARCHITECTURE.md)** for deep dive.
      - `domain_admin` — full self-service over its own tenant: upload, read/download, manage its own keys/ACLs. Minted automatically as a new tenant's first key. Cannot create other tenants.
      - `uploader` — upload only (e.g. a CI pipeline that should only push, never browse)
      - `auditor` — read/annotate only, scoped strictly to its own tenant — other tenants are invisible, not just inaccessible
+   - **The platform tenant**: exactly one tenant is flagged `is_platform` (the `BOOTSTRAP_SUPER_ADMIN_KEY` tenant — never settable via the public API). Only a `super_admin` key belonging to *that* tenant can pass `?tenant_id=<uuid>` to act on another tenant's data/keys (see/manage all tenants). A `super_admin` key self-minted by any other tenant's `domain_admin` is still only as powerful as `domain_admin` within its own tenant — it does **not** gain cross-tenant reach just from the role name, which would otherwise be a privilege-escalation path.
 
 3. **Storage & Signing** (`crates/storage/`, `crates/signer/`)
    - ObjectStore trait (S3 + in-memory test impl)
@@ -78,7 +79,7 @@ The server binary is `crates/api/src/main.rs` (`cargo run --bin sbomstash-server
 - ✅ Proof endpoints (inclusion, consistency) with client-side verification in the web UI
 - ✅ Signed Tree Head history (`/api/v1/tree-head/latest`, `/api/v1/tree-head/:size`), per tenant
 - ✅ API key provisioning (`POST /api/v1/keys`) for your own tenant — key shown once, key listing, audit log endpoint
-- ✅ React web UI: dashboard, upload (with version), leaves (namespace-filtered), manifest lookup, proof verification + local JSON download, key management (create/revoke), tenant management, audit — nav only ever shows tabs your key's role is actually allowed to use, and your tenant/role/namespace scope is shown at the top
+- ✅ React web UI: dashboard, upload (with version), leaves (namespace-filtered), manifest lookup with a real SBOM artifact viewer (pretty-printed, component/package summary, local file download), proof verification + local JSON download, key management (create/revoke), tenant management, audit — nav only ever shows tabs your key's role is actually allowed to use, your tenant/role/namespace scope is shown at the top, and the platform super_admin gets a tenant selector to act on any other tenant
 - ✅ Server rebuilds each tenant's in-memory MMR from `merkle_leaves` on startup
 - ✅ Trait-based signer (LocalFileSigner) and storage (InMemoryStore)
 
@@ -137,12 +138,15 @@ Response:
 | GET | `/api/v1/proof/consistency/:old/:new` | auditor, domain_admin, super_admin | MMR consistency proof (`new` must equal current size) |
 | GET | `/api/v1/leaves?limit=&offset=` | auditor, domain_admin, super_admin | Recent leaves for your tenant, filtered to your key's `namespace_scope` (newest first) |
 | GET | `/api/v1/manifest/:manifest_hash` | auditor, domain_admin, super_admin | Manifest record + SBOM content (hex) — 404 if it belongs to another tenant or is outside your `namespace_scope` |
+| POST | `/api/v1/manifest/:manifest_hash/revoke` | auditor, domain_admin, super_admin (+ uploader if `DEV_MODE=true`) | Marks a manifest revoked — a status flag, not a delete; nothing is removed from the log or the Merkle tree. 400 if already revoked. |
 | POST | `/api/v1/keys` | domain_admin, super_admin | Create a key for your own tenant (key shown once) |
 | GET | `/api/v1/keys` | domain_admin, super_admin | List keys for your tenant |
 | POST | `/api/v1/keys/:key_id/revoke` | domain_admin, super_admin | Revoke a key belonging to your own tenant (irreversible) |
 | POST | `/api/v1/tenants` | super_admin only | Create a tenant + mint its first `domain_admin` key (key shown once) |
 | GET | `/api/v1/tenants` | super_admin only | List all tenants |
 | GET | `/api/v1/audit-logs?limit=` | auditor, domain_admin, super_admin | Audit entries for your tenant |
+
+All of the above (except `whoami`, `POST /api/v1/tenants`, `GET /api/v1/tenants`, and upload) accept an optional `?tenant_id=<uuid>` (or `tenant_id` in the JSON body for `POST /api/v1/keys`) to act on another tenant instead of your own — honored **only** for a `super_admin` key belonging to the platform tenant; everyone else gets 403.
 
 Inclusion proof response (hashes are hex strings):
 ```json
@@ -195,6 +199,12 @@ SERVER_ADDR=127.0.0.1:3000
 BOOTSTRAP_SUPER_ADMIN_KEY=deadbeef-dead-dead-dead-deadbeefdead:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
 BOOTSTRAP_TENANT_DOMAIN=test.example
 BOOTSTRAP_TENANT_NAME=Test Tenant
+
+# Optional, dev/test only: relaxes a small number of RBAC checks for local
+# testing convenience. Currently the only thing it affects: an uploader-role
+# key can revoke its own manifests (normally that needs auditor/domain_admin/
+# super_admin). Never set this in production.
+DEV_MODE=true
 ```
 
 ### Local Development Setup
@@ -220,12 +230,14 @@ docker run --name sbomstash-db \
   -d postgres:15
 ```
 
-2. Run schema (all four migrations, in order)
+2. Run schema (all six migrations, in order)
 ```bash
 psql -h localhost -U postgres -d sbomstash < migrations/20240821000000_initial_schema.sql
 psql -h localhost -U postgres -d sbomstash < migrations/20260821000001_manifests.sql
 psql -h localhost -U postgres -d sbomstash < migrations/20260822000001_tenants.sql
 psql -h localhost -U postgres -d sbomstash < migrations/20260822000002_versions_and_namespace_scoping.sql
+psql -h localhost -U postgres -d sbomstash < migrations/20260822000003_platform_tenant.sql
+psql -h localhost -U postgres -d sbomstash < migrations/20260822000004_manifest_revocation.sql
 ```
 
 3. (Optional) generate a signing key — the server auto-creates one at startup

@@ -17,6 +17,10 @@ pub struct AppState {
     pub signer: Arc<dyn Signer>,
     pub trees: Arc<Mutex<HashMap<Uuid, MerkleTree>>>,
     pub audit: Arc<AuditLogger>,
+    /// From the `DEV_MODE` env var. Relaxes a small number of RBAC checks
+    /// for local testing convenience (currently: who can revoke a
+    /// manifest) — never set this in production.
+    pub dev_mode: bool,
 }
 
 impl Clone for AppState {
@@ -27,6 +31,7 @@ impl Clone for AppState {
             signer: Arc::clone(&self.signer),
             trees: Arc::clone(&self.trees),
             audit: Arc::clone(&self.audit),
+            dev_mode: self.dev_mode,
         }
     }
 }

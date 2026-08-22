@@ -21,6 +21,9 @@ pub struct MerkleLeafRecord {
     pub leaf_hash: Vec<u8>,
     pub status: String,
     pub created_at: DateTime<Utc>,
+    pub manifest_hash: Option<String>,
+    pub revoked: bool,
+    pub domain: String,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -30,6 +33,7 @@ pub struct TenantRecord {
     pub name: String,
     pub created_by: String,
     pub created_at: DateTime<Utc>,
+    pub is_platform: bool,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -78,4 +82,7 @@ pub struct ManifestRecord {
     pub signature: Vec<u8>,
     pub created_by: String,
     pub created_at: DateTime<Utc>,
+    pub revoked: bool,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub revoked_by: Option<String>,
 }

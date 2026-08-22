@@ -55,14 +55,19 @@ function useTenantOverride(): string | undefined {
   return tenantId || undefined;
 }
 
-const TABS: { id: Tab; label: string; requires: RbacAction }[] = [
-  { id: 'dashboard', label: 'Dashboard', requires: 'read' },
-  { id: 'upload', label: 'Upload SBOM', requires: 'upload' },
-  { id: 'leaves', label: 'Leaves', requires: 'read' },
-  { id: 'proofs', label: 'Proofs', requires: 'read' },
-  { id: 'keys', label: 'API Keys', requires: 'manage_keys' },
-  { id: 'tenants', label: 'Tenants', requires: 'manage_tenants' },
-  { id: 'audit', label: 'Audit Log', requires: 'read' },
+// "workspace" = day-to-day SBOM work; "admin" = key/tenant/audit
+// administration — kept visually separate in the nav so the two don't blur
+// together (this is the "pull out user management" grouping).
+type TabGroup = 'workspace' | 'admin';
+
+const TABS: { id: Tab; label: string; requires: RbacAction; group: TabGroup }[] = [
+  { id: 'dashboard', label: 'Dashboard', requires: 'read', group: 'workspace' },
+  { id: 'upload', label: 'Upload SBOM', requires: 'upload', group: 'workspace' },
+  { id: 'leaves', label: 'SBOM Explorer', requires: 'read', group: 'workspace' },
+  { id: 'proofs', label: 'Proofs', requires: 'read', group: 'workspace' },
+  { id: 'keys', label: 'API Keys', requires: 'manage_keys', group: 'admin' },
+  { id: 'tenants', label: 'Tenants', requires: 'manage_tenants', group: 'admin' },
+  { id: 'audit', label: 'Audit Log', requires: 'read', group: 'admin' },
 ];
 
 function Hash({ value, chars = 16 }: { value: string; chars?: number }) {
@@ -75,6 +80,40 @@ function Hash({ value, chars = 16 }: { value: string; chars?: number }) {
 
 function Badge({ ok, children }: { ok: boolean; children: React.ReactNode }) {
   return <span className={`badge ${ok ? 'badge-ok' : 'badge-err'}`}>{children}</span>;
+}
+
+// Small monochrome icons (currentColor) for the tree views — deliberately
+// plain line icons rather than emoji, which render inconsistently (size,
+// color, style) across platforms.
+function FolderIcon() {
+  return (
+    <svg className="tree-icon tree-icon-folder" width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
+      <path
+        d="M1.75 3.75c0-.55.45-1 1-1h3.1c.24 0 .47.1.64.27l.98.98h5.78c.55 0 1 .45 1 1v6.25c0 .55-.45 1-1 1h-10.5c-.55 0-1-.45-1-1v-7.5z"
+        fill="currentColor"
+        fillOpacity="0.15"
+        stroke="currentColor"
+        strokeWidth="1.1"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function FileIcon() {
+  return (
+    <svg className="tree-icon tree-icon-file" width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
+      <path
+        d="M4.25 1.75h4.5l3 3v8.5a.5.5 0 0 1-.5.5h-7a.5.5 0 0 1-.5-.5v-11a.5.5 0 0 1 .5-.5z"
+        fill="currentColor"
+        fillOpacity="0.12"
+        stroke="currentColor"
+        strokeWidth="1.1"
+        strokeLinejoin="round"
+      />
+      <path d="M8.75 1.75v3h3" fill="none" stroke="currentColor" strokeWidth="1.1" strokeLinejoin="round" />
+    </svg>
+  );
 }
 
 function ErrorBox({ message }: { message: string }) {
@@ -225,7 +264,8 @@ function Dashboard({
 
 // ---------- Upload ----------
 
-function Upload({ onUploaded }: { onUploaded: (head: TreeHead) => void }) {
+function Upload({ onUploaded }: { onUploaded: (result: UploadResult) => void }) {
+  const tenantId = useTenantOverride();
   const [file, setFile] = useState<File | null>(null);
   const [format, setFormat] = useState<'cyclonedx' | 'spdx'>('cyclonedx');
   const [namespace, setNamespace] = useState('/');
@@ -239,9 +279,9 @@ function Upload({ onUploaded }: { onUploaded: (head: TreeHead) => void }) {
     setBusy(true);
     setError('');
     try {
-      const res = await api.upload(file, format, namespace, version.trim());
+      const res = await api.upload(file, format, namespace, version.trim(), tenantId);
       setResult(res);
-      onUploaded(res.signed_tree_head);
+      onUploaded(res);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -297,12 +337,8 @@ function Upload({ onUploaded }: { onUploaded: (head: TreeHead) => void }) {
             <span>{result.version}</span>
           </div>
           <div className="kv-row">
-            <span className="kv-label">domain</span>
-            <span>{result.domain}</span>
-          </div>
-          <div className="kv-row">
             <span className="kv-label">namespace</span>
-            <span>{result.namespace}</span>
+            <span>{result.domain}{result.namespace}</span>
           </div>
           <div className="kv-row">
             <span className="kv-label">leaf_index</span>
@@ -350,11 +386,163 @@ function formatBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(2)} MB`;
 }
 
+// "created_by"/"principal" is `apikey:<full key_id uuid>` — only show the
+// last 5 characters so it doesn't dump the full identifier everywhere; the
+// full value is still available on hover.
+function shortPrincipal(value: string): string {
+  if (!value) return '';
+  return `…${value.slice(-5)}`;
+}
+
+interface SbomTreeNode {
+  id: string;
+  label: string;
+  detail?: string;
+  children: SbomTreeNode[];
+}
+
+// CycloneDX component fields vary a lot; pull whatever's useful for the
+// detail line without assuming a strict shape.
+function cycloneDxDetail(c: unknown): string | undefined {
+  if (!c || typeof c !== 'object') return undefined;
+  const obj = c as Record<string, unknown>;
+  const bits = [obj.version, obj.type, obj.purl].filter((v) => typeof v === 'string') as string[];
+  return bits.length ? bits.join(' · ') : undefined;
+}
+
+/// Prefers the real dependency graph (`dependencies[]`: bom-ref -> dependsOn)
+/// over the `components[]` nesting, which is more about physical grouping
+/// than "depends on." Falls back to nested `components[]`, then a flat list.
+/// Circular refs (a real possibility in a dependency graph) are cut off
+/// rather than recursed into.
+function buildCycloneDxTree(doc: Record<string, unknown>): SbomTreeNode[] {
+  const byRef = new Map<string, Record<string, unknown>>();
+  const collect = (comps: unknown): void => {
+    if (!Array.isArray(comps)) return;
+    for (const c of comps) {
+      if (c && typeof c === 'object') {
+        const obj = c as Record<string, unknown>;
+        if (typeof obj['bom-ref'] === 'string') byRef.set(obj['bom-ref'] as string, obj);
+        collect(obj.components);
+      }
+    }
+  };
+  collect(doc.components);
+  const metaComponent = (doc.metadata as Record<string, unknown> | undefined)?.component as
+    | Record<string, unknown>
+    | undefined;
+  if (metaComponent && typeof metaComponent['bom-ref'] === 'string') {
+    byRef.set(metaComponent['bom-ref'] as string, metaComponent);
+  }
+
+  const nodeFor = (ref: string): SbomTreeNode => {
+    const c = byRef.get(ref);
+    const name = (c?.name as string | undefined) ?? ref;
+    return { id: ref, label: name, detail: cycloneDxDetail(c), children: [] };
+  };
+
+  const deps = doc.dependencies;
+  if (Array.isArray(deps) && deps.length > 0) {
+    const childrenOf = new Map<string, string[]>();
+    for (const d of deps) {
+      if (!d || typeof d !== 'object') continue;
+      const obj = d as Record<string, unknown>;
+      if (typeof obj.ref === 'string') {
+        childrenOf.set(obj.ref, Array.isArray(obj.dependsOn) ? (obj.dependsOn as string[]) : []);
+      }
+    }
+    const referenced = new Set<string>();
+    Array.from(childrenOf.values()).forEach((list) => list.forEach((r) => referenced.add(r)));
+    let roots = Array.from(childrenOf.keys()).filter((ref) => !referenced.has(ref));
+    if (roots.length === 0) roots = Array.from(childrenOf.keys());
+
+    const build = (ref: string, ancestors: Set<string>): SbomTreeNode => {
+      const node = nodeFor(ref);
+      if (ancestors.has(ref)) {
+        return { ...node, label: `${node.label} (circular reference)`, children: [] };
+      }
+      const nextAncestors = new Set(ancestors).add(ref);
+      node.children = (childrenOf.get(ref) ?? []).map((child) => build(child, nextAncestors));
+      return node;
+    };
+    return roots.map((ref) => build(ref, new Set()));
+  }
+
+  // No dependency graph: fall back to whatever nesting components[] has.
+  const fromComponents = (comps: unknown): SbomTreeNode[] => {
+    if (!Array.isArray(comps)) return [];
+    return comps.map((c) => {
+      const obj = (c ?? {}) as Record<string, unknown>;
+      const id = (obj['bom-ref'] as string | undefined) ?? (obj.name as string | undefined) ?? '?';
+      return {
+        id,
+        label: (obj.name as string | undefined) ?? id,
+        detail: cycloneDxDetail(obj),
+        children: fromComponents(obj.components),
+      };
+    });
+  };
+  return fromComponents(doc.components);
+}
+
+/// SPDX has no inherent hierarchy on packages[] — it's reconstructed from
+/// relationships[] (spdxElementId -> relatedSpdxElement). Falls back to a
+/// flat package list if there are no relationships to build a tree from.
+function buildSpdxTree(doc: Record<string, unknown>): SbomTreeNode[] {
+  const byId = new Map<string, Record<string, unknown>>();
+  if (Array.isArray(doc.packages)) {
+    for (const p of doc.packages) {
+      if (p && typeof p === 'object' && typeof (p as Record<string, unknown>).SPDXID === 'string') {
+        byId.set((p as Record<string, unknown>).SPDXID as string, p as Record<string, unknown>);
+      }
+    }
+  }
+
+  const nodeFor = (id: string): SbomTreeNode => {
+    const p = byId.get(id);
+    const name = (p?.name as string | undefined) ?? id;
+    const version = p?.versionInfo as string | undefined;
+    return { id, label: name, detail: version, children: [] };
+  };
+
+  const rels = doc.relationships;
+  if (Array.isArray(rels) && rels.length > 0) {
+    const childrenOf = new Map<string, string[]>();
+    for (const r of rels) {
+      if (!r || typeof r !== 'object') continue;
+      const obj = r as Record<string, unknown>;
+      const parent = obj.spdxElementId as string | undefined;
+      const child = obj.relatedSpdxElement as string | undefined;
+      if (!parent || !child) continue;
+      if (!childrenOf.has(parent)) childrenOf.set(parent, []);
+      childrenOf.get(parent)!.push(child);
+    }
+    const referenced = new Set<string>();
+    Array.from(childrenOf.values()).forEach((list) => list.forEach((c) => referenced.add(c)));
+    let roots = Array.from(childrenOf.keys()).filter((id) => !referenced.has(id));
+    if (roots.length === 0) roots = Array.from(byId.keys());
+
+    const build = (id: string, ancestors: Set<string>): SbomTreeNode => {
+      const node = nodeFor(id);
+      if (ancestors.has(id)) {
+        return { ...node, label: `${node.label} (circular reference)`, children: [] };
+      }
+      const nextAncestors = new Set(ancestors).add(id);
+      node.children = (childrenOf.get(id) ?? []).map((c) => build(c, nextAncestors));
+      return node;
+    };
+    return roots.map((id) => build(id, new Set()));
+  }
+
+  return Array.from(byId.keys()).map((id) => nodeFor(id));
+}
+
 interface SbomSummary {
   label: string;
   count: number;
   name?: string;
   pretty: string | null;
+  tree: SbomTreeNode[] | null;
 }
 
 function summarizeSbom(hex: string, format: string): SbomSummary {
@@ -362,7 +550,7 @@ function summarizeSbom(hex: string, format: string): SbomSummary {
   try {
     text = hexToText(hex);
   } catch {
-    return { label: 'components', count: 0, pretty: null };
+    return { label: 'components', count: 0, pretty: null, tree: null };
   }
   try {
     const doc = JSON.parse(text);
@@ -373,15 +561,57 @@ function summarizeSbom(hex: string, format: string): SbomSummary {
         count: doc.components.length,
         name: doc.metadata?.component?.name,
         pretty,
+        tree: buildCycloneDxTree(doc),
       };
     }
     if (format === 'spdx' && Array.isArray(doc.packages)) {
-      return { label: 'packages', count: doc.packages.length, name: doc.name, pretty };
+      return {
+        label: 'packages',
+        count: doc.packages.length,
+        name: doc.name,
+        pretty,
+        tree: buildSpdxTree(doc),
+      };
     }
-    return { label: 'top-level keys', count: Object.keys(doc).length, pretty };
+    return { label: 'top-level keys', count: Object.keys(doc).length, pretty, tree: null };
   } catch {
-    return { label: 'components', count: 0, pretty: text };
+    return { label: 'components', count: 0, pretty: text, tree: null };
   }
+}
+
+function SbomTreeRow({ node, depth }: { node: SbomTreeNode; depth: number }) {
+  const [open, setOpen] = useState(depth < 1);
+  const hasChildren = node.children.length > 0;
+  return (
+    <div>
+      <div
+        className={`sbom-tree-row${hasChildren ? ' clickable' : ''}`}
+        style={{ paddingLeft: depth * 18 }}
+        onClick={() => hasChildren && setOpen((o) => !o)}
+      >
+        <span className="sbom-tree-toggle">{hasChildren ? (open ? '▾' : '▸') : '·'}</span>
+        <span className="sbom-tree-label">{node.label}</span>
+        {node.detail && <span className="sbom-tree-detail">{node.detail}</span>}
+        {hasChildren && <span className="muted"> ({node.children.length})</span>}
+      </div>
+      {hasChildren && open && node.children.map((child, i) => (
+        <SbomTreeRow key={`${child.id}-${i}`} node={child} depth={depth + 1} />
+      ))}
+    </div>
+  );
+}
+
+function SbomTree({ roots }: { roots: SbomTreeNode[] }) {
+  if (roots.length === 0) {
+    return <div className="muted">No components/packages found to build a tree from.</div>;
+  }
+  return (
+    <div className="sbom-tree">
+      {roots.map((r, i) => (
+        <SbomTreeRow key={`${r.id}-${i}`} node={r} depth={0} />
+      ))}
+    </div>
+  );
 }
 
 function downloadBytes(filename: string, bytes: Uint8Array) {
@@ -397,9 +627,10 @@ function downloadBytes(filename: string, bytes: Uint8Array) {
 }
 
 function SbomArtifact({ manifest }: { manifest: Manifest }) {
-  const [expanded, setExpanded] = useState(false);
   const bytes = manifest.sbom_hex.length / 2;
   const summary = summarizeSbom(manifest.sbom_hex, manifest.sbom_format);
+  const hasTree = summary.tree !== null;
+  const [view, setView] = useState<'tree' | 'raw' | 'none'>(hasTree ? 'tree' : 'raw');
 
   return (
     <div className="sbom-artifact">
@@ -413,9 +644,18 @@ function SbomArtifact({ manifest }: { manifest: Manifest }) {
           </span>
         </div>
         <div className="form-row">
+          {hasTree && (
+            <button
+              className="btn"
+              disabled={view === 'tree'}
+              onClick={() => setView(view === 'tree' ? 'none' : 'tree')}
+            >
+              Tree view
+            </button>
+          )}
           {summary.pretty !== null && (
-            <button className="btn" onClick={() => setExpanded(!expanded)}>
-              {expanded ? 'Hide raw SBOM' : 'Show raw SBOM'}
+            <button className="btn" onClick={() => setView(view === 'raw' ? 'none' : 'raw')}>
+              {view === 'raw' ? 'Hide raw SBOM' : 'Show raw SBOM'}
             </button>
           )}
           <button
@@ -428,63 +668,115 @@ function SbomArtifact({ manifest }: { manifest: Manifest }) {
           </button>
         </div>
       </div>
-      {expanded && summary.pretty !== null && <pre className="json sbom-json">{summary.pretty}</pre>}
+      {view === 'tree' && hasTree && <SbomTree roots={summary.tree as SbomTreeNode[]} />}
+      {view === 'raw' && summary.pretty !== null && <pre className="json sbom-json">{summary.pretty}</pre>}
     </div>
   );
 }
 
-function ManifestLookup() {
-  const tenantId = useTenantOverride();
+function SbomSearchBox({ onSelect }: { onSelect: (hash: string) => void }) {
   const [hash, setHash] = useState('');
-  const [manifest, setManifest] = useState<Manifest | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
+  return (
+    <div className="form-row">
+      <label className="field">
+        <span>Manifest hash</span>
+        <input
+          value={hash}
+          onChange={(e) => setHash(e.target.value)}
+          placeholder="paste a manifest_hash"
+        />
+      </label>
+      <button className="btn primary" disabled={!hash.trim()} onClick={() => onSelect(hash.trim())}>
+        Look up
+      </button>
+    </div>
+  );
+}
 
-  const lookup = async () => {
-    if (!hash.trim()) return;
+function SbomDetailPanel({ hash, tenantId }: { hash: string; tenantId?: string }) {
+  const [manifest, setManifest] = useState<Manifest | null>(null);
+  const [busy, setBusy] = useState(true);
+  const [error, setError] = useState('');
+  const [revoking, setRevoking] = useState(false);
+  const [revokeError, setRevokeError] = useState('');
+
+  const load = useCallback(async () => {
     setBusy(true);
     setError('');
-    setManifest(null);
     try {
-      setManifest(await api.manifest(hash.trim(), tenantId));
+      setManifest(await api.manifest(hash, tenantId));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      setManifest(null);
     } finally {
       setBusy(false);
+    }
+  }, [hash, tenantId]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const revoke = async () => {
+    if (!manifest) return;
+    if (
+      !window.confirm(
+        'This revocation is final and cannot be undone. The manifest stays in the log (nothing is deleted), but it will be permanently marked as revoked/superseded.\n\nRevoke this manifest?'
+      )
+    ) {
+      return;
+    }
+    setRevoking(true);
+    setRevokeError('');
+    try {
+      await api.revokeManifest(manifest.manifest_hash, tenantId);
+      await load(); // refresh to pick up revoked status
+    } catch (e) {
+      setRevokeError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRevoking(false);
     }
   };
 
   return (
     <div className="card">
-      <h2>Manifest Lookup</h2>
-      <div className="form-row">
-        <label className="field">
-          <span>Manifest hash</span>
-          <input
-            value={hash}
-            onChange={(e) => setHash(e.target.value)}
-            placeholder="paste a manifest_hash from an upload"
-          />
-        </label>
-        <button className="btn primary" disabled={!hash.trim() || busy} onClick={lookup}>
-          {busy ? 'Looking up…' : 'Look up'}
-        </button>
-      </div>
+      <h2>SBOM Details</h2>
+      {busy && <Spinner label="Loading…" />}
       {error && <ErrorBox message={error} />}
-      {manifest && (
+      {!busy && manifest && (
         <div className="result-box">
-          <SbomArtifact manifest={manifest} />
+          <SbomArtifact key={manifest.manifest_hash} manifest={manifest} />
+          <div className="kv-row">
+            <span className="kv-label">status</span>
+            <Badge ok={!manifest.revoked}>{manifest.revoked ? 'revoked' : 'active'}</Badge>
+            {!manifest.revoked && (
+              <button className="btn" disabled={revoking} onClick={revoke}>
+                {revoking ? 'Revoking…' : 'Revoke'}
+              </button>
+            )}
+          </div>
+          {revokeError && <ErrorBox message={revokeError} />}
+          {manifest.revoked && (
+            <>
+              <div className="kv-row">
+                <span className="kv-label">revoked_by</span>
+                <span title={manifest.revoked_by ?? ''}>
+                  {manifest.revoked_by ? shortPrincipal(manifest.revoked_by) : '—'}
+                </span>
+              </div>
+              <div className="kv-row">
+                <span className="kv-label">revoked_at</span>
+                <span>{manifest.revoked_at ? new Date(manifest.revoked_at).toLocaleString() : '—'}</span>
+              </div>
+            </>
+          )}
           <div className="kv-row">
             <span className="kv-label">version</span>
             <span>{manifest.version}</span>
           </div>
           <div className="kv-row">
-            <span className="kv-label">domain</span>
-            <span>{manifest.domain}</span>
-          </div>
-          <div className="kv-row">
             <span className="kv-label">namespace</span>
-            <span>{manifest.namespace}</span>
+            <span>{manifest.domain}{manifest.namespace}</span>
           </div>
           <div className="kv-row">
             <span className="kv-label">sbom_hash</span>
@@ -496,7 +788,7 @@ function ManifestLookup() {
           </div>
           <div className="kv-row">
             <span className="kv-label">created_by</span>
-            <span>{manifest.created_by}</span>
+            <span title={manifest.created_by}>{shortPrincipal(manifest.created_by)}</span>
           </div>
           <div className="kv-row">
             <span className="kv-label">created_at</span>
@@ -508,12 +800,145 @@ function ManifestLookup() {
   );
 }
 
+// ---------- Namespace tree (folders = path segments, SBOMs = leaves) ----------
+
+interface NamespaceTreeNode {
+  id: string;
+  name: string;
+  children: NamespaceTreeNode[];
+  leaves: Leaf[];
+}
+
+/// Turns namespaces like "/products/v1" into nested folders ("products" >
+/// "v1"), with each leaf placed as a file under the folder matching its
+/// exact namespace. Multiple leaves can share one folder (repeat uploads to
+/// the same namespace); a leaf at "/" lands at the root, not in a folder.
+function buildNamespaceTree(leaves: Leaf[], domain: string): NamespaceTreeNode {
+  const root: NamespaceTreeNode = { id: domain || '/', name: domain || '/', children: [], leaves: [] };
+  for (const leaf of leaves) {
+    const parts = leaf.namespace.split('/').filter(Boolean);
+    let node = root;
+    let path = '';
+    for (const part of parts) {
+      path += '/' + part;
+      let child = node.children.find((c) => c.name === part);
+      if (!child) {
+        child = { id: path, name: part, children: [], leaves: [] };
+        node.children.push(child);
+      }
+      node = child;
+    }
+    node.leaves.push(leaf);
+  }
+  const sortRec = (n: NamespaceTreeNode) => {
+    n.children.sort((a, b) => a.name.localeCompare(b.name));
+    n.children.forEach(sortRec);
+  };
+  sortRec(root);
+  return root;
+}
+
+function SbomLeafRow({
+  leaf,
+  depth,
+  onViewSbom,
+}: {
+  leaf: Leaf;
+  depth: number;
+  onViewSbom: (hash: string) => void;
+}) {
+  return (
+    <div
+      className={`sbom-tree-row${leaf.manifest_hash ? ' clickable' : ''}`}
+      style={{ paddingLeft: depth * 18 }}
+      onClick={() => leaf.manifest_hash && onViewSbom(leaf.manifest_hash)}
+      title={leaf.manifest_hash ? 'View SBOM' : 'No manifest available'}
+    >
+      <FileIcon />
+      <span className="sbom-tree-label">
+        <Hash value={leaf.leaf_hash} chars={16} />
+      </span>
+      <span className="sbom-tree-detail">
+        seq {leaf.seq_id} · {new Date(leaf.created_at).toLocaleDateString()}
+      </span>
+      {leaf.revoked && <Badge ok={false}>revoked</Badge>}
+    </div>
+  );
+}
+
+function NamespaceFolderRow({
+  node,
+  depth,
+  onViewSbom,
+}: {
+  node: NamespaceTreeNode;
+  depth: number;
+  onViewSbom: (hash: string) => void;
+}) {
+  // depth 0 is now the org/domain root, so expand it and its immediate
+  // children by default — otherwise everything would start collapsed
+  // behind one extra click.
+  const [open, setOpen] = useState(depth < 2);
+  const hasContent = node.children.length > 0 || node.leaves.length > 0;
+  return (
+    <div>
+      <div
+        className={`sbom-tree-row${hasContent ? ' clickable' : ''}`}
+        style={{ paddingLeft: depth * 18 }}
+        onClick={() => hasContent && setOpen((o) => !o)}
+      >
+        <span className="sbom-tree-toggle">{hasContent ? (open ? '▾' : '▸') : '·'}</span>
+        <FolderIcon />
+        <span className="sbom-tree-label">{node.name}</span>
+        <span className="muted">
+          {' '}
+          ({node.leaves.length} SBOM{node.leaves.length === 1 ? '' : 's'}
+          {node.children.length > 0 ? `, ${node.children.length} sub` : ''})
+        </span>
+      </div>
+      {open && (
+        <>
+          {node.leaves.map((leaf) => (
+            <SbomLeafRow key={leaf.seq_id} leaf={leaf} depth={depth + 1} onViewSbom={onViewSbom} />
+          ))}
+          {node.children.map((child) => (
+            <NamespaceFolderRow key={child.id} node={child} depth={depth + 1} onViewSbom={onViewSbom} />
+          ))}
+        </>
+      )}
+    </div>
+  );
+}
+
+function NamespaceTree({ leaves, onViewSbom }: { leaves: Leaf[]; onViewSbom: (hash: string) => void }) {
+  // All leaves in one call belong to one tenant, so they share one domain —
+  // shown as the tree's root folder, e.g. "myorg.example" > "products" >
+  // "v1" > (SBOM), which reads the same as "myorg.example/products/v1".
+  const domain = leaves[0]?.domain ?? '';
+  const root = buildNamespaceTree(leaves, domain);
+  if (root.children.length === 0 && root.leaves.length === 0) {
+    return <div className="muted">No leaves yet.</div>;
+  }
+  return (
+    <div className="sbom-tree">
+      <NamespaceFolderRow node={root} depth={0} onViewSbom={onViewSbom} />
+    </div>
+  );
+}
+
 // ---------- Leaves ----------
 
-function Leaves() {
+function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
   const tenantId = useTenantOverride();
   const [leaves, setLeaves] = useState<Leaf[] | null>(null);
   const [error, setError] = useState('');
+  // Leaves fully remounts each time you switch to this tab (App renders it
+  // conditionally), so this lazy init correctly re-seeds the selection when
+  // jumping here right after an upload, without needing to track/clear a
+  // "consumed" flag.
+  const [selectedHash, setSelectedHash] = useState<string | undefined>(initialSelectedHash);
+  const [view, setView] = useState<'tree' | 'table'>('tree');
+  const [showRevoked, setShowRevoked] = useState(false);
 
   const load = useCallback(() => {
     setError('');
@@ -524,44 +949,85 @@ function Leaves() {
 
   useEffect(load, [load]);
 
+  // Revoked SBOMs are superseded/invalid, so they're hidden from the browse
+  // views by default — "Show revoked" brings them back (visually marked).
+  // Either way they're still fully retrievable directly by hash; nothing is
+  // ever deleted.
+  const visibleLeaves = leaves ? (showRevoked ? leaves : leaves.filter((l) => !l.revoked)) : null;
+
   return (
-    <div className="stack">
-    <ManifestLookup />
-    <div className="card">
-      <div className="card-header">
-        <h2>Merkle Leaves</h2>
-        <button className="btn" onClick={load}>Refresh</button>
-      </div>
-      {error && <ErrorBox message={error} />}
-      {leaves === null && !error && <Spinner label="Loading leaves…" />}
-      {leaves && leaves.length === 0 && <div className="muted">No leaves yet.</div>}
-      {leaves && leaves.length > 0 && (
-        <table className="table">
-          <thead>
-            <tr>
-              <th>seq</th>
-              <th>leaf_index</th>
-              <th>leaf_hash</th>
-              <th>namespace</th>
-              <th>status</th>
-              <th>created</th>
-            </tr>
-          </thead>
-          <tbody>
-            {leaves.map((leaf) => (
-              <tr key={leaf.seq_id}>
-                <td>{leaf.seq_id}</td>
-                <td>{leaf.leaf_index}</td>
-                <td><Hash value={leaf.leaf_hash} /></td>
-                <td>{leaf.namespace}</td>
-                <td><Badge ok={leaf.status === 'locked'}>{leaf.status}</Badge></td>
-                <td>{new Date(leaf.created_at).toLocaleString()}</td>
+    <div className="explorer-layout">
+      <div className="card explorer-left">
+        <div className="card-header">
+          <h2>SBOM Explorer</h2>
+          <button className="btn" onClick={load}>Refresh</button>
+        </div>
+        <SbomSearchBox onSelect={setSelectedHash} />
+        <div className="form-row explorer-filters">
+          <button className="btn" disabled={view === 'tree'} onClick={() => setView('tree')}>
+            Namespace tree
+          </button>
+          <button className="btn" disabled={view === 'table'} onClick={() => setView('table')}>
+            Table
+          </button>
+          <label className="checkbox-field">
+            <input
+              type="checkbox"
+              checked={showRevoked}
+              onChange={(e) => setShowRevoked(e.target.checked)}
+            />
+            Show revoked
+          </label>
+        </div>
+        {error && <ErrorBox message={error} />}
+        {visibleLeaves === null && !error && <Spinner label="Loading leaves…" />}
+        {visibleLeaves && visibleLeaves.length === 0 && <div className="muted">No leaves yet.</div>}
+        {visibleLeaves && visibleLeaves.length > 0 && view === 'tree' && (
+          <NamespaceTree leaves={visibleLeaves} onViewSbom={setSelectedHash} />
+        )}
+        {visibleLeaves && visibleLeaves.length > 0 && view === 'table' && (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>seq</th>
+                <th>leaf_index</th>
+                <th>leaf_hash</th>
+                <th>namespace</th>
+                <th>status</th>
+                <th>created</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
-    </div>
+            </thead>
+            <tbody>
+              {visibleLeaves.map((leaf) => (
+                <tr
+                  key={leaf.seq_id}
+                  className={leaf.manifest_hash ? 'row-clickable' : ''}
+                  onClick={() => leaf.manifest_hash && setSelectedHash(leaf.manifest_hash)}
+                >
+                  <td>{leaf.seq_id}</td>
+                  <td>{leaf.leaf_index}</td>
+                  <td><Hash value={leaf.leaf_hash} /></td>
+                  <td>{leaf.domain}{leaf.namespace}</td>
+                  <td>
+                    <Badge ok={leaf.status === 'locked'}>{leaf.status}</Badge>
+                    {leaf.revoked && <Badge ok={false}>revoked</Badge>}
+                  </td>
+                  <td>{new Date(leaf.created_at).toLocaleString()}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+      <div className="explorer-right">
+        {selectedHash ? (
+          <SbomDetailPanel key={selectedHash} hash={selectedHash} tenantId={tenantId} />
+        ) : (
+          <div className="card">
+            <div className="muted">Select an SBOM on the left to view its details.</div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -942,12 +1408,11 @@ function TenantSelector() {
       className="tenant-selector"
       value={tenantId}
       onChange={(e) => setTenantId(e.target.value)}
-      title="Act on another tenant (super_admin only)"
+      title="Tenant to act as (platform super_admin only)"
     >
-      <option value="">My tenant</option>
       {tenants.map((t) => (
-        <option key={t.id} value={t.id}>
-          {t.domain}
+        <option key={t.id} value={t.id} title={t.domain}>
+          {t.name}
         </option>
       ))}
     </select>
@@ -956,13 +1421,15 @@ function TenantSelector() {
 
 // ---------- Tenants ----------
 
-function Tenants() {
+function Tenants({ isPlatform }: { isPlatform: boolean }) {
   const [tenants, setTenants] = useState<Tenant[] | null>(null);
   const [domain, setDomain] = useState('');
   const [name, setName] = useState('');
   const [created, setCreated] = useState<CreateTenantResponse | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState('');
 
   const load = useCallback(() => {
     api.listTenants()
@@ -971,6 +1438,26 @@ function Tenants() {
   }, []);
 
   useEffect(load, [load]);
+
+  const deleteTenant = async (t: Tenant) => {
+    if (
+      !window.confirm(
+        `Delete tenant "${t.name}" (${t.domain})?\n\nThis is final and cannot be undone. It permanently removes ALL of that tenant's data: every API key, every uploaded SBOM, its entire Merkle tree/signed-tree-head history, and its audit log.\n\nType nothing needed — click OK only if you're certain.`
+      )
+    ) {
+      return;
+    }
+    setDeletingId(t.id);
+    setDeleteError('');
+    try {
+      await api.deleteTenant(t.id);
+      load();
+    } catch (e) {
+      setDeleteError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDeletingId(null);
+    }
+  };
 
   const create = async () => {
     setBusy(true);
@@ -1040,6 +1527,7 @@ function Tenants() {
           <h2>Tenants</h2>
           <button className="btn" onClick={load}>Refresh</button>
         </div>
+        {deleteError && <ErrorBox message={deleteError} />}
         {tenants === null && <Spinner label="Loading tenants…" />}
         {tenants && tenants.length === 0 && <div className="muted">No tenants yet.</div>}
         {tenants && tenants.length > 0 && (
@@ -1050,15 +1538,32 @@ function Tenants() {
                 <th>name</th>
                 <th>created by</th>
                 <th>created</th>
+                {isPlatform && <th></th>}
               </tr>
             </thead>
             <tbody>
               {tenants.map((t) => (
                 <tr key={t.id}>
                   <td>{t.domain}</td>
-                  <td>{t.name}</td>
-                  <td title={t.created_by}>{t.created_by}</td>
+                  <td>
+                    {t.name}
+                    {t.is_platform && <Badge ok>platform</Badge>}
+                  </td>
+                  <td title={t.created_by}>{shortPrincipal(t.created_by)}</td>
                   <td>{new Date(t.created_at).toLocaleString()}</td>
+                  {isPlatform && (
+                    <td>
+                      {!t.is_platform && (
+                        <button
+                          className="btn"
+                          disabled={deletingId === t.id}
+                          onClick={() => deleteTenant(t)}
+                        >
+                          {deletingId === t.id ? 'Deleting…' : 'Delete'}
+                        </button>
+                      )}
+                    </td>
+                  )}
                 </tr>
               ))}
             </tbody>
@@ -1110,7 +1615,7 @@ function Audit() {
             {entries.map((e) => (
               <tr key={e.id}>
                 <td>{new Date(e.created_at).toLocaleString()}</td>
-                <td title={e.principal}>{e.principal.slice(0, 16)}</td>
+                <td title={e.principal}>{shortPrincipal(e.principal)}</td>
                 <td>{e.action}</td>
                 <td title={e.resource}><Hash value={e.resource} chars={20} /></td>
                 <td><Badge ok={e.result === 'success'}>{e.result}</Badge></td>
@@ -1191,6 +1696,7 @@ export default function App() {
   const [apiKey, setKey] = useState('');
   const [treeHead, setTreeHead] = useState<TreeHead | null>(null);
   const [headError, setHeadError] = useState('');
+  const [pendingSbomHash, setPendingSbomHash] = useState<string | undefined>(undefined);
   const [whoami, setWhoami] = useState<WhoAmI | null>(null);
   const [checkingKey, setCheckingKey] = useState(false);
   const [keyError, setKeyError] = useState('');
@@ -1220,7 +1726,11 @@ export default function App() {
         if (!mounted) return;
         setWhoami(w);
         setKeyError('');
-        setViewTenantId('');
+        // Only the platform super_admin has a tenant selector at all — for
+        // everyone else this must stay empty (no override ever sent).
+        // Default the selector to the key's own tenant, shown as a real
+        // entry in the list rather than a separate "My tenant" option.
+        setViewTenantId(w.is_platform_tenant ? w.tenant_id : '');
       })
       .catch((e) => {
         if (!mounted) return;
@@ -1266,6 +1776,8 @@ export default function App() {
   const logOut = () => applyKey('');
 
   const visibleTabs = whoami ? TABS.filter((t) => roleCan(whoami.role, t.requires)) : [];
+  const workspaceTabs = visibleTabs.filter((t) => t.group === 'workspace');
+  const adminTabs = visibleTabs.filter((t) => t.group === 'admin');
 
   // If the current tab isn't allowed for this key's role (e.g. a different,
   // less-privileged key was just logged in), bounce to the first tab it can
@@ -1300,51 +1812,89 @@ export default function App() {
 
   return (
     <TenantOverrideContext.Provider value={{ tenantId: viewTenantId, setTenantId: setViewTenantId }}>
-      <div className="app">
-        <header className="app-header">
-          <div className="brand">
+      <div className="app app-shell">
+        <aside className="sidebar">
+          <div className="sidebar-brand">
             <span className="brand-mark">◆</span> sbomStash
+          </div>
+
+          <nav className="sidebar-nav">
+            {workspaceTabs.length > 0 && (
+              <div className="sidebar-group">
+                <div className="sidebar-group-label">Workspace</div>
+                {workspaceTabs.map((t) => (
+                  <button
+                    key={t.id}
+                    className={`sidebar-link ${tab === t.id ? 'active' : ''}`}
+                    onClick={() => setTab(t.id)}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+            )}
+            {adminTabs.length > 0 && (
+              <div className="sidebar-group">
+                <div className="sidebar-group-label">Admin</div>
+                {adminTabs.map((t) => (
+                  <button
+                    key={t.id}
+                    className={`sidebar-link ${tab === t.id ? 'active' : ''}`}
+                    onClick={() => setTab(t.id)}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </nav>
+
+          <div className="sidebar-footer">
+            {whoami.is_platform_tenant && <TenantSelector />}
             <span className="tenant-badge" title="tenant domain · role · namespace scope">
               {whoami.domain} · {whoami.role} · {whoami.namespace_scope}
             </span>
-          </div>
-          <div className="key-field">
-            {whoami.role === 'super_admin' && <TenantSelector />}
             <button className="btn" onClick={logOut}>
               Log out
             </button>
           </div>
-        </header>
+        </aside>
 
-        {viewTenantId && (
-          <div className="viewing-banner">
-            Acting on another tenant — changes here affect that tenant, not your own.
-          </div>
-        )}
-
-        <nav className="tabs">
-          {visibleTabs.map((t) => (
-            <button
-              key={t.id}
-              className={`tab ${tab === t.id ? 'active' : ''}`}
-              onClick={() => setTab(t.id)}
-            >
-              {t.label}
-            </button>
-          ))}
-        </nav>
-
-        <main className="content">
-          {tab === 'dashboard' && roleCan(whoami.role, 'read') && (
-            <Dashboard treeHead={treeHead} onRefresh={refreshHead} headError={headError} />
+        <div className="main-column">
+          {viewTenantId !== '' && viewTenantId !== whoami.tenant_id && (
+            <div className="viewing-banner">
+              Acting on another tenant — changes here affect that tenant, not your own.
+            </div>
           )}
-          {tab === 'upload' && roleCan(whoami.role, 'upload') && <Upload onUploaded={setTreeHead} />}
-          {tab === 'leaves' && roleCan(whoami.role, 'read') && <Leaves />}
-          {tab === 'proofs' && roleCan(whoami.role, 'read') && <Proofs treeHead={treeHead} />}
-          {tab === 'keys' && roleCan(whoami.role, 'manage_keys') && <Keys />}
-          {tab === 'tenants' && roleCan(whoami.role, 'manage_tenants') && <Tenants />}
-          {tab === 'audit' && roleCan(whoami.role, 'read') && <Audit />}
-        </main>
+
+          <main className="content">
+            {tab === 'dashboard' && roleCan(whoami.role, 'read') && (
+              <Dashboard treeHead={treeHead} onRefresh={refreshHead} headError={headError} />
+            )}
+            {tab === 'upload' && roleCan(whoami.role, 'upload') && (
+              <Upload
+                onUploaded={(result) => {
+                  setTreeHead(result.signed_tree_head);
+                  setPendingSbomHash(result.manifest_hash);
+                  // An upload-only key can't see the Explorer (needs Read)
+                  // — nothing to jump to in that case, so stay put.
+                  if (roleCan(whoami.role, 'read')) {
+                    setTab('leaves');
+                  }
+                }}
+              />
+            )}
+            {tab === 'leaves' && roleCan(whoami.role, 'read') && (
+              <Leaves initialSelectedHash={pendingSbomHash} />
+            )}
+            {tab === 'proofs' && roleCan(whoami.role, 'read') && <Proofs treeHead={treeHead} />}
+            {tab === 'keys' && roleCan(whoami.role, 'manage_keys') && <Keys />}
+            {tab === 'tenants' && roleCan(whoami.role, 'manage_tenants') && (
+              <Tenants isPlatform={whoami.is_platform_tenant} />
+            )}
+            {tab === 'audit' && roleCan(whoami.role, 'read') && <Audit />}
+          </main>
+        </div>
       </div>
     </TenantOverrideContext.Provider>
   );

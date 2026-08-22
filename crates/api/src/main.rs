@@ -46,12 +46,20 @@ async fn main() {
         }
     }
 
+    let dev_mode = std::env::var("DEV_MODE")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    if dev_mode {
+        tracing::warn!("DEV_MODE=true — RBAC is relaxed for manifest revocation; never set this in production");
+    }
+
     let state = AppState {
         db: Arc::new(db),
         storage,
         signer,
         trees: Arc::new(Mutex::new(trees)),
         audit: Arc::new(AuditLogger::new()),
+        dev_mode,
     };
 
     let app = create_router(state);
@@ -82,28 +90,35 @@ async fn bootstrap_super_admin_from_env(db: &Database) {
         return;
     };
 
-    match db.lookup_api_key(key_id).await {
-        Ok(Some(_)) => {
-            tracing::info!(%key_id, "bootstrap super_admin key already exists; skipping");
-            return;
-        }
-        Ok(None) => {}
+    let key_exists = match db.lookup_api_key(key_id).await {
+        Ok(existing) => existing.is_some(),
         Err(e) => {
             tracing::warn!(error = %e, "failed to check for existing bootstrap key; skipping bootstrap");
             return;
         }
-    }
+    };
 
     let domain = std::env::var("BOOTSTRAP_TENANT_DOMAIN")
         .unwrap_or_else(|_| "test.example".to_string());
     let name = std::env::var("BOOTSTRAP_TENANT_NAME")
         .unwrap_or_else(|_| "Bootstrap Test Tenant".to_string());
 
+    // Ensure the tenant exists and is marked as the platform tenant on
+    // every startup — not just the first — so an environment that had this
+    // bootstrap key from before `is_platform` was introduced gets upgraded
+    // instead of silently staying non-platform forever.
     let tenant_id = match db.get_tenant_by_domain(&domain).await {
-        Ok(Some(t)) => t.id,
+        Ok(Some(t)) => {
+            if !t.is_platform {
+                if let Err(e) = db.mark_tenant_platform(t.id).await {
+                    tracing::warn!(error = %e, "failed to mark bootstrap tenant as platform");
+                }
+            }
+            t.id
+        }
         Ok(None) => {
             let id = uuid::Uuid::new_v4();
-            if let Err(e) = db.insert_tenant(id, &domain, &name, "bootstrap-env").await {
+            if let Err(e) = db.insert_tenant(id, &domain, &name, "bootstrap-env", true).await {
                 tracing::warn!(error = %e, "failed to create bootstrap tenant; skipping bootstrap");
                 return;
             }
@@ -114,6 +129,11 @@ async fn bootstrap_super_admin_from_env(db: &Database) {
             return;
         }
     };
+
+    if key_exists {
+        tracing::info!(%key_id, "bootstrap super_admin key already exists; skipping key creation");
+        return;
+    }
 
     let hashed = match (sbomstash_auth::ApiKey {
         key: secret.to_string(),

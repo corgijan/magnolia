@@ -36,11 +36,12 @@ impl Database {
         domain: &str,
         name: &str,
         created_by: &str,
+        is_platform: bool,
     ) -> Result<(), DbError> {
         sqlx::query(
             r#"
-            INSERT INTO tenants (id, domain, name, created_by, created_at)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO tenants (id, domain, name, created_by, created_at, is_platform)
+            VALUES ($1, $2, $3, $4, $5, $6)
             "#,
         )
         .bind(id)
@@ -48,6 +49,7 @@ impl Database {
         .bind(name)
         .bind(created_by)
         .bind(chrono::Utc::now())
+        .bind(is_platform)
         .execute(&self.pool)
         .await
         .map_err(map_query_error)?;
@@ -55,9 +57,37 @@ impl Database {
         Ok(())
     }
 
+    /// Idempotently marks a tenant as the platform tenant (super_admin keys
+    /// in it can act across all other tenants). Only ever called from the
+    /// `BOOTSTRAP_SUPER_ADMIN_KEY` startup path — never reachable via the
+    /// public API.
+    pub async fn mark_tenant_platform(&self, id: Uuid) -> Result<(), DbError> {
+        sqlx::query("UPDATE tenants SET is_platform = TRUE WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DbError::QueryError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Deletes a tenant and, via `ON DELETE CASCADE`, everything scoped to
+    /// it (keys, leaves, manifests, signed tree heads, audit log). The
+    /// caller is responsible for gating who may call this and for refusing
+    /// to ever delete the platform tenant — this is a raw, unconditional
+    /// delete at the DB layer. Returns `true` if a row existed and was
+    /// removed.
+    pub async fn delete_tenant(&self, id: Uuid) -> Result<bool, DbError> {
+        let result = sqlx::query("DELETE FROM tenants WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DbError::QueryError(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn get_tenant(&self, id: Uuid) -> Result<Option<TenantRecord>, DbError> {
         sqlx::query_as::<_, TenantRecord>(
-            "SELECT id, domain, name, created_by, created_at FROM tenants WHERE id = $1",
+            "SELECT id, domain, name, created_by, created_at, is_platform FROM tenants WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -70,7 +100,7 @@ impl Database {
         domain: &str,
     ) -> Result<Option<TenantRecord>, DbError> {
         sqlx::query_as::<_, TenantRecord>(
-            "SELECT id, domain, name, created_by, created_at FROM tenants WHERE domain = $1",
+            "SELECT id, domain, name, created_by, created_at, is_platform FROM tenants WHERE domain = $1",
         )
         .bind(domain)
         .fetch_optional(&self.pool)
@@ -80,7 +110,7 @@ impl Database {
 
     pub async fn list_tenants(&self) -> Result<Vec<TenantRecord>, DbError> {
         sqlx::query_as::<_, TenantRecord>(
-            "SELECT id, domain, name, created_by, created_at FROM tenants ORDER BY created_at DESC",
+            "SELECT id, domain, name, created_by, created_at, is_platform FROM tenants ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
         .await
@@ -184,7 +214,15 @@ impl Database {
         seq_id: i64,
     ) -> Result<Option<MerkleLeafRecord>, DbError> {
         sqlx::query_as::<_, MerkleLeafRecord>(
-            "SELECT seq_id, tenant_id, tenant_leaf_index, namespace, sbom_s3_key, leaf_hash, status, created_at FROM merkle_leaves WHERE seq_id = $1"
+            r#"
+            SELECT ml.seq_id, ml.tenant_id, ml.tenant_leaf_index, ml.namespace, ml.sbom_s3_key,
+                   ml.leaf_hash, ml.status, ml.created_at, m.manifest_hash,
+                   COALESCE(m.revoked, FALSE) AS revoked, t.domain
+            FROM merkle_leaves ml
+            LEFT JOIN manifests m ON m.leaf_seq_id = ml.seq_id
+            JOIN tenants t ON t.id = ml.tenant_id
+            WHERE ml.seq_id = $1
+            "#,
         )
         .bind(seq_id)
         .fetch_optional(&self.pool)
@@ -204,11 +242,15 @@ impl Database {
     ) -> Result<Vec<MerkleLeafRecord>, DbError> {
         sqlx::query_as::<_, MerkleLeafRecord>(
             r#"
-            SELECT seq_id, tenant_id, tenant_leaf_index, namespace, sbom_s3_key, leaf_hash, status, created_at
-            FROM merkle_leaves
-            WHERE tenant_id = $1
-              AND ($4 = '/' OR namespace = $4 OR starts_with(namespace, $4 || '/'))
-            ORDER BY seq_id DESC LIMIT $2 OFFSET $3
+            SELECT ml.seq_id, ml.tenant_id, ml.tenant_leaf_index, ml.namespace, ml.sbom_s3_key,
+                   ml.leaf_hash, ml.status, ml.created_at, m.manifest_hash,
+                   COALESCE(m.revoked, FALSE) AS revoked, t.domain
+            FROM merkle_leaves ml
+            LEFT JOIN manifests m ON m.leaf_seq_id = ml.seq_id
+            JOIN tenants t ON t.id = ml.tenant_id
+            WHERE ml.tenant_id = $1
+              AND ($4 = '/' OR ml.namespace = $4 OR starts_with(ml.namespace, $4 || '/'))
+            ORDER BY ml.seq_id DESC LIMIT $2 OFFSET $3
             "#,
         )
         .bind(tenant_id)
@@ -421,7 +463,8 @@ impl Database {
         sqlx::query_as::<_, ManifestRecord>(
             r#"
             SELECT manifest_hash, leaf_seq_id, tenant_id, version, sbom_hash, sbom_format,
-                   sbom_s3_key, namespace, previous_manifest_hash, signature, created_by, created_at
+                   sbom_s3_key, namespace, previous_manifest_hash, signature, created_by, created_at,
+                   revoked, revoked_at, revoked_by
             FROM manifests
             WHERE manifest_hash = $1
             "#,
@@ -439,7 +482,8 @@ impl Database {
         sqlx::query_as::<_, ManifestRecord>(
             r#"
             SELECT manifest_hash, leaf_seq_id, tenant_id, version, sbom_hash, sbom_format,
-                   sbom_s3_key, namespace, previous_manifest_hash, signature, created_by, created_at
+                   sbom_s3_key, namespace, previous_manifest_hash, signature, created_by, created_at,
+                   revoked, revoked_at, revoked_by
             FROM manifests
             WHERE tenant_id = $1
             ORDER BY created_at DESC, leaf_seq_id DESC
@@ -450,5 +494,32 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| DbError::QueryError(e.to_string()))
+    }
+
+    /// Marks a manifest revoked, scoped to `tenant_id` so it can only be
+    /// revoked by (an admin of) its own tenant. Returns `true` if a row was
+    /// updated (i.e. it existed, belonged to that tenant, and wasn't
+    /// already revoked) — idempotent-safe, never double-stamps.
+    pub async fn revoke_manifest(
+        &self,
+        tenant_id: Uuid,
+        manifest_hash: &str,
+        revoked_by: &str,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE manifests
+            SET revoked = TRUE, revoked_at = NOW(), revoked_by = $1
+            WHERE manifest_hash = $2 AND tenant_id = $3 AND revoked = FALSE
+            "#,
+        )
+        .bind(revoked_by)
+        .bind(manifest_hash)
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DbError::QueryError(e.to_string()))?;
+
+        Ok(result.rows_affected() > 0)
     }
 }

@@ -36,6 +36,10 @@ services:
       BOOTSTRAP_SUPER_ADMIN_KEY: "deadbeef-dead-dead-dead-deadbeefdead:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
       BOOTSTRAP_TENANT_DOMAIN: test.example
       BOOTSTRAP_TENANT_NAME: "Test Tenant"
+      # Relaxes a small number of RBAC checks for local testing (currently:
+      # lets an uploader-role key revoke its own manifests, not just
+      # domain_admin/auditor/super_admin). Never set this in production.
+      DEV_MODE: "true"
     ports:
       - "3000:3000"
     volumes:

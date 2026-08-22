@@ -16,6 +16,12 @@
   box-sizing: border-box;
 }
 
+html,
+body,
+#root {
+  height: 100%;
+}
+
 body {
   margin: 0;
   background: var(--bg);
@@ -28,6 +34,107 @@ body {
   max-width: 1100px;
   margin: 0 auto;
   padding: 24px 20px 60px;
+}
+
+/* Authenticated layout: left sidebar + main column, instead of a top tab
+   bar — the sidebar owns navigation and account/tenant controls. */
+.app-shell {
+  display: flex;
+  align-items: stretch;
+  height: 100vh;
+  max-width: none;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+.sidebar {
+  width: 232px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  padding: 20px 14px;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+}
+
+.sidebar-brand {
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  padding: 0 8px;
+}
+
+.sidebar-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  flex: 1;
+}
+
+.sidebar-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sidebar-group-label {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 4px 10px 6px;
+}
+
+.sidebar-link {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--muted);
+  padding: 9px 10px;
+  text-align: left;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.sidebar-link:hover {
+  color: var(--text);
+  background: var(--panel-2);
+}
+
+.sidebar-link.active {
+  color: var(--text);
+  background: var(--panel-2);
+  border-color: var(--border);
+}
+
+.sidebar-footer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.sidebar-footer .tenant-selector,
+.sidebar-footer .btn {
+  width: 100%;
+}
+
+.main-column {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  padding: 24px 28px 60px;
 }
 
 .app-header {
@@ -52,8 +159,7 @@ body {
 }
 
 .tenant-badge {
-  display: inline-block;
-  margin-left: 14px;
+  display: block;
   font-size: 12px;
   font-weight: 400;
   font-family: var(--mono);
@@ -61,31 +167,8 @@ body {
   background: var(--panel-2);
   border: 1px solid var(--border);
   border-radius: 6px;
-  padding: 3px 8px;
-  vertical-align: middle;
-}
-
-.key-field input {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text);
-  padding: 8px 12px;
-  font-family: var(--mono);
-  font-size: 12px;
-  width: 380px;
-  max-width: 100%;
-}
-
-.key-field input:focus {
-  outline: none;
-  border-color: var(--accent);
-}
-
-.key-field {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+  padding: 6px 8px;
+  overflow-wrap: break-word;
 }
 
 .tenant-selector {
@@ -107,40 +190,13 @@ body {
   font-size: 13px;
 }
 
-.tabs {
-  display: flex;
-  gap: 4px;
-  margin: 18px 0;
-  flex-wrap: wrap;
-}
-
-.tab {
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  color: var(--muted);
-  padding: 8px 14px;
-  cursor: pointer;
-  font-size: 14px;
-}
-
-.tab:hover {
-  color: var(--text);
-  background: var(--panel);
-}
-
-.tab.active {
-  color: var(--text);
-  background: var(--panel-2);
-  border-color: var(--border);
-}
-
 .card {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 20px;
   margin-bottom: 18px;
+  overflow-x: auto;
 }
 
 .card h2 {
@@ -298,6 +354,20 @@ code.hash {
   margin-bottom: 12px;
 }
 
+.checkbox-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  cursor: pointer;
+  margin-bottom: 12px;
+}
+
+.checkbox-field input {
+  cursor: pointer;
+}
+
 .error-box {
   background: rgba(248, 81, 73, 0.12);
   border: 1px solid rgba(248, 81, 73, 0.4);
@@ -313,6 +383,85 @@ code.hash {
   margin-top: 14px;
   border-top: 1px solid var(--border);
   padding-top: 12px;
+}
+
+.sbom-artifact {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+}
+
+.sbom-artifact-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.sbom-json {
+  margin-top: 12px;
+}
+
+.sbom-tree {
+  margin-top: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 4px;
+  max-height: 420px;
+  overflow-y: auto;
+  font-family: var(--mono);
+  font-size: 14.5px;
+}
+
+.sbom-tree-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+
+.sbom-tree-row.clickable {
+  cursor: pointer;
+}
+
+.sbom-tree-row.clickable:hover {
+  background: var(--panel-2);
+}
+
+.sbom-tree-toggle {
+  color: var(--muted);
+  width: 12px;
+  flex-shrink: 0;
+  text-align: center;
+}
+
+.tree-icon {
+  flex-shrink: 0;
+}
+
+.tree-icon-folder {
+  color: var(--accent);
+}
+
+.tree-icon-file {
+  color: var(--muted);
+}
+
+.sbom-tree-label {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sbom-tree-detail {
+  color: var(--accent);
+  font-size: 12.5px;
 }
 
 .spinner {
@@ -363,6 +512,55 @@ pre.json {
   display: block;
 }
 
+/* SBOM Explorer master-detail: browse list on the left, selected SBOM's
+   details on the right. Wraps to stacked on narrow viewports. */
+.explorer-layout {
+  display: flex;
+  align-items: stretch;
+  gap: 16px;
+  flex-wrap: wrap;
+  flex: 1;
+  min-height: 0;
+}
+
+.explorer-left {
+  flex: 1 1 380px;
+  min-width: 320px;
+  min-height: 0;
+  overflow-y: auto;
+  margin-bottom: 0;
+}
+
+.explorer-right {
+  flex: 2 1 420px;
+  min-width: 320px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* The visible card is a child of .explorer-right (SbomDetailPanel renders
+   its own .card, or the "select an SBOM" placeholder does) — stretch that
+   child to fill the pane, since .explorer-right itself has no background/
+   border of its own. */
+.explorer-right > .card {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  margin-bottom: 0;
+}
+
+.row-clickable {
+  cursor: pointer;
+}
+
+.row-clickable:hover {
+  background: var(--panel-2);
+}
+
 .content {
-  min-height: 300px;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }

@@ -1,10 +1,21 @@
 # sbomStash — Current Status
 
-**Last verified: 2026-08-22 — `cargo test --all` green (33 tests), `cargo check --all --bins` clean, frontend `tsc` + production build passing. Full tenant-isolation flow verified end-to-end against a fresh Postgres via `docker-compose` (create tenant → mint keys → upload → cross-tenant reads correctly blocked → restart → trees rebuild correctly). domain_admin self-service, `BOOTSTRAP_SUPER_ADMIN_KEY` bootstrap, required upload `version`, namespace-scoped key isolation (upload/leaves/manifest), and key revocation all verified live against the running compose stack.**
+**Last verified: 2026-08-22 — `cargo test --all` green (33 tests), `cargo check --all --bins` clean, frontend `tsc` + production build passing. Full tenant-isolation flow verified end-to-end against a fresh Postgres via `docker-compose` (create tenant → mint keys → upload → cross-tenant reads correctly blocked → restart → trees rebuild correctly). domain_admin self-service, `BOOTSTRAP_SUPER_ADMIN_KEY` bootstrap, required upload `version`, namespace-scoped key isolation (upload/leaves/manifest), key revocation, the platform-tenant cross-tenant override (including the privilege-escalation fix), and manifest revocation (both with and without `DEV_MODE`) all verified live against the running compose stack.**
 
 ## What's Built
 
-### Tenants & isolation (new)
+### Manifest revocation
+- `POST /api/v1/manifest/:manifest_hash/revoke` marks a manifest `revoked` (+ `revoked_at`, `revoked_by`) — a **status flag, not a delete**: the manifest row, its signature, and the Merkle leaf/hash it's chained from are untouched, so the append-only log and tamper-evidence are unaffected. Idempotent-safe (400 if already revoked, not a silent no-op).
+- Normally requires `Action::Annotate` (super_admin, domain_admin, auditor). `DEV_MODE=true` on the server (set in `docker-compose.yml`'s `api` service, off by default) additionally allows `uploader` — for local testing where the same pipeline that uploaded a bad SBOM wants to retract it without a separate admin key. Verified both ways live: uploader gets 403 without `DEV_MODE`, 204 with it.
+- Same tenant + namespace-scope ownership check as reading a manifest (404, not 403, for out-of-scope) — reuses the same logic, so a namespace-scoped key can't revoke outside its scope.
+- Frontend: SBOM Explorer shows an active/revoked status badge and (when active) a Revoke button with a confirmation prompt; revoked manifests show `revoked_by`/`revoked_at`.
+
+### Platform tenant & cross-tenant super_admin (new)
+- Exactly one tenant can be flagged `tenants.is_platform` — set only by the `BOOTSTRAP_SUPER_ADMIN_KEY` startup path (idempotently, including an upgrade path for environments that had the bootstrap key from before this flag existed) or direct SQL. `POST /api/v1/tenants` (the public API) always creates non-platform tenants.
+- Every tenant-scoped endpoint (tree-head, proofs, leaves, manifest, keys, audit-logs) now accepts an optional `tenant_id` override (`?tenant_id=` query param, or a body field for `POST /api/v1/keys`), resolved by `effective_tenant()` in `handlers.rs`. When acting cross-tenant, the caller's own `namespace_scope` doesn't apply — they see/manage that tenant in full.
+- **Security fix caught during testing**: the override was initially gated on `grant.role == SuperAdmin` alone. Since `domain_admin` can already assign *any* role string (including `"super_admin"`) to a key it mints for its own tenant, that would have let any tenant self-escalate to platform-wide access by minting itself a `super_admin` key. Fixed by additionally requiring `AuthGrant.is_platform_tenant` (resolved once at auth-extraction time via a lookup on the key's own tenant row, only for `super_admin`-role keys — no extra query for anyone else). Verified live: a non-platform tenant's own `super_admin` key now gets 403 on `?tenant_id=`, while the actual platform tenant's key still succeeds, and both still work normally for their own tenant with no override.
+
+### Tenants & isolation
 - **`tenants` table**: one row per domain (domain is unique — a tenant *is* a domain). `api_keys`, `merkle_leaves`, `manifests`, `audit_logs` all have a real FK into it now (previously `tenant_id` was a free-typed UUID with no registry backing it).
 - **Each tenant has its own Merkle tree and signed-tree-head chain.** `AppState.trees` is `HashMap<tenant_id, MerkleTree>` instead of one global tree; `signed_tree_heads`' primary key is now `(tenant_id, tree_size)`. Leaves, tree-head, inclusion/consistency proofs, and manifest/SBOM content are all scoped to the caller's own tenant — nothing is visible or inferable across tenants.
 - **`manifest` fetch-by-hash is now ownership-checked** — this closed a real gap: previously any authenticated Read-capable key could fetch *any* tenant's raw SBOM content by guessing/knowing its manifest hash. Now returns 404 (not 403) for another tenant's manifest, so existence isn't leaked either.
@@ -65,10 +76,12 @@ Previously a namespace-scoped key (e.g. `namespace_scope: "/product/v1"`) could 
 ### Frontend (`frontend/`, React + TypeScript, port 4000, CRA proxy → :3000)
 - **Nav only shows tabs the current key's role is actually allowed to use** — a client-side mirror of the backend RBAC matrix (`ROLE_ACTIONS` in `App.tsx`) filters `TABS` and double-guards each tab's rendered content, not just the nav buttons. Falls back to the first allowed tab if the current one becomes disallowed (e.g. after logging in with a different-role key).
 - Header shows the current key's tenant domain, role, and namespace scope at all times (`.tenant-badge`), plus a Log out button (clears the key, drops back to the connection-status gate).
+- **Platform super_admin gets a tenant selector** in the header ("My tenant" / any other tenant, from `GET /api/v1/tenants`) plus a "you're acting on another tenant" banner. The selection flows through a small `TenantOverrideContext` to Leaves/Proofs/Keys/Audit/ManifestLookup (not prop-drilled) and is appended to their API calls. `GET /api/v1/whoami` now returns `is_platform_tenant`, and the selector is gated on that (not just `role === 'super_admin'`) — a non-platform tenant's own super_admin key never even sees it, rather than seeing it and hitting a 403 on every use (client-side convenience only — the backend independently enforces the same check).
 - Dashboard: latest STH, signature-verified badge, frontier peaks
 - Upload: file + format + namespace + **version** (required), result shows version/domain/namespace plus leaf index/hashes
-- Leaves: table of recent leaves (own tenant + namespace scope only), now shows each leaf's namespace
-- **Manifest Lookup**: paste a manifest_hash → shows version, domain, namespace, format, previous_manifest_hash, created_by/at
+- Leaves: recent leaves (own tenant + namespace scope only, or the selected tenant for a platform super_admin), two view modes — a **namespace tree** (default: namespace path segments become nested folders, e.g. `/products/v1` → `products` › `v1`, with each SBOM as a clickable leaf under its exact-match folder; verified standalone against a 5-leaf, 2-level, multi-leaf-per-folder case) and the original flat table. Each leaf, in either view, has a "View SBOM" jump to the SBOM Explorer below, which now also carries `manifest_hash` (previously there was no way to get from a leaf to its SBOM at all — `GET /api/v1/leaves` didn't return it; fixed with a JOIN against `manifests`).
+- **Manifest Lookup / SBOM artifact view**: paste a manifest_hash → metadata (version, domain, namespace, previous_manifest_hash, created_by/at) plus a proper artifact viewer — decodes the hex SBOM to text, shows a component/package count and name (CycloneDX `metadata.component.name` / SPDX `name`) and file size, with a **Download SBOM** button that saves the actual decoded bytes locally (not the hex or the manifest wrapper).
+  - **Navigable dependency tree** (default view): for CycloneDX, built from `dependencies[]` (bom-ref → dependsOn) when present — the real dependency graph, not just the physical `components[]` nesting — falling back to nested `components[]`, then a flat list. For SPDX, built from `relationships[]` (spdxElementId → relatedSpdxElement), falling back to a flat package list. Root = whichever nodes aren't referenced as a child of anything else. Click a node to expand/collapse; first level auto-expands. Cycles (a real possibility in a dependency graph) are detected via an ancestor-path check and cut off as "(circular reference)" rather than recursed into infinitely. Verified standalone against a 3-package graph with a deliberate cycle (pkg-b ↔ pkg-c) and against the nested-`components[]` fallback — root detection, nesting, cycle cutoff, and the fallback path all correct. A raw pretty-printed JSON view remains available as a toggle.
 - **Proofs**: inclusion + consistency with in-browser verification (Web Crypto SHA-256 port of the Rust verifier), plus a **Download JSON** button to save the fetched proof locally
 - API Keys: create (role + namespace scope + optional expiry) + list, with a persistent copy-to-clipboard reveal for the new key, and a **Revoke** button per key (confirmation prompt, tenant-scoped on the backend)
 - Tenants: create (domain + name, super_admin only) + list, reveals the new tenant's first key
@@ -98,12 +111,19 @@ psql -h localhost -U postgres -d sbomstash < migrations/20240821000000_initial_s
 psql -h localhost -U postgres -d sbomstash < migrations/20260821000001_manifests.sql
 psql -h localhost -U postgres -d sbomstash < migrations/20260822000001_tenants.sql
 psql -h localhost -U postgres -d sbomstash < migrations/20260822000002_versions_and_namespace_scoping.sql
+psql -h localhost -U postgres -d sbomstash < migrations/20260822000003_platform_tenant.sql
+psql -h localhost -U postgres -d sbomstash < migrations/20260822000004_manifest_revocation.sql
 ```
 The third migration is schema-breaking (`signed_tree_heads` is rebuilt with a
 new per-tenant primary key) — apply it to a fresh database; there's no
-migration-rollback tooling yet. The fourth is additive (`ALTER TABLE ... ADD
-COLUMN ... DEFAULT ...`) and safe to run against an existing database —
-note that Postgres only runs `docker-entrypoint-initdb.d` scripts against a
-*fresh* volume, so an already-initialized `docker compose` DB volume needs
-this one applied by hand (`docker exec -i <db-container> psql -U postgres -d
-sbomstash < migrations/20260822000002_versions_and_namespace_scoping.sql`).
+migration-rollback tooling yet. The fourth, fifth, and sixth are additive
+(`ALTER TABLE ... ADD COLUMN ... DEFAULT ...`) and safe to run against an
+existing database — note that Postgres only runs `docker-entrypoint-initdb.d`
+scripts against a *fresh* volume, so an already-initialized `docker compose`
+DB volume needs these applied by hand, e.g.:
+```bash
+docker exec -i <db-container> psql -U postgres -d sbomstash < migrations/20260822000004_manifest_revocation.sql
+```
+After applying the fifth migration, restart the API once so the
+`BOOTSTRAP_SUPER_ADMIN_KEY` startup path re-marks its tenant as the
+platform tenant (it does this on every startup, not just the first).
