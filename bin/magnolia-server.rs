@@ -1,6 +1,6 @@
-use sbomstash_api::{AppState, create_router};
-use sbomstash_storage::InMemoryStore;
-use sbomstash_signer::LocalFileSigner;
+use magnolia_api::{AppState, create_router};
+use magnolia_storage::InMemoryStore;
+use magnolia_signer::LocalFileSigner;
 use std::sync::Arc;
 use std::path::PathBuf;
 

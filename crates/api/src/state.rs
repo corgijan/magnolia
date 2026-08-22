@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use sbomstash_audit::AuditLogger;
-use sbomstash_core::MerkleTree;
-use sbomstash_db::Database;
-use sbomstash_signer::Signer;
-use sbomstash_storage::ObjectStore;
+use magnolia_audit::AuditLogger;
+use magnolia_core::MerkleTree;
+use magnolia_db::Database;
+use magnolia_signer::Signer;
+use magnolia_storage::ObjectStore;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 

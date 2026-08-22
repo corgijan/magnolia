@@ -1,4 +1,4 @@
-// Typed client for the sbomStash API. In dev, requests go through the CRA
+// Typed client for the Magnolia API. In dev, requests go through the CRA
 // proxy (see "proxy" in package.json) to the server on 127.0.0.1:3000.
 
 export interface TreeHead {
@@ -84,6 +84,16 @@ export interface Manifest {
   revoked_by: string | null;
 }
 
+export interface CurrentManifest {
+  namespace: string;
+  domain: string;
+  version: string;
+  manifest_hash: string;
+  sbom_hash: string;
+  sbom_format: string;
+  created_at: string;
+}
+
 export interface ApiKeyInfo {
   id: string;
   tenant_id: string;
@@ -139,7 +149,7 @@ export interface AuditEntry {
   created_at: string;
 }
 
-const KEY_STORAGE = 'sbomstash_api_key';
+const KEY_STORAGE = 'magnolia_api_key';
 
 export function getApiKey(): string {
   return localStorage.getItem(KEY_STORAGE) ?? '';
@@ -242,6 +252,9 @@ export const api = {
 
   revokeManifest: (manifestHash: string, tenantId?: string): Promise<void> =>
     request(`/api/v1/manifest/${manifestHash}/revoke${tenantQs(tenantId)}`, { method: 'POST' }),
+
+  currentManifests: (tenantId?: string): Promise<CurrentManifest[]> =>
+    request(`/api/v1/manifests/current${tenantQs(tenantId)}`),
 
   listKeys: (tenantId?: string): Promise<ApiKeyInfo[]> =>
     request(`/api/v1/keys${tenantQs(tenantId)}`),

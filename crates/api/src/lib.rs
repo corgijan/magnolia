@@ -44,6 +44,10 @@ pub fn create_router(state: AppState) -> Router {
             post(handlers::revoke_manifest),
         )
         .route(
+            "/api/v1/manifests/current",
+            get(handlers::current_manifests),
+        )
+        .route(
             "/api/v1/keys",
             get(handlers::list_keys).post(handlers::create_key),
         )

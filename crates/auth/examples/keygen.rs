@@ -1,10 +1,10 @@
 //! Generate an Argon2 PHC hash for a key secret, for bootstrapping the very
 //! first API key directly in the database.
 //!
-//! Usage: cargo run -p sbomstash-auth --example keygen -- <secret>
+//! Usage: cargo run -p magnolia-auth --example keygen -- <secret>
 //! Output: the PHC string to store in api_keys.key_hash
 
-use sbomstash_auth::{generate_server_key, ApiKey};
+use magnolia_auth::{generate_server_key, ApiKey};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

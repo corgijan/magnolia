@@ -496,6 +496,37 @@ impl Database {
         .map_err(|e| DbError::QueryError(e.to_string()))
     }
 
+    /// Most recent non-revoked manifest per namespace, within a tenant and
+    /// namespace scope. Unlike `latest_manifest` (tenant-wide single row,
+    /// used to chain `previous_manifest_hash` on upload), this groups by
+    /// namespace and excludes revoked entries — "what's currently
+    /// deployed" per deployable, not "the single latest thing uploaded
+    /// anywhere."
+    pub async fn latest_manifests_by_namespace(
+        &self,
+        tenant_id: Uuid,
+        namespace_scope: &str,
+    ) -> Result<Vec<ManifestRecord>, DbError> {
+        sqlx::query_as::<_, ManifestRecord>(
+            r#"
+            SELECT DISTINCT ON (namespace)
+                   manifest_hash, leaf_seq_id, tenant_id, version, sbom_hash, sbom_format,
+                   sbom_s3_key, namespace, previous_manifest_hash, signature, created_by, created_at,
+                   revoked, revoked_at, revoked_by
+            FROM manifests
+            WHERE tenant_id = $1
+              AND revoked = FALSE
+              AND ($2 = '/' OR namespace = $2 OR starts_with(namespace, $2 || '/'))
+            ORDER BY namespace, created_at DESC, leaf_seq_id DESC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(namespace_scope)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbError::QueryError(e.to_string()))
+    }
+
     /// Marks a manifest revoked, scoped to `tenant_id` so it can only be
     /// revoked by (an admin of) its own tenant. Returns `true` if a row was
     /// updated (i.e. it existed, belonged to that tenant, and wasn't

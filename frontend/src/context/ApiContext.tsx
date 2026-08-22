@@ -28,21 +28,21 @@ interface ApiProviderProps {
 
 export const ApiProvider: React.FC<ApiProviderProps> = ({ children }) => {
   const [masterKey, setMasterKey] = useState<string | null>(
-    localStorage.getItem('sbomstash_master_key')
+    localStorage.getItem('magnolia_master_key')
   );
   const [apiKeys, setApiKeys] = useState<ApiKey[]>([]);
   const [serverUrl, setServerUrl] = useState(
-    localStorage.getItem('sbomstash_server_url') || 'http://127.0.0.1:3000'
+    localStorage.getItem('magnolia_server_url') || 'http://127.0.0.1:3000'
   );
 
   const handleSetMasterKey = (key: string) => {
     setMasterKey(key);
-    localStorage.setItem('sbomstash_master_key', key);
+    localStorage.setItem('magnolia_master_key', key);
   };
 
   const handleSetServerUrl = (url: string) => {
     setServerUrl(url);
-    localStorage.setItem('sbomstash_server_url', url);
+    localStorage.setItem('magnolia_server_url', url);
   };
 
   const addApiKey = (key: ApiKey) => {

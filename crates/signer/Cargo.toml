@@ -1,5 +1,5 @@
 [package]
-name = "sbomstash-signer"
+name = "magnolia-signer"
 version.workspace = true
 edition.workspace = true
 

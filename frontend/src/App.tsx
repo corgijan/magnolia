@@ -7,6 +7,7 @@ import {
   ConsistencyProof,
   CreateKeyResponse,
   CreateTenantResponse,
+  CurrentManifest,
   InclusionProof,
   Leaf,
   Manifest,
@@ -606,7 +607,7 @@ function SbomTree({ roots }: { roots: SbomTreeNode[] }) {
     return <div className="muted">No components/packages found to build a tree from.</div>;
   }
   return (
-    <div className="sbom-tree">
+    <div className="sbom-tree sbom-content-tree">
       {roots.map((r, i) => (
         <SbomTreeRow key={`${r.id}-${i}`} node={r} depth={0} />
       ))}
@@ -788,7 +789,7 @@ function SbomDetailPanel({ hash, tenantId }: { hash: string; tenantId?: string }
           </div>
           <div className="kv-row">
             <span className="kv-label">created_by</span>
-            <span title={manifest.created_by}>{shortPrincipal(manifest.created_by)}</span>
+            <span>{manifest.created_by}</span>
           </div>
           <div className="kv-row">
             <span className="kv-label">created_at</span>
@@ -937,14 +938,17 @@ function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
   // jumping here right after an upload, without needing to track/clear a
   // "consumed" flag.
   const [selectedHash, setSelectedHash] = useState<string | undefined>(initialSelectedHash);
-  const [view, setView] = useState<'tree' | 'table'>('tree');
+  const [view, setView] = useState<'tree' | 'table' | 'current'>('tree');
   const [showRevoked, setShowRevoked] = useState(false);
+  const [current, setCurrent] = useState<CurrentManifest[] | null>(null);
 
   const load = useCallback(() => {
     setError('');
     api.leaves(50, 0, tenantId)
       .then(setLeaves)
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+    // Non-fatal: the tree/table views still work if this fails.
+    api.currentManifests(tenantId).then(setCurrent).catch(() => {});
   }, [tenantId]);
 
   useEffect(load, [load]);
@@ -969,6 +973,9 @@ function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
           </button>
           <button className="btn" disabled={view === 'table'} onClick={() => setView('table')}>
             Table
+          </button>
+          <button className="btn" disabled={view === 'current'} onClick={() => setView('current')}>
+            Currently running
           </button>
           <label className="checkbox-field">
             <input
@@ -1013,6 +1020,32 @@ function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
                     {leaf.revoked && <Badge ok={false}>revoked</Badge>}
                   </td>
                   <td>{new Date(leaf.created_at).toLocaleString()}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        {view === 'current' && (
+          current === null ? <Spinner label="Loading current versions…" /> :
+          current.length === 0 ? <div className="muted">Nothing deployed yet.</div> :
+          <table className="table">
+            <thead>
+              <tr>
+                <th>namespace</th>
+                <th>version</th>
+                <th>uploaded</th>
+              </tr>
+            </thead>
+            <tbody>
+              {current.map((c) => (
+                <tr
+                  key={c.namespace}
+                  className="row-clickable"
+                  onClick={() => setSelectedHash(c.manifest_hash)}
+                >
+                  <td>{c.domain}{c.namespace}</td>
+                  <td>{c.version}</td>
+                  <td>{new Date(c.created_at).toLocaleString()}</td>
                 </tr>
               ))}
             </tbody>
@@ -1704,7 +1737,7 @@ export default function App() {
 
   useEffect(() => {
     try {
-      setKey(window.localStorage.getItem('sbomstash_api_key') ?? '');
+      setKey(window.localStorage.getItem('magnolia_api_key') ?? '');
     } catch {
       setKey('');
     }
@@ -1795,7 +1828,7 @@ export default function App() {
       <div className="app">
         <header className="app-header">
           <div className="brand">
-            <span className="brand-mark">◆</span> sbomStash
+            <span className="brand-mark">◆</span> Magnolia
           </div>
         </header>
         <main className="content">
@@ -1815,7 +1848,7 @@ export default function App() {
       <div className="app app-shell">
         <aside className="sidebar">
           <div className="sidebar-brand">
-            <span className="brand-mark">◆</span> sbomStash
+            <span className="brand-mark">◆</span> Magnolia
           </div>
 
           <nav className="sidebar-nav">

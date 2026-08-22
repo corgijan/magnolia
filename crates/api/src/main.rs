@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use sbomstash_api::{create_router, AppState};
-use sbomstash_audit::AuditLogger;
-use sbomstash_core::MerkleTree;
-use sbomstash_db::Database;
-use sbomstash_signer::LocalFileSigner;
-use sbomstash_storage::{InMemoryStore, ObjectStore};
+use magnolia_api::{create_router, AppState};
+use magnolia_audit::AuditLogger;
+use magnolia_core::MerkleTree;
+use magnolia_db::Database;
+use magnolia_signer::LocalFileSigner;
+use magnolia_storage::{InMemoryStore, ObjectStore};
 use tokio::sync::Mutex;
 
 #[tokio::main]
@@ -67,7 +67,7 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("failed to bind server address");
-    tracing::info!(%addr, "sbomstash listening");
+    tracing::info!(%addr, "magnolia listening");
     axum::serve(listener, app).await.expect("server failed");
 }
 
@@ -135,7 +135,7 @@ async fn bootstrap_super_admin_from_env(db: &Database) {
         return;
     }
 
-    let hashed = match (sbomstash_auth::ApiKey {
+    let hashed = match (magnolia_auth::ApiKey {
         key: secret.to_string(),
         created_at: chrono::Utc::now(),
     })

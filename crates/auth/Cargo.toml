@@ -1,5 +1,5 @@
 [package]
-name = "sbomstash-auth"
+name = "magnolia-auth"
 version.workspace = true
 edition.workspace = true
 

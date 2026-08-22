@@ -1,4 +1,4 @@
-# sbomStash — Current Status
+# Magnolia — Current Status
 
 **Last verified: 2026-08-22 — `cargo test --all` green (33 tests), `cargo check --all --bins` clean, frontend `tsc` + production build passing. Full tenant-isolation flow verified end-to-end against a fresh Postgres via `docker-compose` (create tenant → mint keys → upload → cross-tenant reads correctly blocked → restart → trees rebuild correctly). domain_admin self-service, `BOOTSTRAP_SUPER_ADMIN_KEY` bootstrap, required upload `version`, namespace-scoped key isolation (upload/leaves/manifest), key revocation, the platform-tenant cross-tenant override (including the privilege-escalation fix), and manifest revocation (both with and without `DEV_MODE`) all verified live against the running compose stack.**
 
@@ -21,7 +21,7 @@
 - **`manifest` fetch-by-hash is now ownership-checked** — this closed a real gap: previously any authenticated Read-capable key could fetch *any* tenant's raw SBOM content by guessing/knowing its manifest hash. Now returns 404 (not 403) for another tenant's manifest, so existence isn't leaked either.
 - **`POST /api/v1/tenants`** (super_admin only, via a new `Action::ManageTenants` that bypasses domain-scoping since there's no existing domain to scope it to) creates a tenant and mints its first `domain_admin` key in the same call — no more manual SQL to bootstrap a new tenant.
 
-### Cryptographic core (`sbomstash-core`)
+### Cryptographic core (`magnolia-core`)
 - **Merkle Mountain Range** (`crates/core/src/merkle.rs`)
   - O(log N) append, frontier stored compactly, full node sequence kept in memory for proof generation
   - **Inclusion proofs** per leaf (sibling path up to its peak + all peaks); verification is a plain hash fold
@@ -31,14 +31,14 @@
 - **Signed Tree Head**: canonical payload = `tree_size (8B BE) || root_hash`, signed by the pluggable Signer, per tenant
 - **Manifest**: per-tenant hash chain (`previous_manifest_hash`), signed, stored in `manifests`
 
-### Auth & RBAC (`sbomstash-auth`)
+### Auth & RBAC (`magnolia-auth`)
 - API keys `<key_id>:<secret>`: public UUID for lookup, Argon2 hash of the secret at rest
 - RBAC matrix (super_admin / domain_admin / uploader / auditor) with domain + namespace-scope enforcement
 - **Fix:** namespace scope matching is segment-aware (`/p1` does NOT cover `/p10`)
 - **Fix:** a revoked or expired key is now rejected at auth-extraction time, for every endpoint — previously it only got denied later, per RBAC action
 - **New:** `Action::ManageTenants` — checks role only (super_admin), skips domain/namespace scoping since tenant creation is platform-level
 - **Changed:** `domain_admin` now has full self-service over its own tenant (Upload, Read, Annotate, ManageKeys, ManageAcls) — previously it could only manage keys, meaning a fresh tenant's own admin key couldn't upload or read anything. The only thing it still can't do is create other tenants.
-- **Fix:** `namespace_in_scope("/anything", "/")` used to return `false` — a root-scoped (`"/"`) key could only ever act on the literal namespace `"/"`, not any sub-namespace, because the segment-prefix rule (`scope + "/"`) degenerates to `"//"` when `scope == "/"`, which no normalized namespace starts with. Root scope now explicitly means "everything." This is now a public helper, `sbomstash_auth::namespace_in_scope`, reused by both RBAC enforcement and the namespace-filtered leaf/manifest queries below.
+- **Fix:** `namespace_in_scope("/anything", "/")` used to return `false` — a root-scoped (`"/"`) key could only ever act on the literal namespace `"/"`, not any sub-namespace, because the segment-prefix rule (`scope + "/"`) degenerates to `"//"` when `scope == "/"`, which no normalized namespace starts with. Root scope now explicitly means "everything." This is now a public helper, `magnolia_auth::namespace_in_scope`, reused by both RBAC enforcement and the namespace-filtered leaf/manifest queries below.
 - **New:** key revocation is tenant-scoped at the DB layer (`revoke_api_key(tenant_id, key_id)` — `UPDATE ... WHERE id = $1 AND tenant_id = $2`), so a key can only ever be revoked by (an admin of) its own tenant.
 
 ### Namespace scoping now actually restricts reads, not just uploads
@@ -53,7 +53,7 @@ Previously a namespace-scoped key (e.g. `namespace_scope: "/product/v1"`) could 
 ### Server startup / dev bootstrap
 - `BOOTSTRAP_SUPER_ADMIN_KEY=<key_id>:<secret>` env var (optional): on startup, ensures that exact key exists as a super_admin key, creating its tenant from `BOOTSTRAP_TENANT_DOMAIN`/`BOOTSTRAP_TENANT_NAME` if needed. Idempotent (checks `key_id` first, never overwrites). `docker-compose.yml` sets this to a well-known `deadbeef-...` example so `docker compose up` is immediately usable — verified across two consecutive restarts (creates once, skips on the second).
 
-### API (`sbomstash-api`, binary `sbomstash-server`)
+### API (`magnolia-api`, binary `magnolia-server`)
 | Endpoint | Notes |
 |---|---|
 | `GET /api/v1/whoami` | authenticated-only (no RBAC action) — role/domain/namespace_scope for the calling key |

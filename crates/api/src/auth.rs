@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use chrono::{DateTime, Utc};
-use sbomstash_auth::{ApiKeyVerifier, Grant, Role};
+use magnolia_auth::{ApiKeyVerifier, Grant, Role};
 use uuid::Uuid;
 
 use crate::errors::ApiError;
@@ -125,9 +125,9 @@ impl FromRequestParts<AppState> for AuthGrant {
 /// Enforces the RBAC matrix for an action on a resource.
 pub fn require(
     grant: &AuthGrant,
-    action: sbomstash_auth::Action,
+    action: magnolia_auth::Action,
     namespace: &str,
 ) -> Result<(), ApiError> {
-    sbomstash_auth::RbacEngine::require_role(&grant.to_grant(), &grant.domain, namespace, action)
+    magnolia_auth::RbacEngine::require_role(&grant.to_grant(), &grant.domain, namespace, action)
         .map_err(|e| ApiError::Forbidden(e.to_string()))
 }

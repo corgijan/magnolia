@@ -1,8 +1,8 @@
-# sbomStash Architecture
+# Magnolia Architecture
 
 ## Overview
 
-sbomStash is a compliance-focused SBOM archive implementing a pragmatic approach to immutable, append-only storage with cryptographic tamper-evidence. It bridges operational vulnerability analysis (e.g., Dependency-Track) and legally-required WORM archival under EU Cyber Resilience Act (CRA).
+Magnolia is a compliance-focused SBOM archive implementing a pragmatic approach to immutable, append-only storage with cryptographic tamper-evidence. It bridges operational vulnerability analysis (e.g., Dependency-Track) and legally-required WORM archival under EU Cyber Resilience Act (CRA).
 
 ## Design Philosophy
 
@@ -16,7 +16,7 @@ sbomStash is a compliance-focused SBOM archive implementing a pragmatic approach
 
 ### Core Layers
 
-#### 1. **sbomstash-core** — Cryptographic Core
+#### 1. **magnolia-core** — Cryptographic Core
 - **Merkle Mountain Range**: Append-only tree structure for tamper-evidence
   - O(1) memory / O(log N) time for insertions
   - Frontier array stored compactly in DB (max 32 entries ≈ 1 KB)
@@ -30,7 +30,7 @@ sbomStash is a compliance-focused SBOM archive implementing a pragmatic approach
 - `Manifest` — SBOM metadata with hash chaining
 - `InclusionProof`, `ConsistencyProof` — cryptographic audit evidence
 
-#### 2. **sbomstash-signer** — Pluggable Signing
+#### 2. **magnolia-signer** — Pluggable Signing
 
 **Trait-based design** (swap implementations):
 ```rust
@@ -50,7 +50,7 @@ pub trait Signer: Send + Sync {
 - `AwsKmsSigner` — AWS KMS
 - `Pkcs11Signer` — Hardware security modules
 
-#### 3. **sbomstash-storage** — Object Store Abstraction
+#### 3. **magnolia-storage** — Object Store Abstraction
 
 **Trait-based design**:
 ```rust
@@ -71,7 +71,7 @@ pub trait ObjectStore: Send + Sync {
 - `GcsStore` — Google Cloud Storage
 - `AzureStore` — Azure Blob Storage
 
-#### 4. **sbomstash-auth** — Multi-Tenancy & RBAC
+#### 4. **magnolia-auth** — Multi-Tenancy & RBAC
 
 **Components:**
 - **ApiKey**: Generated once, displayed once, never stored in plaintext
@@ -94,7 +94,7 @@ pub trait ObjectStore: Send + Sync {
 - Prefix-based scope inheritance: `/p1` scope covers `/p1/sub1`, `/p1/sub2`
 - Normalized to lowercase, no leading/double slashes, no `..`
 
-#### 5. **sbomstash-db** — PostgreSQL Data Layer
+#### 5. **magnolia-db** — PostgreSQL Data Layer
 
 **Schema** (append-only, normalized):
 
@@ -148,7 +148,7 @@ revoked BOOLEAN,
 created_at TIMESTAMPTZ
 ```
 
-#### 6. **sbomstash-audit** — Append-Only Audit Log
+#### 6. **magnolia-audit** — Append-Only Audit Log
 
 In-memory audit logger; eventually persisted to DB.
 
@@ -170,7 +170,7 @@ pub struct AuditLogEntry {
 - Mandatory `reason` for `super_admin` actions (compliance)
 - Immutable once written
 
-#### 7. **sbomstash-api** — HTTP Layer (Axum)
+#### 7. **magnolia-api** — HTTP Layer (Axum)
 
 **Entry point**: Multi-tenancy via domain/namespace routing, Bearer token auth.
 
@@ -254,20 +254,20 @@ POST /api/v1/admin/keys/create
 ## Crate Dependencies (Workspace)
 
 ```
-sbomstash-api
-├── sbomstash-core
-├── sbomstash-auth
-├── sbomstash-signer
-├── sbomstash-storage
-├── sbomstash-db
-└── sbomstash-audit
+magnolia-api
+├── magnolia-core
+├── magnolia-auth
+├── magnolia-signer
+├── magnolia-storage
+├── magnolia-db
+└── magnolia-audit
 
-sbomstash-core (no internal deps)
-sbomstash-auth (no internal deps)
-sbomstash-signer (no internal deps)
-sbomstash-storage (no internal deps)
-sbomstash-db (no internal deps)
-sbomstash-audit (no internal deps)
+magnolia-core (no internal deps)
+magnolia-auth (no internal deps)
+magnolia-signer (no internal deps)
+magnolia-storage (no internal deps)
+magnolia-db (no internal deps)
+magnolia-audit (no internal deps)
 ```
 
 ## Key Design Decisions

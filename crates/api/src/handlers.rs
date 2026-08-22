@@ -4,9 +4,9 @@ use axum::extract::{Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, Utc};
-use sbomstash_audit::{AuditLogEntry, AuditResult};
-use sbomstash_auth::{generate_server_key, Action, Role};
-use sbomstash_core::{
+use magnolia_audit::{AuditLogEntry, AuditResult};
+use magnolia_auth::{generate_server_key, Action, Role};
+use magnolia_core::{
     ConsistencyProof, InclusionProof, Manifest, MerkleTree, SbomFormat, SignedTreeHead,
 };
 use sha2::{Digest, Sha256};
@@ -77,6 +77,17 @@ pub struct ManifestJson {
     pub revoked: bool,
     pub revoked_at: Option<DateTime<Utc>>,
     pub revoked_by: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct CurrentManifestJson {
+    pub namespace: String,
+    pub domain: String,
+    pub version: String,
+    pub manifest_hash: String,
+    pub sbom_hash: String,
+    pub sbom_format: String,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(serde::Deserialize)]
@@ -212,6 +223,16 @@ fn effective_tenant(grant: &AuthGrant, requested: Option<Uuid>) -> Result<(Uuid,
 
 fn db_err(e: impl std::fmt::Display) -> ApiError {
     ApiError::InternalError(e.to_string())
+}
+
+/// `created_by`/principal is `apikey:<full key_id uuid>` — the key_id, not
+/// the secret, but still a stable per-key identifier we don't want handed
+/// out in full to anyone with read access to a namespace. Only the last 5
+/// characters ever leave the server; the rest is truncated here, not just
+/// hidden client-side, so the full value never reaches the browser at all.
+fn mask_principal(principal: &str) -> String {
+    let tail_len = 5.min(principal.len());
+    format!("…{}", &principal[principal.len() - tail_len..])
 }
 
 fn normalize_namespace(raw: &str) -> Result<String, ApiError> {
@@ -644,7 +665,7 @@ pub async fn tree_head_at(
 
 async fn tree_head_record_to_json(
     state: &AppState,
-    record: sbomstash_db::SignedTreeHeadRecord,
+    record: magnolia_db::SignedTreeHeadRecord,
 ) -> Result<TreeHeadJson, ApiError> {
     let sth = SignedTreeHead {
         tree_size: record.tree_size as u64,
@@ -782,7 +803,7 @@ pub async fn manifest(
     // the target tenant in full — namespace scope doesn't apply there.
     if record.tenant_id != tenant_id
         || (!cross_tenant
-            && !sbomstash_auth::namespace_in_scope(&record.namespace, &grant.namespace_scope))
+            && !magnolia_auth::namespace_in_scope(&record.namespace, &grant.namespace_scope))
     {
         return Err(ApiError::NotFound);
     }
@@ -818,12 +839,59 @@ pub async fn manifest(
         namespace: record.namespace,
         previous_manifest_hash: record.previous_manifest_hash,
         signature: hex::encode(&record.signature),
-        created_by: record.created_by,
+        created_by: mask_principal(&record.created_by),
         created_at: record.created_at,
         revoked: record.revoked,
         revoked_at: record.revoked_at,
         revoked_by: record.revoked_by,
     }))
+}
+
+/// The most recent non-revoked manifest per namespace — "what's currently
+/// deployed" for each deployable, not just the single latest upload
+/// tenant-wide. Recency (`created_at`), not `version` magnitude, decides
+/// "current" — a rollback to an older version number is still correctly
+/// reported as current, since it's what was actually deployed last.
+pub async fn current_manifests(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+) -> Result<Json<Vec<CurrentManifestJson>>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    let scope = if cross_tenant { "/" } else { &grant.namespace_scope };
+
+    let domain = if cross_tenant {
+        state
+            .db
+            .get_tenant(tenant_id)
+            .await
+            .map_err(db_err)?
+            .map(|t| t.domain)
+            .unwrap_or_default()
+    } else {
+        grant.domain.clone()
+    };
+
+    let rows = state
+        .db
+        .latest_manifests_by_namespace(tenant_id, scope)
+        .await
+        .map_err(db_err)?;
+
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| CurrentManifestJson {
+                namespace: r.namespace,
+                domain: domain.clone(),
+                version: r.version,
+                manifest_hash: r.manifest_hash,
+                sbom_hash: r.sbom_hash,
+                sbom_format: r.sbom_format,
+                created_at: r.created_at,
+            })
+            .collect(),
+    ))
 }
 
 /// Marks a manifest revoked — a status flag, not a delete: the manifest
@@ -860,7 +928,7 @@ pub async fn revoke_manifest(
 
     if record.tenant_id != tenant_id
         || (!cross_tenant
-            && !sbomstash_auth::namespace_in_scope(&record.namespace, &grant.namespace_scope))
+            && !magnolia_auth::namespace_in_scope(&record.namespace, &grant.namespace_scope))
     {
         return Err(ApiError::NotFound);
     }
@@ -892,7 +960,7 @@ async fn mint_key(
     expires_at: Option<DateTime<Utc>>,
 ) -> Result<CreateKeyResponse, ApiError> {
     let (key_id, secret, full_key) = generate_server_key();
-    let key_material = sbomstash_auth::ApiKey {
+    let key_material = magnolia_auth::ApiKey {
         key: secret,
         created_at: Utc::now(),
     };
@@ -999,7 +1067,7 @@ pub async fn create_tenant(
         .insert_tenant(tenant_id, &domain, name, &grant.principal(), false)
         .await
         .map_err(|e| match e {
-            sbomstash_db::DbError::Conflict(_) => {
+            magnolia_db::DbError::Conflict(_) => {
                 ApiError::BadRequest(format!("domain '{}' is already in use", domain))
             }
             other => db_err(other),

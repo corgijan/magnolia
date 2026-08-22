@@ -1,5 +1,5 @@
 [package]
-name = "sbomstash-storage"
+name = "magnolia-storage"
 version.workspace = true
 edition.workspace = true
 

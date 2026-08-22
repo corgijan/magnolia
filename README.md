@@ -1,4 +1,4 @@
-# sbomStash — Compliance SBOM Archive
+# Magnolia — Compliance SBOM Archive
 
 A pragmatic, cryptographically-sound SBOM archive for EU Cyber Resilience Act (CRA) compliance. Version-accurate, immutable, append-only.
 
@@ -13,7 +13,7 @@ cargo build --release
 ```bash
 # Requires: PostgreSQL running, migrations applied
 export DATABASE_URL="postgres://user:pass@localhost/sbomstash"
-cargo run --bin sbomstash-server
+cargo run --bin magnolia-server
 # Server listens on http://127.0.0.1:3000
 ```
 
@@ -50,7 +50,7 @@ See **[ARCHITECTURE.md](./ARCHITECTURE.md)** for deep dive.
 ## Project Structure
 
 ```
-sbomstash/
+magnolia/
 ├── crates/
 │   ├── api/           # Axum HTTP layer, auth extractor, handlers, server binary
 │   ├── core/          # Merkle Mountain Range, manifests, proofs
@@ -65,7 +65,7 @@ sbomstash/
 └── Features.md, tech.md # Requirements
 ```
 
-The server binary is `crates/api/src/main.rs` (`cargo run --bin sbomstash-server`).
+The server binary is `crates/api/src/main.rs` (`cargo run --bin magnolia-server`).
 
 ## MVP Status
 
@@ -223,7 +223,7 @@ Then just run the frontend natively (step 5 below) — its dev-server proxy alre
 
 1. Start PostgreSQL
 ```bash
-docker run --name sbomstash-db \
+docker run --name magnolia-db \
   -e POSTGRES_PASSWORD=postgres \
   -e POSTGRES_DB=sbomstash \
   -p 5432:5432 \
@@ -248,7 +248,7 @@ chmod 600 .sbomstash_key
 
 4. Run server (listens on 127.0.0.1:3000)
 ```bash
-cargo run --bin sbomstash-server
+cargo run --bin magnolia-server
 ```
 
 5. Run the web UI (port 4000, proxies `/api` and `/health` to the server)
@@ -261,7 +261,7 @@ cd frontend && npm install && npm start
    UI header. There's no admin key yet for the very first tenant, so create
    one directly. Generate a key_id/secret/hash triple:
 ```bash
-cargo run -p sbomstash-auth --example bootstrap_key
+cargo run -p magnolia-auth --example bootstrap_key
 # prints key_id=..., full_key=..., argon2_hash=...
 ```
    Then insert the tenant and its key (replace the UUID/domain/hash with

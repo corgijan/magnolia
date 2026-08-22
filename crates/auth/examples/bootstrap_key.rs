@@ -1,4 +1,4 @@
-use sbomstash_auth::{generate_server_key, ApiKey};
+use magnolia_auth::{generate_server_key, ApiKey};
 
 fn main() {
     let (key_id, secret, full_key) = generate_server_key();

@@ -1,5 +1,5 @@
 [package]
-name = "sbomstash-db"
+name = "magnolia-db"
 version.workspace = true
 edition.workspace = true
 

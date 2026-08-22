@@ -407,14 +407,25 @@ code.hash {
 
 .sbom-tree {
   margin-top: 12px;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
   padding: 8px 4px;
-  max-height: 420px;
-  overflow-y: auto;
   font-family: var(--mono);
   font-size: 14.5px;
+}
+
+/* Namespace browser (SBOM Explorer, left pane): lives in a flex column and
+   should fill the pane's full height rather than self-cap. */
+.explorer-left .sbom-tree {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* SBOM-content tree (detail panel, right pane): not a flex child of a
+   bounded column, so it needs its own cap or a huge component list grows
+   the whole page instead of scrolling. */
+.sbom-content-tree {
+  max-height: 420px;
+  overflow-y: auto;
 }
 
 .sbom-tree-row {
@@ -529,6 +540,8 @@ pre.json {
   min-height: 0;
   overflow-y: auto;
   margin-bottom: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .explorer-right {

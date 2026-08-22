@@ -1,5 +1,5 @@
 [package]
-name = "sbomstash-core"
+name = "magnolia-core"
 version.workspace = true
 edition.workspace = true
 

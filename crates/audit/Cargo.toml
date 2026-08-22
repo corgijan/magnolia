@@ -1,5 +1,5 @@
 [package]
-name = "sbomstash-audit"
+name = "magnolia-audit"
 version.workspace = true
 edition.workspace = true
 
