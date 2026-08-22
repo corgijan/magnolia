@@ -1846,7 +1846,14 @@ export default function App() {
   const [whoami, setWhoami] = useState<WhoAmI | null>(null);
   const [checkingKey, setCheckingKey] = useState(false);
   const [keyError, setKeyError] = useState('');
-  const [viewTenantId, setViewTenantId] = useState('');
+  // Seeded from the URL, not '', so the URL-sync effect below doesn't
+  // immediately strip a bookmarked ?tenant= before whoami gets a chance to
+  // read and confirm it (that race made the tenant silently reset to the
+  // default on every reload). This value is only ever a temporary guess
+  // until whoami resolves and either keeps or clears it — see the
+  // whoami-success handler, which is the actual authority on whether this
+  // key may use a tenant override at all.
+  const [viewTenantId, setViewTenantId] = useState(() => readUrlState().tenant ?? '');
 
   // Keeps the URL in sync with the active tab/tenant (via replaceState, so
   // switching tabs doesn't spam browser history) — makes the current view
