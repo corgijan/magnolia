@@ -26,17 +26,20 @@ import {
 } from './merkle';
 import './App.css';
 
-type Tab = 'dashboard' | 'upload' | 'leaves' | 'proofs' | 'keys' | 'tenants' | 'audit';
+type Tab = 'dashboard' | 'upload' | 'leaves' | 'proofs' | 'keys' | 'tenants' | 'audit' | 'settings';
 
 // Mirrors the backend RBAC matrix (crates/auth/src/rbac.rs) so the UI only
 // ever shows tabs/actions the current key is actually allowed to use.
-type RbacAction = 'upload' | 'read' | 'manage_keys' | 'manage_tenants';
+// 'annotate' mirrors Action::Annotate (crates/auth/src/rbac.rs) — same gate
+// the backend uses for the namespace-hidden toggle, so Settings never shows
+// a control that would 403 for the current role.
+type RbacAction = 'upload' | 'read' | 'manage_keys' | 'manage_tenants' | 'annotate';
 
 const ROLE_ACTIONS: Record<string, RbacAction[]> = {
-  super_admin: ['upload', 'read', 'manage_keys', 'manage_tenants'],
-  domain_admin: ['upload', 'read', 'manage_keys'],
+  super_admin: ['upload', 'read', 'manage_keys', 'manage_tenants', 'annotate'],
+  domain_admin: ['upload', 'read', 'manage_keys', 'annotate'],
   uploader: ['upload'],
-  auditor: ['read'],
+  auditor: ['read', 'annotate'],
 };
 
 function roleCan(role: string, action: RbacAction): boolean {
@@ -67,6 +70,7 @@ const TABS: { id: Tab; label: string; requires: RbacAction; group: TabGroup }[] 
   { id: 'dashboard', label: 'Info', requires: 'read', group: 'workspace' },
   { id: 'upload', label: 'Upload', requires: 'upload', group: 'workspace' },
   { id: 'proofs', label: 'Proofs', requires: 'read', group: 'workspace' },
+  { id: 'settings', label: 'Settings', requires: 'annotate', group: 'workspace' },
   { id: 'keys', label: 'API Keys', requires: 'manage_keys', group: 'admin' },
   { id: 'tenants', label: 'Tenants', requires: 'manage_tenants', group: 'admin' },
   { id: 'audit', label: 'Audit Log', requires: 'read', group: 'admin' },
@@ -290,10 +294,21 @@ function Dashboard({
 
 // ---------- Upload ----------
 
+// A git-repo upload is just a "document" on the wire (format=document,
+// document_type="git-repo") — no backend format value of its own. The UI
+// treats it as a distinct file type: the upload form presets the document
+// type instead of asking for it, and the detail panel routes it to
+// GitRepoArtifact instead of the generic download-only DocumentArtifact.
+const GIT_REPO_DOCUMENT_TYPE = 'git-repo';
+
+function isGitRepoDocumentType(documentType: string | null | undefined): boolean {
+  return (documentType ?? '').trim().toLowerCase() === GIT_REPO_DOCUMENT_TYPE;
+}
+
 function Upload({ onUploaded }: { onUploaded: (result: UploadResult) => void }) {
   const tenantId = useTenantOverride();
   const [file, setFile] = useState<File | null>(null);
-  const [format, setFormat] = useState<'cyclonedx' | 'spdx' | 'document'>('cyclonedx');
+  const [format, setFormat] = useState<'cyclonedx' | 'spdx' | 'document' | 'git-repo'>('cyclonedx');
   const [namespace, setNamespace] = useState('/');
   const [version, setVersion] = useState('');
   const [documentType, setDocumentType] = useState('');
@@ -301,8 +316,9 @@ function Upload({ onUploaded }: { onUploaded: (result: UploadResult) => void }) 
   const [result, setResult] = useState<UploadResult | null>(null);
   const [error, setError] = useState('');
 
-  const isDocument = format === 'document';
-  const canUpload = !!file && !!version.trim() && (!isDocument || !!documentType.trim());
+  const isGitRepo = format === 'git-repo';
+  const isCustomDocument = format === 'document';
+  const canUpload = !!file && !!version.trim() && (!isCustomDocument || !!documentType.trim());
 
   const upload = async () => {
     if (!canUpload || !file) return;
@@ -311,11 +327,11 @@ function Upload({ onUploaded }: { onUploaded: (result: UploadResult) => void }) 
     try {
       const res = await api.upload(
         file,
-        format,
+        isGitRepo ? 'document' : format,
         namespace,
         version.trim(),
         tenantId,
-        isDocument ? documentType.trim() : undefined
+        isGitRepo ? GIT_REPO_DOCUMENT_TYPE : isCustomDocument ? documentType.trim() : undefined
       );
       setResult(res);
       onUploaded(res);
@@ -340,14 +356,20 @@ function Upload({ onUploaded }: { onUploaded: (result: UploadResult) => void }) 
         <span>Format</span>
         <select
           value={format}
-          onChange={(e) => setFormat(e.target.value as 'cyclonedx' | 'spdx' | 'document')}
+          onChange={(e) => setFormat(e.target.value as 'cyclonedx' | 'spdx' | 'document' | 'git-repo')}
         >
           <option value="cyclonedx">CycloneDX (JSON)</option>
           <option value="spdx">SPDX (JSON)</option>
           <option value="document">Other technical documentation</option>
+          <option value="git-repo">Git repo (.tar / .tar.gz)</option>
         </select>
       </label>
-      {isDocument && (
+      {isGitRepo && (
+        <div className="muted upload-hint">
+          Archive is browsable file-by-file in the detail view after upload — no need to unpack it yourself.
+        </div>
+      )}
+      {isCustomDocument && (
         <label className="field">
           <span>Document type</span>
           <input
@@ -809,6 +831,272 @@ function DocumentArtifact({ manifest }: { manifest: Manifest }) {
   );
 }
 
+// ---------- Git repo (tar/tar.gz) browsing ----------
+
+// TypeScript 4.9's DOM lib predates the Compression Streams API — it's a
+// real, widely-supported browser API (Chrome 80+, Firefox 113+, Safari
+// 16.4+), just not in this project's lib.dom.d.ts yet.
+declare global {
+  interface DecompressionStream {
+    readonly readable: ReadableStream<Uint8Array>;
+    readonly writable: WritableStream<Uint8Array>;
+  }
+  // eslint-disable-next-line no-var
+  var DecompressionStream: {
+    prototype: DecompressionStream;
+    new (format: 'gzip' | 'deflate' | 'deflate-raw'): DecompressionStream;
+  };
+}
+
+interface TarEntry {
+  name: string;
+  size: number;
+  isDirectory: boolean;
+  dataStart: number;
+}
+
+function isGzip(bytes: Uint8Array): boolean {
+  return bytes.length > 2 && bytes[0] === 0x1f && bytes[1] === 0x8b;
+}
+
+async function gunzipIfNeeded(bytes: Uint8Array): Promise<Uint8Array> {
+  if (!isGzip(bytes)) return bytes;
+  if (typeof DecompressionStream === 'undefined') {
+    throw new Error('this browser cannot decompress gzip — try a Chromium/Firefox/Safari from the last couple of years');
+  }
+  const stream = new Blob([bytes as BlobPart]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+function readTarString(bytes: Uint8Array, offset: number, length: number): string {
+  let end = offset;
+  const stop = Math.min(offset + length, bytes.length);
+  while (end < stop && bytes[end] !== 0) end++;
+  return new TextDecoder('utf-8').decode(bytes.subarray(offset, end));
+}
+
+function readTarOctal(bytes: Uint8Array, offset: number, length: number): number {
+  const s = readTarString(bytes, offset, length).trim();
+  return s ? parseInt(s, 8) || 0 : 0;
+}
+
+function isZeroBlock(bytes: Uint8Array, offset: number): boolean {
+  for (let i = 0; i < 512; i++) {
+    if (bytes[offset + i] !== 0) return false;
+  }
+  return true;
+}
+
+// Routing to the git-repo browser shouldn't depend on someone having typed
+// the document_type exactly as "git-repo" — a gzip magic byte or a ustar
+// header is effectively unambiguous, so any document (regardless of its
+// label) that looks like a tar/tar.gz gets the browsable view instead of
+// the plain download-only fallback.
+function looksLikeTarArchive(bytes: Uint8Array): boolean {
+  if (isGzip(bytes)) return true;
+  if (bytes.length < 512) return false;
+  return readTarString(bytes, 257, 6).startsWith('ustar');
+}
+
+// Minimal ustar/GNU/pax tar reader — enough to list and extract the
+// entries a real repo archive (e.g. `git archive`) produces: fixed 100-byte
+// names plus the ustar "prefix" field for longer ones, GNU long-name
+// ('L') headers, and pax extended ('x') headers for unicode/very long
+// paths. Base-256 (>8GB) size encoding isn't handled — not a real case for
+// source trees.
+function parseTar(bytes: Uint8Array): TarEntry[] {
+  const entries: TarEntry[] = [];
+  let offset = 0;
+  let longNameOverride: string | null = null;
+  let paxPathOverride: string | null = null;
+
+  while (offset + 512 <= bytes.length) {
+    if (isZeroBlock(bytes, offset)) break;
+
+    const typeflag = String.fromCharCode(bytes[offset + 156]);
+    let name = readTarString(bytes, offset, 100);
+    const prefix = readTarString(bytes, offset + 345, 155);
+    if (prefix) name = `${prefix}/${name}`;
+    const size = readTarOctal(bytes, offset + 124, 12);
+    const dataStart = offset + 512;
+    const dataBlocks = Math.ceil(size / 512);
+    let nextOffset = dataStart + dataBlocks * 512;
+    if (nextOffset <= offset) break; // malformed — avoid an infinite loop
+
+    if (typeflag === 'L') {
+      longNameOverride = readTarString(bytes, dataStart, size);
+      offset = nextOffset;
+      continue;
+    }
+    if (typeflag === 'x') {
+      const text = new TextDecoder('utf-8').decode(bytes.subarray(dataStart, Math.min(dataStart + size, bytes.length)));
+      const match = text.match(/\d+ path=([^\n]*)\n/);
+      if (match) paxPathOverride = match[1];
+      offset = nextOffset;
+      continue;
+    }
+    if (typeflag === 'g' || typeflag === 'K') {
+      offset = nextOffset;
+      continue;
+    }
+
+    if (longNameOverride) {
+      name = longNameOverride;
+      longNameOverride = null;
+    } else if (paxPathOverride) {
+      name = paxPathOverride;
+      paxPathOverride = null;
+    }
+
+    if (name && (typeflag === '0' || typeflag === '\0' || typeflag === '5')) {
+      entries.push({
+        name,
+        size,
+        isDirectory: typeflag === '5' || name.endsWith('/'),
+        dataStart,
+      });
+    }
+    offset = nextOffset;
+  }
+  return entries;
+}
+
+// macOS's tar (and Finder/zip) sprinkle sidecar/metadata entries into
+// archives that carry no real repo content — AppleDouble resource-fork
+// files ("._foo" next to "foo"), Finder's ".DS_Store", and zip's
+// "__MACOSX/" folder. Noise, not files anyone uploading a repo meant to
+// include, so they're filtered out of the browser entirely.
+function isMacOsJunkTarEntry(name: string): boolean {
+  const base = name.split('/').pop() ?? name;
+  return base.startsWith('._') || base === '.DS_Store' || name.startsWith('__MACOSX/') || name.includes('/__MACOSX/');
+}
+
+function GitRepoArtifact({ manifest }: { manifest: Manifest }) {
+  const rawBytes = useMemo(() => hexToBytes(manifest.sbom_hex), [manifest.sbom_hex]);
+  const [tarBytes, setTarBytes] = useState<Uint8Array | null>(null);
+  const [entries, setEntries] = useState<TarEntry[] | null>(null);
+  const [parseError, setParseError] = useState('');
+  const [selected, setSelected] = useState<TarEntry | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setTarBytes(null);
+    setEntries(null);
+    setParseError('');
+    setSelected(null);
+    gunzipIfNeeded(rawBytes)
+      .then((bytes) => {
+        if (cancelled) return;
+        const files = parseTar(bytes)
+          .filter((e) => !e.isDirectory && !isMacOsJunkTarEntry(e.name))
+          .sort((a, b) => a.name.localeCompare(b.name));
+        setTarBytes(bytes);
+        setEntries(files);
+      })
+      .catch((e) => {
+        if (!cancelled) setParseError(e instanceof Error ? e.message : String(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [rawBytes]);
+
+  const selectedBytes = useMemo(() => {
+    if (!selected || !tarBytes) return null;
+    return tarBytes.subarray(selected.dataStart, selected.dataStart + selected.size);
+  }, [selected, tarBytes]);
+
+  const selectedPdf = useMemo(() => (selectedBytes ? isPdf(selectedBytes) : false), [selectedBytes]);
+  const selectedText = useMemo(
+    () => (selectedBytes && !selectedPdf ? displayableText(selectedBytes) : null),
+    [selectedBytes, selectedPdf]
+  );
+  const selectedPdfUrl = useMemo(() => {
+    if (!selectedBytes || !selectedPdf) return null;
+    const blob = new Blob([selectedBytes as BlobPart], { type: 'application/pdf' });
+    return URL.createObjectURL(blob);
+  }, [selectedBytes, selectedPdf]);
+  useEffect(() => {
+    return () => {
+      if (selectedPdfUrl) URL.revokeObjectURL(selectedPdfUrl);
+    };
+  }, [selectedPdfUrl]);
+
+  return (
+    <div className="sbom-artifact">
+      <div className="sbom-artifact-header">
+        <div>
+          <strong>{documentDisplayName(manifest.document_type ?? '', manifest.version)}</strong>
+          <span className="muted">
+            {' '}
+            · git repo · {formatBytes(rawBytes.length)}
+            {entries ? ` · ${entries.length} file${entries.length === 1 ? '' : 's'}` : ''}
+          </span>
+        </div>
+        <div className="form-row">
+          <button
+            className="btn"
+            onClick={() =>
+              downloadBytes(
+                `${manifest.sbom_hash.slice(0, 16)}.tar`,
+                rawBytes,
+                isGzip(rawBytes) ? 'application/gzip' : 'application/x-tar'
+              )
+            }
+          >
+            Download archive
+          </button>
+        </div>
+      </div>
+      {parseError && <ErrorBox message={`Could not read this as a tar archive: ${parseError}`} />}
+      {!parseError && entries === null && <Spinner label="Reading archive…" />}
+      {!parseError && entries !== null && entries.length === 0 && (
+        <div className="muted">Archive contains no files.</div>
+      )}
+      {!parseError && entries !== null && entries.length > 0 && (
+        <div className="git-repo-browser">
+          <div className="git-repo-files sbom-tree">
+            {entries.map((e) => (
+              <div
+                key={e.name}
+                className={`sbom-tree-row clickable${selected?.name === e.name ? ' git-repo-file-active' : ''}`}
+                onClick={() => setSelected(e)}
+                title={e.name}
+              >
+                <FileIcon />
+                <span className="sbom-tree-label">{e.name}</span>
+                <span className="sbom-tree-detail">{formatBytes(e.size)}</span>
+              </div>
+            ))}
+          </div>
+          <div className="git-repo-preview">
+            {!selected && <div className="muted">Select a file on the left to preview it.</div>}
+            {selected && selectedPdf && selectedPdfUrl && (
+              <iframe title="repo file preview" src={selectedPdfUrl} className="document-pdf-preview" />
+            )}
+            {selected && !selectedPdf && selectedText !== null && (
+              <pre className="json sbom-json">{selectedText || '(empty file)'}</pre>
+            )}
+            {selected && !selectedPdf && selectedText === null && (
+              <div className="git-repo-file-fallback">
+                <div className="muted">No preview available for this file type.</div>
+                <button
+                  className="btn"
+                  onClick={() =>
+                    selectedBytes && downloadBytes(selected.name.split('/').pop() || 'file', selectedBytes)
+                  }
+                >
+                  Download file
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SbomSearchBox({ onSelect }: { onSelect: (hash: string) => void }) {
   const [hash, setHash] = useState('');
   return (
@@ -844,7 +1132,7 @@ function VersionPicker({ leaves, onSelect }: { leaves: Leaf[]; onSelect: (hash: 
             <span className="sbom-tree-label" title={leaf.leaf_hash}>
               {leaf.document_type
                 ? documentDisplayName(leaf.document_type, leaf.version ?? '')
-                : leaf.version ?? 'no version'}
+                : documentDisplayName('SBOM', leaf.version ?? '')}
             </span>
             <span className="sbom-tree-detail">
               {new Date(leaf.created_at).toLocaleString()}
@@ -863,6 +1151,14 @@ function SbomDetailPanel({ hash, tenantId }: { hash: string; tenantId?: string }
   const [error, setError] = useState('');
   const [revoking, setRevoking] = useState(false);
   const [revokeError, setRevokeError] = useState('');
+
+  // Only bothers sniffing document uploads — a real SBOM is validated
+  // CycloneDX/SPDX JSON server-side already, so it can never collide with
+  // a tar/gzip signature.
+  const looksLikeTar = useMemo(
+    () => (manifest?.document_type ? looksLikeTarArchive(hexToBytes(manifest.sbom_hex)) : false),
+    [manifest?.document_type, manifest?.sbom_hex]
+  );
 
   const load = useCallback(async () => {
     setBusy(true);
@@ -909,7 +1205,9 @@ function SbomDetailPanel({ hash, tenantId }: { hash: string; tenantId?: string }
       {error && <ErrorBox message={error} />}
       {!busy && manifest && (
         <div className="result-box">
-          {manifest.document_type ? (
+          {isGitRepoDocumentType(manifest.document_type) || looksLikeTar ? (
+            <GitRepoArtifact key={manifest.manifest_hash} manifest={manifest} />
+          ) : manifest.document_type ? (
             <DocumentArtifact key={manifest.manifest_hash} manifest={manifest} />
           ) : (
             <SbomArtifact key={manifest.manifest_hash} manifest={manifest} />
@@ -1071,7 +1369,7 @@ function SbomLeafRow({
       <span className="sbom-tree-label" title={leaf.leaf_hash}>
         {leaf.document_type
           ? documentDisplayName(leaf.document_type, leaf.version ?? '')
-          : leaf.version ?? 'no version'}
+          : documentDisplayName('SBOM', leaf.version ?? '')}
       </span>
       <span className="sbom-tree-detail">
         {new Date(leaf.created_at).toLocaleDateString()}
@@ -1124,35 +1422,22 @@ function NamespaceFolderRow({
   depth,
   onViewSbom,
   onViewGroup,
-  hiddenNamespaces,
-  onToggleHidden,
 }: {
   node: NamespaceTreeNode;
   depth: number;
   onViewSbom: (hash: string) => void;
   onViewGroup: (leaves: Leaf[]) => void;
-  hiddenNamespaces: Set<string>;
-  onToggleHidden: (namespace: string, hidden: boolean) => void;
 }) {
-  // depth 0 is now the org/domain root, so expand it and its immediate
-  // children by default — otherwise everything would start collapsed
-  // behind one extra click.
-  const [open, setOpen] = useState(depth < 2);
+  // depth 0 is the org/domain root — expand it by default so the first
+  // real namespace level (depth 1) is visible immediately, but leave that
+  // first level (and everything under it) collapsed by default rather
+  // than auto-expanding the whole tree.
+  const [open, setOpen] = useState(depth < 1);
   const hasContent = node.children.length > 0 || node.leaves.length > 0;
-  // Only nodes with leaves directly on them are real namespaces (something
-  // was actually uploaded there) — purely structural path segments (e.g.
-  // "products" grouping "products/v1", "products/v2") aren't toggleable,
-  // since "current" tracking is per exact namespace, not per path prefix.
-  // depth 0 (the domain root) is excluded too: buildNamespaceTree gives it
-  // `id = domain`, not the literal namespace "/", so toggling from here
-  // would target the wrong key — a namespace of exactly "/" can't be
-  // toggled from the tree view yet.
-  const isRealNamespace = node.leaves.length > 0 && depth > 0;
-  const isHidden = isRealNamespace && hiddenNamespaces.has(node.id);
   return (
     <div>
       <div
-        className={`sbom-tree-row${hasContent ? ' clickable' : ''}`}
+        className={`sbom-tree-row${hasContent ? ' clickable' : ''}${depth === 1 ? ' sbom-tree-row-top' : ''}`}
         style={{ paddingLeft: depth * 18 }}
         onClick={() => hasContent && setOpen((o) => !o)}
       >
@@ -1164,20 +1449,6 @@ function NamespaceFolderRow({
           ({node.leaves.length} item{node.leaves.length === 1 ? '' : 's'}
           {node.children.length > 0 ? `, ${node.children.length} sub` : ''})
         </span>
-        {isRealNamespace && (
-          <label
-            className="checkbox-field namespace-hidden-toggle"
-            onClick={(e) => e.stopPropagation()}
-            title="Show this namespace in the 'Currently running' view"
-          >
-            <input
-              type="checkbox"
-              checked={!isHidden}
-              onChange={(e) => onToggleHidden(node.id, !e.target.checked)}
-            />
-            in "Currently running"
-          </label>
-        )}
       </div>
       {open && (
         <>
@@ -1200,8 +1471,6 @@ function NamespaceFolderRow({
               depth={depth + 1}
               onViewSbom={onViewSbom}
               onViewGroup={onViewGroup}
-              hiddenNamespaces={hiddenNamespaces}
-              onToggleHidden={onToggleHidden}
             />
           ))}
         </>
@@ -1214,14 +1483,10 @@ function NamespaceTree({
   leaves,
   onViewSbom,
   onViewGroup,
-  hiddenNamespaces,
-  onToggleHidden,
 }: {
   leaves: Leaf[];
   onViewSbom: (hash: string) => void;
   onViewGroup: (leaves: Leaf[]) => void;
-  hiddenNamespaces: Set<string>;
-  onToggleHidden: (namespace: string, hidden: boolean) => void;
 }) {
   // All leaves in one call belong to one tenant, so they share one domain —
   // shown as the tree's root folder, e.g. "myorg.example" > "products" >
@@ -1233,19 +1498,28 @@ function NamespaceTree({
   }
   return (
     <div className="sbom-tree">
-      <NamespaceFolderRow
-        node={root}
-        depth={0}
-        onViewSbom={onViewSbom}
-        onViewGroup={onViewGroup}
-        hiddenNamespaces={hiddenNamespaces}
-        onToggleHidden={onToggleHidden}
-      />
+      <NamespaceFolderRow node={root} depth={0} onViewSbom={onViewSbom} onViewGroup={onViewGroup} />
     </div>
   );
 }
 
 // ---------- Leaves ----------
+
+// Whether the "Currently running" button/view shows in the Explorer at
+// all, toggled from Settings. Per-browser (localStorage), not a tenant
+// setting on the server — this hides a UI affordance, it doesn't change
+// what any API call returns, so there's nothing server-side to gate.
+// Defaults off — an opt-in view, unlike the per-namespace visibility
+// feature it sits on top of (that one's still on by default).
+const CURRENTLY_RUNNING_VIEW_KEY = 'magnolia_currently_running_view_enabled';
+
+function readCurrentlyRunningViewEnabled(): boolean {
+  return localStorage.getItem(CURRENTLY_RUNNING_VIEW_KEY) === 'true';
+}
+
+function writeCurrentlyRunningViewEnabled(enabled: boolean): void {
+  localStorage.setItem(CURRENTLY_RUNNING_VIEW_KEY, String(enabled));
+}
 
 function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
   const tenantId = useTenantOverride();
@@ -1270,30 +1544,22 @@ function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
   const [view, setView] = useState<'tree' | 'table' | 'current'>('tree');
   const [showRevoked, setShowRevoked] = useState(false);
   const [current, setCurrent] = useState<CurrentManifest[] | null>(null);
-  const [hiddenNamespaces, setHiddenNamespaces] = useState<Set<string>>(new Set());
-
-  const loadHidden = useCallback(() => {
-    api.hiddenNamespaces(tenantId).then((ns) => setHiddenNamespaces(new Set(ns))).catch(() => {});
-  }, [tenantId]);
+  // Read once per mount — Leaves fully remounts on every tab switch (see
+  // above), so toggling this in Settings and switching back here picks up
+  // the new value without needing a live cross-tab subscription.
+  const [currentlyRunningViewEnabled] = useState(() => readCurrentlyRunningViewEnabled());
 
   const load = useCallback(() => {
     setError('');
     api.leaves(50, 0, tenantId)
       .then(setLeaves)
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
-    // Non-fatal: the tree/table views still work if this fails.
-    api.currentManifests(tenantId).then(setCurrent).catch(() => {});
-    loadHidden();
-  }, [tenantId, loadHidden]);
-
-  const toggleNamespaceHidden = useCallback(
-    async (namespace: string, hidden: boolean) => {
-      await api.setNamespaceHidden(namespace, hidden, tenantId);
-      loadHidden();
+    // Non-fatal: the tree/table views still work if this fails. Skipped
+    // entirely when the view is turned off — nothing would use it.
+    if (currentlyRunningViewEnabled) {
       api.currentManifests(tenantId).then(setCurrent).catch(() => {});
-    },
-    [tenantId, loadHidden]
-  );
+    }
+  }, [tenantId, currentlyRunningViewEnabled]);
 
   useEffect(load, [load]);
 
@@ -1318,9 +1584,11 @@ function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
           <button className="btn" disabled={view === 'table'} onClick={() => setView('table')}>
             Table
           </button>
-          <button className="btn" disabled={view === 'current'} onClick={() => setView('current')}>
-            Currently running
-          </button>
+          {currentlyRunningViewEnabled && (
+            <button className="btn" disabled={view === 'current'} onClick={() => setView('current')}>
+              Currently running
+            </button>
+          )}
           <label className="checkbox-field">
             <input
               type="checkbox"
@@ -1341,8 +1609,6 @@ function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
               setSelectedHash(undefined);
               setSelectedGroup(g);
             }}
-            hiddenNamespaces={hiddenNamespaces}
-            onToggleHidden={toggleNamespaceHidden}
           />
         )}
         {visibleLeaves && visibleLeaves.length > 0 && view === 'table' && (
@@ -2027,6 +2293,126 @@ function Audit() {
   );
 }
 
+// ---------- Settings (per-namespace "Currently running" visibility) ----------
+
+function Settings() {
+  const tenantId = useTenantOverride();
+  const [leaves, setLeaves] = useState<Leaf[] | null>(null);
+  const [hiddenNamespaces, setHiddenNamespaces] = useState<Set<string>>(new Set());
+  const [error, setError] = useState('');
+  const [busyNamespace, setBusyNamespace] = useState<string | null>(null);
+  const [currentlyRunningViewEnabled, setCurrentlyRunningViewEnabled] = useState(() =>
+    readCurrentlyRunningViewEnabled()
+  );
+
+  const toggleCurrentlyRunningView = (enabled: boolean) => {
+    writeCurrentlyRunningViewEnabled(enabled);
+    setCurrentlyRunningViewEnabled(enabled);
+  };
+
+  const load = useCallback(() => {
+    setError('');
+    // A larger limit than the Explorer tabs use — this page exists to be
+    // the complete list, not a recent-activity view. Still bounded by the
+    // same underlying pagination, so a tenant with more uploads than this
+    // could have older namespaces missing here (matches the same
+    // limitation the Explorer tree already has, just with more headroom).
+    api.leaves(500, 0, tenantId)
+      .then(setLeaves)
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+    api.hiddenNamespaces(tenantId).then((ns) => setHiddenNamespaces(new Set(ns))).catch(() => {});
+  }, [tenantId]);
+
+  useEffect(load, [load]);
+
+  const namespaces = useMemo(() => {
+    if (!leaves) return null;
+    const set = new Set<string>();
+    for (const leaf of leaves) set.add(leaf.namespace);
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [leaves]);
+
+  const toggle = async (namespace: string, hidden: boolean) => {
+    setBusyNamespace(namespace);
+    setError('');
+    try {
+      await api.setNamespaceHidden(namespace, hidden, tenantId);
+      setHiddenNamespaces((prev) => {
+        const next = new Set(prev);
+        if (hidden) next.add(namespace);
+        else next.delete(namespace);
+        return next;
+      });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyNamespace(null);
+    }
+  };
+
+  return (
+    <div className="card">
+      <div className="card-header">
+        <h2>Settings</h2>
+        <button className="btn" onClick={load}>Refresh</button>
+      </div>
+      <label className="checkbox-field settings-master-toggle">
+        <input
+          type="checkbox"
+          checked={currentlyRunningViewEnabled}
+          onChange={(e) => toggleCurrentlyRunningView(e.target.checked)}
+        />
+        Show the "Currently running" button and view in the Explorer
+      </label>
+      <p className="muted">
+        Per-browser — this just hides the tab, it doesn't change what any API call returns. When
+        shown, the table below controls which namespaces appear in it — a display filter only;
+        uploads, revocation, and the Merkle log are unaffected either way.
+      </p>
+      {error && <ErrorBox message={error} />}
+      {!currentlyRunningViewEnabled && (
+        <div className="muted">
+          "Currently running" is hidden — the list below still works and takes effect immediately
+          if you turn it back on.
+        </div>
+      )}
+      {namespaces === null && !error && <Spinner label="Loading namespaces…" />}
+      {namespaces !== null && namespaces.length === 0 && <div className="muted">No namespaces yet.</div>}
+      {namespaces !== null && namespaces.length > 0 && (
+        <table className="table">
+          <thead>
+            <tr>
+              <th>namespace</th>
+              <th>in "Currently running"</th>
+            </tr>
+          </thead>
+          <tbody>
+            {namespaces.map((ns) => {
+              const isHidden = hiddenNamespaces.has(ns);
+              return (
+                <tr key={ns}>
+                  <td>{ns}</td>
+                  <td>
+                    <label className="checkbox-field">
+                      <input
+                        type="checkbox"
+                        checked={!isHidden}
+                        disabled={busyNamespace === ns}
+                        onChange={(e) => toggle(ns, !e.target.checked)}
+                      />
+                      {isHidden ? 'hidden' : 'visible'}
+                    </label>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
 // ---------- Connection gate (no valid key: nothing but server status) ----------
 
 function useServerHealth(intervalMs = 10000): boolean | null {
@@ -2331,6 +2717,7 @@ export default function App() {
               <Tenants isPlatform={whoami.is_platform_tenant} />
             )}
             {tab === 'audit' && roleCan(whoami.role, 'read') && <Audit />}
+            {tab === 'settings' && roleCan(whoami.role, 'annotate') && <Settings />}
           </main>
         </div>
       </div>

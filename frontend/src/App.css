@@ -312,6 +312,15 @@ code.hash {
   margin-bottom: 12px;
 }
 
+.upload-hint {
+  margin-bottom: 12px;
+}
+
+.settings-master-toggle {
+  display: flex;
+  margin-bottom: 8px;
+}
+
 .field span {
   display: block;
   color: var(--muted);
@@ -445,6 +454,46 @@ code.hash {
   overflow-y: auto;
 }
 
+/* Git-repo browser (detail panel): file list on the left, selected file's
+   preview on the right — each side caps its own height independently
+   (same reasoning as .sbom-content-tree above) rather than relying on the
+   surrounding layout being sized exactly right. */
+.git-repo-browser {
+  display: flex;
+  gap: 14px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
+.git-repo-files {
+  flex: 1 1 260px;
+  max-width: 340px;
+  max-height: 480px;
+  overflow: auto;
+  border-right: 1px solid var(--border);
+  padding-right: 8px;
+  margin-top: 0;
+}
+
+.git-repo-preview {
+  flex: 2 1 380px;
+  min-width: 0;
+  max-height: 480px;
+  overflow: auto;
+}
+
+.git-repo-file-active {
+  background: var(--panel-2);
+}
+
+.git-repo-file-fallback {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 12px 0;
+}
+
 .sbom-tree-row {
   display: flex;
   align-items: center;
@@ -460,6 +509,18 @@ code.hash {
 
 .sbom-tree-row.clickable:hover {
   background: var(--panel-2);
+}
+
+/* First real namespace level in the Explorer tree (depth 1, directly under
+   the org/domain root) — tinted so the top-level groupings stand out from
+   the plain rows nested underneath them. */
+.sbom-tree-row-top {
+  background: rgba(79, 140, 255, 0.08);
+  border-left: 2px solid var(--accent);
+}
+
+.sbom-tree-row-top.clickable:hover {
+  background: rgba(79, 140, 255, 0.16);
 }
 
 .sbom-tree-toggle {
