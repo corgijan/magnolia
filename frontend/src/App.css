@@ -403,12 +403,19 @@ code.hash {
 
 .sbom-json {
   margin-top: 12px;
+  max-height: 60vh;
+  overflow: auto;
 }
 
+/* Fixed, self-contained cap — not dependent on the surrounding flex chain
+   being sized just right, which is what made this (and the panel as a
+   whole) stop scrolling at all when it was briefly made a flex:1 child
+   instead. Big enough to show real content, capped well under the
+   viewport so it can't push everything else out of view either. */
 .document-pdf-preview {
   display: block;
   width: 100%;
-  height: 75vh;
+  height: 60vh;
   margin-top: 12px;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -565,12 +572,21 @@ pre.json {
 /* The visible card is a child of .explorer-right (SbomDetailPanel renders
    its own .card, or the "select an SBOM" placeholder does) — stretch that
    child to fill the pane, since .explorer-right itself has no background/
-   border of its own. */
+   border of its own. This is the scroll region for the whole detail panel;
+   individual preview elements inside it (PDF, SBOM tree, raw JSON) cap
+   their own height rather than relying on this container's height being
+   computed exactly right, so scrolling keeps working even if it isn't. */
 .explorer-right > .card {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
   margin-bottom: 0;
+}
+
+.back-to-versions {
+  align-self: flex-start;
+  margin-bottom: 8px;
+  flex: 0 0 auto;
 }
 
 .row-clickable {

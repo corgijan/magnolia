@@ -828,6 +828,35 @@ function SbomSearchBox({ onSelect }: { onSelect: (hash: string) => void }) {
   );
 }
 
+function VersionPicker({ leaves, onSelect }: { leaves: Leaf[]; onSelect: (hash: string) => void }) {
+  return (
+    <div className="card">
+      <h2>Select a version</h2>
+      <div className="sbom-tree">
+        {leaves.map((leaf) => (
+          <div
+            key={leaf.seq_id}
+            className={`sbom-tree-row${leaf.manifest_hash ? ' clickable' : ''}`}
+            onClick={() => leaf.manifest_hash && onSelect(leaf.manifest_hash)}
+            title={leaf.manifest_hash ? 'View this version' : 'No manifest available'}
+          >
+            <FileIcon />
+            <span className="sbom-tree-label" title={leaf.leaf_hash}>
+              {leaf.document_type
+                ? documentDisplayName(leaf.document_type, leaf.version ?? '')
+                : leaf.version ?? 'no version'}
+            </span>
+            <span className="sbom-tree-detail">
+              {new Date(leaf.created_at).toLocaleString()}
+            </span>
+            {leaf.revoked && <Badge ok={false}>revoked</Badge>}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function SbomDetailPanel({ hash, tenantId }: { hash: string; tenantId?: string }) {
   const [manifest, setManifest] = useState<Manifest | null>(null);
   const [busy, setBusy] = useState(true);
@@ -998,6 +1027,30 @@ function buildNamespaceTree(leaves: Leaf[], domain: string): NamespaceTreeNode {
   return root;
 }
 
+// Splits one namespace's leaves into per-file groups — SBOM uploads (no
+// document_type) are one file, and each distinct document_type is its own
+// file, so a namespace holding both an SBOM and a risk-assessment doc
+// shows two rows, not one merged row. Leaves arrive newest-first (API
+// order) and that order is preserved within each group.
+//
+// document_type is free text typed on each upload, so the grouping key is
+// normalized (trimmed, case-folded) — "Risk Assesment" and "risk assesment"
+// are the same file typed inconsistently, not two different files. The
+// displayed label still uses the newest leaf's original casing.
+function groupLeavesByFile(leaves: Leaf[]): Leaf[][] {
+  const groups = new Map<string, Leaf[]>();
+  for (const leaf of leaves) {
+    const key = leaf.document_type ? leaf.document_type.trim().toLowerCase() : '__sbom__';
+    const group = groups.get(key);
+    if (group) {
+      group.push(leaf);
+    } else {
+      groups.set(key, [leaf]);
+    }
+  }
+  return Array.from(groups.values());
+}
+
 function SbomLeafRow({
   leaf,
   depth,
@@ -1029,16 +1082,55 @@ function SbomLeafRow({
   );
 }
 
+// Collapses every version of one file (all leaves sharing the same
+// document_type, or all plain SBOM uploads when null) into a single row —
+// clicking it opens a version picker in the right pane instead of jumping
+// straight to a manifest, since there's more than one to choose from.
+// `leaves` is already newest-first (API order) and, per groupLeavesByFile,
+// all share the same document_type.
+function SbomFileGroupRow({
+  leaves,
+  depth,
+  onViewGroup,
+}: {
+  leaves: Leaf[];
+  depth: number;
+  onViewGroup: (leaves: Leaf[]) => void;
+}) {
+  const documentType = leaves[0]?.document_type;
+  const revokedCount = leaves.filter((l) => l.revoked).length;
+  return (
+    <div
+      className="sbom-tree-row clickable"
+      style={{ paddingLeft: depth * 18 }}
+      onClick={() => onViewGroup(leaves)}
+      title="Select a version to view"
+    >
+      <FileIcon />
+      <span className="sbom-tree-label">
+        {documentType ? documentDisplayName(documentType, '') : 'SBOM'}
+      </span>
+      <span className="sbom-tree-detail">{leaves.length} versions</span>
+      {documentType && <Badge ok={true}>document</Badge>}
+      {revokedCount > 0 && (
+        <Badge ok={false}>{revokedCount} revoked</Badge>
+      )}
+    </div>
+  );
+}
+
 function NamespaceFolderRow({
   node,
   depth,
   onViewSbom,
+  onViewGroup,
   hiddenNamespaces,
   onToggleHidden,
 }: {
   node: NamespaceTreeNode;
   depth: number;
   onViewSbom: (hash: string) => void;
+  onViewGroup: (leaves: Leaf[]) => void;
   hiddenNamespaces: Set<string>;
   onToggleHidden: (namespace: string, hidden: boolean) => void;
 }) {
@@ -1089,15 +1181,25 @@ function NamespaceFolderRow({
       </div>
       {open && (
         <>
-          {node.leaves.map((leaf) => (
-            <SbomLeafRow key={leaf.seq_id} leaf={leaf} depth={depth + 1} onViewSbom={onViewSbom} />
-          ))}
+          {groupLeavesByFile(node.leaves).map((group) =>
+            group.length === 1 ? (
+              <SbomLeafRow key={group[0].seq_id} leaf={group[0]} depth={depth + 1} onViewSbom={onViewSbom} />
+            ) : (
+              <SbomFileGroupRow
+                key={group[0].document_type ?? '__sbom__'}
+                leaves={group}
+                depth={depth + 1}
+                onViewGroup={onViewGroup}
+              />
+            )
+          )}
           {node.children.map((child) => (
             <NamespaceFolderRow
               key={child.id}
               node={child}
               depth={depth + 1}
               onViewSbom={onViewSbom}
+              onViewGroup={onViewGroup}
               hiddenNamespaces={hiddenNamespaces}
               onToggleHidden={onToggleHidden}
             />
@@ -1111,11 +1213,13 @@ function NamespaceFolderRow({
 function NamespaceTree({
   leaves,
   onViewSbom,
+  onViewGroup,
   hiddenNamespaces,
   onToggleHidden,
 }: {
   leaves: Leaf[];
   onViewSbom: (hash: string) => void;
+  onViewGroup: (leaves: Leaf[]) => void;
   hiddenNamespaces: Set<string>;
   onToggleHidden: (namespace: string, hidden: boolean) => void;
 }) {
@@ -1133,6 +1237,7 @@ function NamespaceTree({
         node={root}
         depth={0}
         onViewSbom={onViewSbom}
+        onViewGroup={onViewGroup}
         hiddenNamespaces={hiddenNamespaces}
         onToggleHidden={onToggleHidden}
       />
@@ -1151,6 +1256,17 @@ function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
   // jumping here right after an upload, without needing to track/clear a
   // "consumed" flag.
   const [selectedHash, setSelectedHash] = useState<string | undefined>(initialSelectedHash);
+  // Set when a multi-version namespace row is clicked — the right pane
+  // shows a version picker instead of jumping straight to a manifest.
+  // Cleared by any selection that already names a specific manifest
+  // directly (search box, table row, "currently running" row, or a
+  // single-version tree row), so a stale "← All versions" link never
+  // points at an unrelated group.
+  const [selectedGroup, setSelectedGroup] = useState<Leaf[] | null>(null);
+  const selectHash = useCallback((hash: string) => {
+    setSelectedGroup(null);
+    setSelectedHash(hash);
+  }, []);
   const [view, setView] = useState<'tree' | 'table' | 'current'>('tree');
   const [showRevoked, setShowRevoked] = useState(false);
   const [current, setCurrent] = useState<CurrentManifest[] | null>(null);
@@ -1194,7 +1310,7 @@ function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
           <h2>Archive Explorer</h2>
           <button className="btn" onClick={load}>Refresh</button>
         </div>
-        <SbomSearchBox onSelect={setSelectedHash} />
+        <SbomSearchBox onSelect={selectHash} />
         <div className="form-row explorer-filters">
           <button className="btn" disabled={view === 'tree'} onClick={() => setView('tree')}>
             Namespace tree
@@ -1220,7 +1336,11 @@ function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
         {visibleLeaves && visibleLeaves.length > 0 && view === 'tree' && (
           <NamespaceTree
             leaves={visibleLeaves}
-            onViewSbom={setSelectedHash}
+            onViewSbom={selectHash}
+            onViewGroup={(g) => {
+              setSelectedHash(undefined);
+              setSelectedGroup(g);
+            }}
             hiddenNamespaces={hiddenNamespaces}
             onToggleHidden={toggleNamespaceHidden}
           />
@@ -1242,7 +1362,7 @@ function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
                 <tr
                   key={leaf.seq_id}
                   className={leaf.manifest_hash ? 'row-clickable' : ''}
-                  onClick={() => leaf.manifest_hash && setSelectedHash(leaf.manifest_hash)}
+                  onClick={() => leaf.manifest_hash && selectHash(leaf.manifest_hash)}
                 >
                   <td>{leaf.seq_id}</td>
                   <td>{leaf.leaf_index}</td>
@@ -1274,7 +1394,7 @@ function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
                 <tr
                   key={c.namespace}
                   className="row-clickable"
-                  onClick={() => setSelectedHash(c.manifest_hash)}
+                  onClick={() => selectHash(c.manifest_hash)}
                 >
                   <td>{c.domain}{c.namespace}</td>
                   <td>{c.version}</td>
@@ -1286,8 +1406,17 @@ function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
         )}
       </div>
       <div className="explorer-right">
-        {selectedHash ? (
-          <SbomDetailPanel key={selectedHash} hash={selectedHash} tenantId={tenantId} />
+        {selectedGroup && !selectedHash ? (
+          <VersionPicker leaves={selectedGroup} onSelect={setSelectedHash} />
+        ) : selectedHash ? (
+          <>
+            {selectedGroup && (
+              <button className="btn back-to-versions" onClick={() => setSelectedHash(undefined)}>
+                ← All versions
+              </button>
+            )}
+            <SbomDetailPanel key={selectedHash} hash={selectedHash} tenantId={tenantId} />
+          </>
         ) : (
           <div className="card">
             <div className="muted">Select an item on the left to view its details.</div>
