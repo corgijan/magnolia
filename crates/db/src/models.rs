@@ -60,6 +60,16 @@ pub struct ApiKeyRecord {
 }
 
 #[derive(Debug, Clone, FromRow)]
+pub struct ComplianceSettingRecord {
+    pub tenant_id: uuid::Uuid,
+    pub profile_id: String,
+    pub enabled: bool,
+    pub enforce_level: String,
+    pub updated_by: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, FromRow)]
 pub struct AuditLogRecord {
     pub id: uuid::Uuid,
     pub tenant_id: uuid::Uuid,

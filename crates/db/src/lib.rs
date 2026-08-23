@@ -2,8 +2,8 @@ mod models;
 mod errors;
 
 pub use models::{
-    ApiKeyRecord, AuditLogRecord, ManifestRecord, MerkleLeafRecord, MerkleNodeRecord,
-    SignedTreeHeadRecord, TenantRecord,
+    ApiKeyRecord, AuditLogRecord, ComplianceSettingRecord, ManifestRecord, MerkleLeafRecord,
+    MerkleNodeRecord, SignedTreeHeadRecord, TenantRecord,
 };
 pub use errors::DbError;
 
@@ -609,6 +609,81 @@ impl Database {
                 .await
                 .map_err(|e| DbError::QueryError(e.to_string()))?;
         }
+        Ok(())
+    }
+
+    // ---- Compliance profile settings ----
+
+    /// All settings rows a tenant has ever written. Profiles never touched
+    /// aren't included — callers apply the enabled=false/enforce_level="off"
+    /// default themselves, since this layer has no notion of which profile
+    /// ids exist (that's owned by `magnolia_core::registered_profiles`).
+    pub async fn list_compliance_settings(&self, tenant_id: Uuid) -> Result<Vec<ComplianceSettingRecord>, DbError> {
+        sqlx::query_as::<_, ComplianceSettingRecord>(
+            r#"
+            SELECT tenant_id, profile_id, enabled, enforce_level, updated_by, updated_at
+            FROM compliance_profile_settings
+            WHERE tenant_id = $1
+            ORDER BY profile_id
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    pub async fn get_compliance_setting(
+        &self,
+        tenant_id: Uuid,
+        profile_id: &str,
+    ) -> Result<Option<ComplianceSettingRecord>, DbError> {
+        sqlx::query_as::<_, ComplianceSettingRecord>(
+            r#"
+            SELECT tenant_id, profile_id, enabled, enforce_level, updated_by, updated_at
+            FROM compliance_profile_settings
+            WHERE tenant_id = $1 AND profile_id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(profile_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// Upserts one profile's setting for a tenant — always writes a row,
+    /// never deletes on "off" (two independent values need to persist; see
+    /// the migration's header comment for why this differs from
+    /// `set_namespace_hidden`'s delete-on-default pattern).
+    pub async fn set_compliance_setting(
+        &self,
+        tenant_id: Uuid,
+        profile_id: &str,
+        enabled: bool,
+        enforce_level: &str,
+        updated_by: &str,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            r#"
+            INSERT INTO compliance_profile_settings
+                (tenant_id, profile_id, enabled, enforce_level, updated_by, updated_at)
+            VALUES ($1, $2, $3, $4, $5, now())
+            ON CONFLICT (tenant_id, profile_id)
+            DO UPDATE SET enabled = EXCLUDED.enabled,
+                           enforce_level = EXCLUDED.enforce_level,
+                           updated_by = EXCLUDED.updated_by,
+                           updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(profile_id)
+        .bind(enabled)
+        .bind(enforce_level)
+        .bind(updated_by)
+        .execute(&self.pool)
+        .await
+        .map_err(map_query_error)?;
         Ok(())
     }
 

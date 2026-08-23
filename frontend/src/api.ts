@@ -103,6 +103,29 @@ export interface Manifest {
   revoked: boolean;
   revoked_at: string | null;
   revoked_by: string | null;
+  compliance: ComplianceReport[];
+}
+
+export interface ComplianceProfileInfo {
+  id: string;
+  name: string;
+}
+
+export interface ComplianceSetting {
+  profile_id: string;
+  profile_name: string;
+  enabled: boolean;
+  enforce_level: 'off' | 'minimum' | 'full';
+}
+
+export interface ComplianceReport {
+  profile_id: string;
+  profile_name: string;
+  applicable: boolean;
+  meets_minimum: boolean;
+  minimum_issues: string[];
+  fully_compliant: boolean;
+  missing_fields: string[];
 }
 
 export interface CurrentManifest {
@@ -295,6 +318,24 @@ export const api = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ namespace, hidden }),
+    }),
+
+  complianceProfiles: (): Promise<ComplianceProfileInfo[]> =>
+    request('/api/v1/compliance/profiles'),
+
+  complianceSettings: (tenantId?: string): Promise<ComplianceSetting[]> =>
+    request(`/api/v1/compliance/settings${tenantQs(tenantId)}`),
+
+  setComplianceSetting: (
+    profileId: string,
+    enabled: boolean,
+    enforceLevel: 'off' | 'minimum' | 'full',
+    tenantId?: string
+  ): Promise<void> =>
+    request(`/api/v1/compliance/settings${tenantQs(tenantId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ profile_id: profileId, enabled, enforce_level: enforceLevel }),
     }),
 
   listKeys: (tenantId?: string): Promise<ApiKeyInfo[]> =>

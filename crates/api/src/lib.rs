@@ -54,6 +54,14 @@ pub fn create_router(state: AppState) -> Router {
             get(handlers::list_hidden_namespaces).post(handlers::set_namespace_hidden),
         )
         .route(
+            "/api/v1/compliance/profiles",
+            get(handlers::list_compliance_profiles),
+        )
+        .route(
+            "/api/v1/compliance/settings",
+            get(handlers::compliance_settings).post(handlers::set_compliance_setting),
+        )
+        .route(
             "/api/v1/keys",
             get(handlers::list_keys).post(handlers::create_key),
         )

@@ -4,6 +4,7 @@ mod errors;
 mod schema_validation;
 mod dsse;
 mod keys;
+mod compliance;
 
 pub use merkle::{
     ConsistencyProof, InclusionProof, MerkleNode, MerkleTree, PeakProof, ProofStep,
@@ -11,6 +12,9 @@ pub use merkle::{
 pub use manifest::SbomFormat;
 pub use errors::CoreError;
 pub use schema_validation::validate_sbom_schema;
+pub use compliance::{
+    profile_by_id, registered_profiles, ComplianceProfile, ComplianceReport,
+};
 pub use dsse::{
     build_envelope, pae, DocumentPredicate, DocumentStatement, DsseEnvelope, DsseSignature,
     ManifestPredicate, ManifestStatement, Statement, Subject, DOCUMENT_PREDICATE_TYPE,

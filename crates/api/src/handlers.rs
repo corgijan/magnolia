@@ -7,7 +7,8 @@ use chrono::{DateTime, Utc};
 use magnolia_audit::{AuditLogEntry, AuditResult};
 use magnolia_auth::{generate_server_key, Action, Role};
 use magnolia_core::{
-    build_envelope, ed25519_public_key_base64, ed25519_public_key_pem, pae, ConsistencyProof,
+    build_envelope, ed25519_public_key_base64, ed25519_public_key_pem, pae, profile_by_id,
+    registered_profiles, ComplianceReport as CoreComplianceReport, ConsistencyProof,
     DocumentPredicate, DocumentStatement, InclusionProof, ManifestPredicate, ManifestStatement,
     MerkleTree, SbomFormat, SignedTreeHead, Statement, Subject, DOCUMENT_PREDICATE_TYPE,
     DSSE_PAYLOAD_TYPE, IN_TOTO_STATEMENT_TYPE, MANIFEST_PREDICATE_TYPE,
@@ -90,6 +91,56 @@ pub struct ManifestJson {
     pub revoked: bool,
     pub revoked_at: Option<DateTime<Utc>>,
     pub revoked_by: Option<String>,
+    /// One report per compliance profile enabled for this tenant (empty
+    /// when none are enabled, or when the enabled ones don't apply to this
+    /// upload's format — e.g. a generic `document`).
+    pub compliance: Vec<ComplianceReportJson>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ComplianceProfileJson {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct ComplianceSettingJson {
+    pub profile_id: String,
+    pub profile_name: String,
+    pub enabled: bool,
+    pub enforce_level: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetComplianceSettingRequest {
+    pub profile_id: String,
+    pub enabled: bool,
+    pub enforce_level: String,
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct ComplianceReportJson {
+    pub profile_id: String,
+    pub profile_name: String,
+    pub applicable: bool,
+    pub meets_minimum: bool,
+    pub minimum_issues: Vec<String>,
+    pub fully_compliant: bool,
+    pub missing_fields: Vec<String>,
+}
+
+impl From<CoreComplianceReport> for ComplianceReportJson {
+    fn from(r: CoreComplianceReport) -> Self {
+        Self {
+            profile_id: r.profile_id,
+            profile_name: r.profile_name,
+            applicable: r.applicable,
+            meets_minimum: r.meets_minimum,
+            minimum_issues: r.minimum_issues,
+            fully_compliant: r.fully_compliant,
+            missing_fields: r.missing_fields,
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -293,6 +344,42 @@ fn validate_sbom_content(data: &[u8], format: &str) -> Result<(), ApiError> {
         }
     };
     magnolia_core::validate_sbom_schema(data, sbom_format).map_err(|e| ApiError::BadRequest(e.to_string()))
+}
+
+/// Rejects an upload at the door when a compliance profile is enforced for
+/// this tenant and the SBOM doesn't meet the configured bar. Runs after
+/// schema validation (so `check()` can assume well-formed JSON) and after
+/// the RBAC upload check (so an unauthorized caller learns nothing about
+/// tenant policy), but before any side effect — storage write, Merkle
+/// mutation, DB insert — so a rejection here leaves nothing to clean up.
+async fn enforce_compliance(state: &AppState, tenant_id: Uuid, format: &str, sbom_bytes: &[u8]) -> Result<(), ApiError> {
+    for profile in registered_profiles() {
+        let Some(setting) = state.db.get_compliance_setting(tenant_id, profile.id()).await.map_err(db_err)? else {
+            continue;
+        };
+        if !setting.enabled || setting.enforce_level == "off" {
+            continue;
+        }
+        let report = profile.check(format, sbom_bytes);
+        if !report.applicable {
+            continue;
+        }
+        if !report.meets_minimum {
+            return Err(ApiError::BadRequest(format!(
+                "upload rejected: does not meet {} minimum compliance: {}",
+                profile.name(),
+                report.minimum_issues.join("; ")
+            )));
+        }
+        if setting.enforce_level == "full" && !report.fully_compliant {
+            return Err(ApiError::BadRequest(format!(
+                "upload rejected: does not meet {} full compliance, missing: {}",
+                profile.name(),
+                report.missing_fields.join("; ")
+            )));
+        }
+    }
+    Ok(())
 }
 
 async fn record_audit(
@@ -540,6 +627,10 @@ pub async fn upload_sbom(
             .await;
             return Err(e);
         }
+    }
+
+    if format != "document" {
+        enforce_compliance(&state, tenant_id, &format, &sbom_bytes).await?;
     }
 
     let target_tenant = if cross_tenant {
@@ -955,6 +1046,22 @@ pub async fn manifest(
         .await
         .map_err(|e| ApiError::InternalError(format!("storage get failed: {}", e)))?;
 
+    // Only computed for profiles this tenant has actually enabled — a
+    // disabled profile's report would just be noise in the response.
+    let compliance: Vec<ComplianceReportJson> = {
+        let settings = state.db.list_compliance_settings(tenant_id).await.map_err(db_err)?;
+        let enabled_ids: std::collections::HashSet<_> =
+            settings.into_iter().filter(|s| s.enabled).map(|s| s.profile_id).collect();
+        registered_profiles()
+            .iter()
+            .filter(|p| enabled_ids.contains(p.id()))
+            .filter_map(|p| {
+                let r = p.check(&record.sbom_format, &sbom_bytes);
+                if r.applicable { Some(ComplianceReportJson::from(r)) } else { None }
+            })
+            .collect()
+    };
+
     Ok(Json(ManifestJson {
         sbom_hex: hex::encode(&sbom_bytes),
         manifest_hash: record.manifest_hash,
@@ -975,6 +1082,7 @@ pub async fn manifest(
         revoked: record.revoked,
         revoked_at: record.revoked_at,
         revoked_by: record.revoked_by,
+        compliance,
     }))
 }
 
@@ -1054,16 +1162,17 @@ pub struct SetNamespaceHiddenRequest {
 /// Toggles whether a namespace is excluded from the "current" view — a
 /// display filter only (declutter test/staging namespaces from "what's
 /// running in prod"), not a tracking pause: uploads, revocation, and the
-/// Merkle log/proofs are entirely unaffected either way. Gated the same as
-/// manifest revocation (`Action::Annotate`) since it's curatorial, not a
-/// destructive or security-sensitive action.
+/// Merkle log/proofs are entirely unaffected either way. Gated with
+/// `Action::ManageSettings` — a tenant-wide setting, not a per-item
+/// curatorial action, so (unlike manifest revocation) `auditor` may view
+/// it but not change it.
 pub async fn set_namespace_hidden(
     State(state): State<AppState>,
     grant: AuthGrant,
     Query(q): Query<TenantOverrideQuery>,
     Json(body): Json<SetNamespaceHiddenRequest>,
 ) -> Result<StatusCode, ApiError> {
-    require(&grant, Action::Annotate, &grant.namespace_scope)?;
+    require(&grant, Action::ManageSettings, &grant.namespace_scope)?;
     let namespace = normalize_namespace(&body.namespace)?;
     let (tenant_id, cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
     if !cross_tenant && !magnolia_auth::namespace_in_scope(&namespace, &grant.namespace_scope) {
@@ -1073,6 +1182,73 @@ pub async fn set_namespace_hidden(
     state
         .db
         .set_namespace_hidden(tenant_id, &namespace, body.hidden, &grant.principal())
+        .await
+        .map_err(db_err)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Every registered compliance profile — informational, not tenant-scoped,
+/// so plain `Action::Read` is enough.
+pub async fn list_compliance_profiles(grant: AuthGrant) -> Result<Json<Vec<ComplianceProfileJson>>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    Ok(Json(
+        registered_profiles()
+            .iter()
+            .map(|p| ComplianceProfileJson { id: p.id().to_string(), name: p.name().to_string() })
+            .collect(),
+    ))
+}
+
+/// This tenant's setting for every registered profile — always the full
+/// list, even for profiles the tenant has never touched (those default to
+/// disabled/off). Viewing is `Action::Read`; only `set_compliance_setting`
+/// (below) requires `Action::ManageSettings`.
+pub async fn compliance_settings(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+) -> Result<Json<Vec<ComplianceSettingJson>>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    let rows = state.db.list_compliance_settings(tenant_id).await.map_err(db_err)?;
+    let by_id: std::collections::HashMap<_, _> = rows.into_iter().map(|r| (r.profile_id.clone(), r)).collect();
+    Ok(Json(
+        registered_profiles()
+            .iter()
+            .map(|p| {
+                let row = by_id.get(p.id());
+                ComplianceSettingJson {
+                    profile_id: p.id().to_string(),
+                    profile_name: p.name().to_string(),
+                    enabled: row.map(|r| r.enabled).unwrap_or(false),
+                    enforce_level: row.map(|r| r.enforce_level.clone()).unwrap_or_else(|| "off".to_string()),
+                }
+            })
+            .collect(),
+    ))
+}
+
+/// Enables/disables a compliance profile for this tenant and sets its
+/// enforcement level. `Action::ManageSettings` — deliberately excludes
+/// `auditor`, since this can turn on upload-rejecting enforcement for the
+/// whole tenant.
+pub async fn set_compliance_setting(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+    Json(body): Json<SetComplianceSettingRequest>,
+) -> Result<StatusCode, ApiError> {
+    require(&grant, Action::ManageSettings, &grant.namespace_scope)?;
+    if profile_by_id(&body.profile_id).is_none() {
+        return Err(ApiError::BadRequest(format!("unknown compliance profile_id: {}", body.profile_id)));
+    }
+    if !matches!(body.enforce_level.as_str(), "off" | "minimum" | "full") {
+        return Err(ApiError::BadRequest("enforce_level must be one of: off, minimum, full".to_string()));
+    }
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    state
+        .db
+        .set_compliance_setting(tenant_id, &body.profile_id, body.enabled, &body.enforce_level, &grant.principal())
         .await
         .map_err(db_err)?;
     Ok(StatusCode::NO_CONTENT)

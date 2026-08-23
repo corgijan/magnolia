@@ -70,6 +70,13 @@ pub enum Action {
     Annotate,
     ManageKeys,
     ManageAcls,
+    /// Persistent tenant-wide configuration (namespace-hidden visibility,
+    /// compliance-profile enforcement, ...) — deliberately separate from
+    /// Annotate, which Auditor also holds: Auditor may view and annotate
+    /// individual items, but must not be able to change settings that
+    /// affect the whole tenant (e.g. turning on upload-rejecting
+    /// compliance enforcement).
+    ManageSettings,
     /// Platform-level: create/list tenants. Not scoped to the grant's own
     /// domain, since a tenant doesn't yet exist to scope it to.
     ManageTenants,
@@ -133,7 +140,12 @@ impl RbacEngine {
             // (ManageTenants, also handled above).
             (
                 Role::DomainAdmin,
-                Action::Upload | Action::Read | Action::Annotate | Action::ManageKeys | Action::ManageAcls,
+                Action::Upload
+                | Action::Read
+                | Action::Annotate
+                | Action::ManageKeys
+                | Action::ManageAcls
+                | Action::ManageSettings,
             ) => Ok(()),
 
             // Uploader: upload only (e.g. a CI pipeline that should only
@@ -198,18 +210,20 @@ mod tests {
             Action::Annotate,
             Action::ManageKeys,
             Action::ManageAcls,
+            Action::ManageSettings,
         ] {
             assert_allows(&super_admin, action);
         }
 
         // domain_admin: full self-service over its own tenant (upload,
-        // read/annotate, manage keys/ACLs) — everything except creating
-        // other tenants.
+        // read/annotate, manage keys/ACLs/settings) — everything except
+        // creating other tenants.
         assert_allows(&domain_admin, Action::Upload);
         assert_allows(&domain_admin, Action::Read);
         assert_allows(&domain_admin, Action::Annotate);
         assert_allows(&domain_admin, Action::ManageKeys);
         assert_allows(&domain_admin, Action::ManageAcls);
+        assert_allows(&domain_admin, Action::ManageSettings);
         assert_denies(&domain_admin, Action::ManageTenants);
 
         assert_allows(&uploader, Action::Upload);
@@ -217,12 +231,16 @@ mod tests {
         assert_denies(&uploader, Action::Annotate);
         assert_denies(&uploader, Action::ManageKeys);
         assert_denies(&uploader, Action::ManageAcls);
+        assert_denies(&uploader, Action::ManageSettings);
 
+        // auditor: read and annotate individual items, but cannot change
+        // tenant-wide settings (see the ManageSettings doc comment).
         assert_allows(&auditor, Action::Read);
         assert_allows(&auditor, Action::Annotate);
         assert_denies(&auditor, Action::Upload);
         assert_denies(&auditor, Action::ManageKeys);
         assert_denies(&auditor, Action::ManageAcls);
+        assert_denies(&auditor, Action::ManageSettings);
     }
 
     #[test]

@@ -9,6 +9,7 @@
   --accent-2: #2f6fe0;
   --ok: #2ea043;
   --err: #f85149;
+  --git: #a371f7;
   --mono: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
 }
 
@@ -159,15 +160,27 @@ body {
 }
 
 .tenant-badge {
-  display: block;
-  font-size: 12px;
-  font-weight: 400;
-  font-family: var(--mono);
-  color: var(--muted);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
   background: var(--panel-2);
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 6px 8px;
+}
+
+.tenant-badge-role {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text);
+}
+
+.tenant-badge-scope {
+  font-size: 12px;
+  font-family: var(--mono);
+  color: var(--muted);
   overflow-wrap: break-word;
 }
 
@@ -202,6 +215,25 @@ body {
 .card h2 {
   margin: 0 0 14px;
   font-size: 16px;
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  z-index: 100;
+}
+
+.modal-box {
+  width: 100%;
+  max-width: 640px;
+  max-height: 80vh;
+  overflow-y: auto;
+  margin-bottom: 0;
 }
 
 .card-header {
@@ -319,6 +351,21 @@ code.hash {
 .settings-master-toggle {
   display: flex;
   margin-bottom: 8px;
+}
+
+.compliance-block {
+  margin-top: 14px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+
+.compliance-profile {
+  margin-bottom: 12px;
+}
+
+.compliance-profile ul {
+  margin: 4px 0 8px 20px;
+  padding: 0;
 }
 
 .field span {
@@ -540,6 +587,14 @@ code.hash {
 
 .tree-icon-file {
   color: var(--muted);
+}
+
+.tree-icon-sbom {
+  color: var(--accent);
+}
+
+.tree-icon-git {
+  color: var(--git);
 }
 
 .sbom-tree-label {

@@ -6,6 +6,7 @@ import {
   AuditEntry,
   ConsistencyProof,
   BackendConfig,
+  ComplianceSetting,
   CreateKeyResponse,
   CreateTenantResponse,
   CurrentManifest,
@@ -30,14 +31,15 @@ type Tab = 'dashboard' | 'upload' | 'leaves' | 'proofs' | 'keys' | 'tenants' | '
 
 // Mirrors the backend RBAC matrix (crates/auth/src/rbac.rs) so the UI only
 // ever shows tabs/actions the current key is actually allowed to use.
-// 'annotate' mirrors Action::Annotate (crates/auth/src/rbac.rs) — same gate
-// the backend uses for the namespace-hidden toggle, so Settings never shows
-// a control that would 403 for the current role.
-type RbacAction = 'upload' | 'read' | 'manage_keys' | 'manage_tenants' | 'annotate';
+// 'annotate' mirrors Action::Annotate; 'manage_settings' mirrors the
+// stricter Action::ManageSettings (persistent tenant-wide configuration —
+// namespace visibility, compliance enforcement) which, unlike Annotate,
+// auditor does NOT hold, so it can view but never change settings.
+type RbacAction = 'upload' | 'read' | 'manage_keys' | 'manage_tenants' | 'annotate' | 'manage_settings';
 
 const ROLE_ACTIONS: Record<string, RbacAction[]> = {
-  super_admin: ['upload', 'read', 'manage_keys', 'manage_tenants', 'annotate'],
-  domain_admin: ['upload', 'read', 'manage_keys', 'annotate'],
+  super_admin: ['upload', 'read', 'manage_keys', 'manage_tenants', 'annotate', 'manage_settings'],
+  domain_admin: ['upload', 'read', 'manage_keys', 'annotate', 'manage_settings'],
   uploader: ['upload'],
   auditor: ['read', 'annotate'],
 };
@@ -70,7 +72,7 @@ const TABS: { id: Tab; label: string; requires: RbacAction; group: TabGroup }[] 
   { id: 'dashboard', label: 'Info', requires: 'read', group: 'workspace' },
   { id: 'upload', label: 'Upload', requires: 'upload', group: 'workspace' },
   { id: 'proofs', label: 'Proofs', requires: 'read', group: 'workspace' },
-  { id: 'settings', label: 'Settings', requires: 'annotate', group: 'workspace' },
+  { id: 'settings', label: 'Settings', requires: 'manage_settings', group: 'workspace' },
   { id: 'keys', label: 'API Keys', requires: 'manage_keys', group: 'admin' },
   { id: 'tenants', label: 'Tenants', requires: 'manage_tenants', group: 'admin' },
   { id: 'audit', label: 'Audit Log', requires: 'read', group: 'admin' },
@@ -122,12 +124,89 @@ function FileIcon() {
   );
 }
 
+// Package/crate glyph — distinguishes a plain SBOM upload (no document_type)
+// from a generic document (FileIcon) in tree/version-picker rows.
+function SbomIcon() {
+  return (
+    <svg className="tree-icon tree-icon-sbom" width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
+      <path
+        d="M8 1.75l5.5 3.2v6.1L8 14.25l-5.5-3.2v-6.1L8 1.75z"
+        fill="currentColor"
+        fillOpacity="0.12"
+        stroke="currentColor"
+        strokeWidth="1.1"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M2.5 4.95L8 8.15l5.5-3.2M8 8.15v6.1"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.1"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+// Branch glyph — flags a git-repo upload (GIT_REPO_DOCUMENT_TYPE) in
+// tree/version-picker rows.
+function GitRepoIcon() {
+  return (
+    <svg className="tree-icon tree-icon-git" width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M4 3.75v8.5" stroke="currentColor" strokeWidth="1.2" fill="none" strokeLinecap="round" />
+      <path d="M4 8c3.2 0 4.8 0 7.3 0" stroke="currentColor" strokeWidth="1.2" fill="none" strokeLinecap="round" />
+      <circle cx="4" cy="3.75" r="1.5" fill="currentColor" fillOpacity="0.15" stroke="currentColor" strokeWidth="1.1" />
+      <circle cx="4" cy="12.25" r="1.5" fill="currentColor" fillOpacity="0.15" stroke="currentColor" strokeWidth="1.1" />
+      <circle cx="12.5" cy="8" r="1.5" fill="currentColor" fillOpacity="0.15" stroke="currentColor" strokeWidth="1.1" />
+    </svg>
+  );
+}
+
+// Picks the tree row icon for a leaf/manifest by document_type: git-repo
+// uploads get the branch glyph, other tagged documents get the plain file
+// glyph, and untagged uploads (a straight SBOM) get the package glyph.
+function TreeEntryIcon({ documentType }: { documentType?: string | null }) {
+  if (isGitRepoDocumentType(documentType)) return <GitRepoIcon />;
+  if (documentType) return <FileIcon />;
+  return <SbomIcon />;
+}
+
 function ErrorBox({ message }: { message: string }) {
   return <div className="error-box">{message}</div>;
 }
 
 function Spinner({ label }: { label: string }) {
   return <div className="spinner">{label}</div>;
+}
+
+function Modal({
+  title,
+  onClose,
+  children,
+}: {
+  title: string;
+  onClose: () => void;
+  children: React.ReactNode;
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-box card" onClick={(e) => e.stopPropagation()}>
+        <div className="card-header">
+          <h2>{title}</h2>
+          <button className="btn" onClick={onClose}>Close</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
 }
 
 function CopyButton({ text }: { text: string }) {
@@ -1097,21 +1176,25 @@ function GitRepoArtifact({ manifest }: { manifest: Manifest }) {
   );
 }
 
-function SbomSearchBox({ onSelect }: { onSelect: (hash: string) => void }) {
-  const [hash, setHash] = useState('');
+// Live filter over the tree/table below — matches namespace or file name,
+// not an exact-hash jump (a manifest hash pasted in place of a URL-based
+// deep link is still reachable directly, e.g. via initialSelectedHash).
+function SbomSearchBox({ value, onChange }: { value: string; onChange: (value: string) => void }) {
   return (
     <div className="form-row">
       <label className="field">
-        <span>Manifest hash</span>
+        <span>Search</span>
         <input
-          value={hash}
-          onChange={(e) => setHash(e.target.value)}
-          placeholder="paste a manifest_hash"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder="filter by namespace or file name"
         />
       </label>
-      <button className="btn primary" disabled={!hash.trim()} onClick={() => onSelect(hash.trim())}>
-        Look up
-      </button>
+      {value && (
+        <button className="btn" onClick={() => onChange('')}>
+          Clear
+        </button>
+      )}
     </div>
   );
 }
@@ -1128,7 +1211,7 @@ function VersionPicker({ leaves, onSelect }: { leaves: Leaf[]; onSelect: (hash: 
             onClick={() => leaf.manifest_hash && onSelect(leaf.manifest_hash)}
             title={leaf.manifest_hash ? 'View this version' : 'No manifest available'}
           >
-            <FileIcon />
+            <TreeEntryIcon documentType={leaf.document_type} />
             <span className="sbom-tree-label" title={leaf.leaf_hash}>
               {leaf.document_type
                 ? documentDisplayName(leaf.document_type, leaf.version ?? '')
@@ -1145,12 +1228,24 @@ function VersionPicker({ leaves, onSelect }: { leaves: Leaf[]; onSelect: (hash: 
   );
 }
 
-function SbomDetailPanel({ hash, tenantId }: { hash: string; tenantId?: string }) {
+function SbomDetailPanel({
+  hash,
+  tenantId,
+  onRevoked,
+}: {
+  hash: string;
+  tenantId?: string;
+  /** Called after a successful revoke so the caller can refresh whatever
+   * list this detail view was opened from (e.g. the Explorer tree), which
+   * otherwise keeps showing the now-revoked item until manually refreshed. */
+  onRevoked?: () => void;
+}) {
   const [manifest, setManifest] = useState<Manifest | null>(null);
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState('');
   const [revoking, setRevoking] = useState(false);
   const [revokeError, setRevokeError] = useState('');
+  const [complianceReportFor, setComplianceReportFor] = useState<string | null>(null);
 
   // Only bothers sniffing document uploads — a real SBOM is validated
   // CycloneDX/SPDX JSON server-side already, so it can never collide with
@@ -1191,6 +1286,7 @@ function SbomDetailPanel({ hash, tenantId }: { hash: string; tenantId?: string }
     try {
       await api.revokeManifest(manifest.manifest_hash, tenantId);
       await load(); // refresh to pick up revoked status
+      onRevoked?.();
     } catch (e) {
       setRevokeError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -1236,6 +1332,58 @@ function SbomDetailPanel({ hash, tenantId }: { hash: string; tenantId?: string }
               </div>
             </>
           )}
+          {manifest.compliance.length > 0 && (
+            <div className="compliance-block">
+              <h3>Compliance</h3>
+              {manifest.compliance.map((c) => {
+                const hasIssues = c.minimum_issues.length > 0 || c.missing_fields.length > 0;
+                return (
+                  <div key={c.profile_id} className="compliance-profile">
+                    <div className="kv-row">
+                      <span className="kv-label">{c.profile_name}</span>
+                      <Badge ok={c.meets_minimum}>{c.meets_minimum ? 'meets minimum' : 'below minimum'}</Badge>
+                      <Badge ok={c.fully_compliant}>
+                        {c.fully_compliant ? 'fully compliant' : 'not fully compliant'}
+                      </Badge>
+                      {hasIssues && (
+                        <button className="btn" onClick={() => setComplianceReportFor(c.profile_id)}>
+                          View non-compliance report
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {complianceReportFor && (() => {
+            const c = manifest.compliance.find((p) => p.profile_id === complianceReportFor);
+            if (!c) return null;
+            return (
+              <Modal title={`Non-compliance report — ${c.profile_name}`} onClose={() => setComplianceReportFor(null)}>
+                {c.minimum_issues.length > 0 && (
+                  <div className="muted">
+                    Missing for minimum compliance:
+                    <ul>
+                      {c.minimum_issues.map((m, i) => (
+                        <li key={i}>{m}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {c.meets_minimum && !c.fully_compliant && c.missing_fields.length > 0 && (
+                  <div className="muted">
+                    Missing for full compliance:
+                    <ul>
+                      {c.missing_fields.map((m, i) => (
+                        <li key={i}>{m}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </Modal>
+            );
+          })()}
           <div className="kv-row">
             <span className="kv-label">version</span>
             <span>{manifest.version}</span>
@@ -1349,6 +1497,16 @@ function groupLeavesByFile(leaves: Leaf[]): Leaf[][] {
   return Array.from(groups.values());
 }
 
+// Matches the Explorer search box against namespace and file name — the
+// same label shown on each tree row (document_type, or "SBOM" when unset).
+function leafMatchesSearch(leaf: Leaf, term: string): boolean {
+  const t = term.trim().toLowerCase();
+  if (!t) return true;
+  const namespace = `${leaf.domain}${leaf.namespace}`.toLowerCase();
+  const fileName = (leaf.document_type ?? 'SBOM').toLowerCase();
+  return namespace.includes(t) || fileName.includes(t);
+}
+
 function SbomLeafRow({
   leaf,
   depth,
@@ -1365,7 +1523,7 @@ function SbomLeafRow({
       onClick={() => leaf.manifest_hash && onViewSbom(leaf.manifest_hash)}
       title={leaf.manifest_hash ? (leaf.document_type ? 'View document' : 'View SBOM') : 'No manifest available'}
     >
-      <FileIcon />
+      <TreeEntryIcon documentType={leaf.document_type} />
       <span className="sbom-tree-label" title={leaf.leaf_hash}>
         {leaf.document_type
           ? documentDisplayName(leaf.document_type, leaf.version ?? '')
@@ -1374,7 +1532,6 @@ function SbomLeafRow({
       <span className="sbom-tree-detail">
         {new Date(leaf.created_at).toLocaleDateString()}
       </span>
-      {leaf.document_type && <Badge ok={true}>document</Badge>}
       {leaf.revoked && <Badge ok={false}>revoked</Badge>}
     </div>
   );
@@ -1404,12 +1561,11 @@ function SbomFileGroupRow({
       onClick={() => onViewGroup(leaves)}
       title="Select a version to view"
     >
-      <FileIcon />
+      <TreeEntryIcon documentType={documentType} />
       <span className="sbom-tree-label">
         {documentType ? documentDisplayName(documentType, '') : 'SBOM'}
       </span>
       <span className="sbom-tree-detail">{leaves.length} versions</span>
-      {documentType && <Badge ok={true}>document</Badge>}
       {revokedCount > 0 && (
         <Badge ok={false}>{revokedCount} revoked</Badge>
       )}
@@ -1422,17 +1578,23 @@ function NamespaceFolderRow({
   depth,
   onViewSbom,
   onViewGroup,
+  forceOpen = false,
 }: {
   node: NamespaceTreeNode;
   depth: number;
   onViewSbom: (hash: string) => void;
   onViewGroup: (leaves: Leaf[]) => void;
+  /** True while an active search filter is narrowing the tree — expands
+   * every folder so filtered matches are visible without manually clicking
+   * through each collapsed level, overriding the local toggle below. */
+  forceOpen?: boolean;
 }) {
   // depth 0 is the org/domain root — expand it by default so the first
   // real namespace level (depth 1) is visible immediately, but leave that
   // first level (and everything under it) collapsed by default rather
   // than auto-expanding the whole tree.
   const [open, setOpen] = useState(depth < 1);
+  const isOpen = forceOpen || open;
   const hasContent = node.children.length > 0 || node.leaves.length > 0;
   return (
     <div>
@@ -1441,7 +1603,7 @@ function NamespaceFolderRow({
         style={{ paddingLeft: depth * 18 }}
         onClick={() => hasContent && setOpen((o) => !o)}
       >
-        <span className="sbom-tree-toggle">{hasContent ? (open ? '▾' : '▸') : '·'}</span>
+        <span className="sbom-tree-toggle">{hasContent ? (isOpen ? '▾' : '▸') : '·'}</span>
         <FolderIcon />
         <span className="sbom-tree-label">{node.name}</span>
         <span className="muted">
@@ -1450,7 +1612,7 @@ function NamespaceFolderRow({
           {node.children.length > 0 ? `, ${node.children.length} sub` : ''})
         </span>
       </div>
-      {open && (
+      {isOpen && (
         <>
           {groupLeavesByFile(node.leaves).map((group) =>
             group.length === 1 ? (
@@ -1471,6 +1633,7 @@ function NamespaceFolderRow({
               depth={depth + 1}
               onViewSbom={onViewSbom}
               onViewGroup={onViewGroup}
+              forceOpen={forceOpen}
             />
           ))}
         </>
@@ -1483,10 +1646,12 @@ function NamespaceTree({
   leaves,
   onViewSbom,
   onViewGroup,
+  forceOpen = false,
 }: {
   leaves: Leaf[];
   onViewSbom: (hash: string) => void;
   onViewGroup: (leaves: Leaf[]) => void;
+  forceOpen?: boolean;
 }) {
   // All leaves in one call belong to one tenant, so they share one domain —
   // shown as the tree's root folder, e.g. "myorg.example" > "products" >
@@ -1498,7 +1663,13 @@ function NamespaceTree({
   }
   return (
     <div className="sbom-tree">
-      <NamespaceFolderRow node={root} depth={0} onViewSbom={onViewSbom} onViewGroup={onViewGroup} />
+      <NamespaceFolderRow
+        node={root}
+        depth={0}
+        onViewSbom={onViewSbom}
+        onViewGroup={onViewGroup}
+        forceOpen={forceOpen}
+      />
     </div>
   );
 }
@@ -1543,6 +1714,7 @@ function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
   }, []);
   const [view, setView] = useState<'tree' | 'table' | 'current'>('tree');
   const [showRevoked, setShowRevoked] = useState(false);
+  const [searchTerm, setSearchTerm] = useState('');
   const [current, setCurrent] = useState<CurrentManifest[] | null>(null);
   // Read once per mount — Leaves fully remounts on every tab switch (see
   // above), so toggling this in Settings and switching back here picks up
@@ -1568,6 +1740,21 @@ function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
   // Either way they're still fully retrievable directly by hash; nothing is
   // ever deleted.
   const visibleLeaves = leaves ? (showRevoked ? leaves : leaves.filter((l) => !l.revoked)) : null;
+  const filteredLeaves = visibleLeaves
+    ? searchTerm.trim()
+      ? visibleLeaves.filter((l) => leafMatchesSearch(l, searchTerm))
+      : visibleLeaves
+    : null;
+  // Namespace tree groups by namespace inherently; the flat table doesn't,
+  // so it's sorted by namespace (then file name) to match the tree's order.
+  const tableLeaves = useMemo(() => {
+    if (!filteredLeaves) return null;
+    return [...filteredLeaves].sort((a, b) => {
+      const nsCompare = `${a.domain}${a.namespace}`.localeCompare(`${b.domain}${b.namespace}`);
+      if (nsCompare !== 0) return nsCompare;
+      return (a.document_type ?? '').localeCompare(b.document_type ?? '');
+    });
+  }, [filteredLeaves]);
 
   return (
     <div className="explorer-layout">
@@ -1576,7 +1763,7 @@ function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
           <h2>Archive Explorer</h2>
           <button className="btn" onClick={load}>Refresh</button>
         </div>
-        <SbomSearchBox onSelect={selectHash} />
+        <SbomSearchBox value={searchTerm} onChange={setSearchTerm} />
         <div className="form-row explorer-filters">
           <button className="btn" disabled={view === 'tree'} onClick={() => setView('tree')}>
             Namespace tree
@@ -1601,17 +1788,25 @@ function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
         {error && <ErrorBox message={error} />}
         {visibleLeaves === null && !error && <Spinner label="Loading leaves…" />}
         {visibleLeaves && visibleLeaves.length === 0 && <div className="muted">No leaves yet.</div>}
-        {visibleLeaves && visibleLeaves.length > 0 && view === 'tree' && (
+        {visibleLeaves && visibleLeaves.length > 0 && filteredLeaves && filteredLeaves.length === 0 && (
+          <div className="muted">No matches for "{searchTerm.trim()}".</div>
+        )}
+        {filteredLeaves && filteredLeaves.length > 0 && view === 'tree' && (
           <NamespaceTree
-            leaves={visibleLeaves}
+            leaves={filteredLeaves}
             onViewSbom={selectHash}
             onViewGroup={(g) => {
-              setSelectedHash(undefined);
               setSelectedGroup(g);
+              // Leaves within a group arrive newest-first (groupLeavesByFile),
+              // so jump straight to the newest version instead of forcing a
+              // picker click — "All versions" (rendered whenever selectedGroup
+              // is set) still reaches the rest.
+              setSelectedHash(g.find((l) => l.manifest_hash)?.manifest_hash ?? undefined);
             }}
+            forceOpen={searchTerm.trim().length > 0}
           />
         )}
-        {visibleLeaves && visibleLeaves.length > 0 && view === 'table' && (
+        {tableLeaves && tableLeaves.length > 0 && view === 'table' && (
           <table className="table">
             <thead>
               <tr>
@@ -1624,7 +1819,7 @@ function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
               </tr>
             </thead>
             <tbody>
-              {visibleLeaves.map((leaf) => (
+              {tableLeaves.map((leaf) => (
                 <tr
                   key={leaf.seq_id}
                   className={leaf.manifest_hash ? 'row-clickable' : ''}
@@ -1681,7 +1876,7 @@ function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
                 ← All versions
               </button>
             )}
-            <SbomDetailPanel key={selectedHash} hash={selectedHash} tenantId={tenantId} />
+            <SbomDetailPanel key={selectedHash} hash={selectedHash} tenantId={tenantId} onRevoked={load} />
           </>
         ) : (
           <div className="card">
@@ -2056,13 +2251,8 @@ function Keys() {
 
 // ---------- Tenant selector (super_admin: act on another tenant) ----------
 
-function TenantSelector() {
+function TenantSelector({ tenants }: { tenants: Tenant[] | null }) {
   const { tenantId, setTenantId } = useContext(TenantOverrideContext);
-  const [tenants, setTenants] = useState<Tenant[]>([]);
-
-  useEffect(() => {
-    api.listTenants().then(setTenants).catch(() => setTenants([]));
-  }, []);
 
   return (
     <select
@@ -2071,7 +2261,7 @@ function TenantSelector() {
       onChange={(e) => setTenantId(e.target.value)}
       title="Tenant to act as (platform super_admin only)"
     >
-      {tenants.map((t) => (
+      {(tenants ?? []).map((t) => (
         <option key={t.id} value={t.id} title={t.domain}>
           {t.name}
         </option>
@@ -2082,8 +2272,15 @@ function TenantSelector() {
 
 // ---------- Tenants ----------
 
-function Tenants({ isPlatform }: { isPlatform: boolean }) {
-  const [tenants, setTenants] = useState<Tenant[] | null>(null);
+function Tenants({
+  isPlatform,
+  tenants,
+  refreshTenants,
+}: {
+  isPlatform: boolean;
+  tenants: Tenant[] | null;
+  refreshTenants: () => void;
+}) {
   const [domain, setDomain] = useState('');
   const [name, setName] = useState('');
   const [created, setCreated] = useState<CreateTenantResponse | null>(null);
@@ -2093,13 +2290,6 @@ function Tenants({ isPlatform }: { isPlatform: boolean }) {
   const [deleteError, setDeleteError] = useState('');
   const [devMode, setDevMode] = useState(false);
 
-  const load = useCallback(() => {
-    api.listTenants()
-      .then(setTenants)
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
-  }, []);
-
-  useEffect(load, [load]);
   useEffect(() => {
     api.config().then((c) => setDevMode(c.dev_mode)).catch(() => setDevMode(false));
   }, []);
@@ -2115,7 +2305,7 @@ function Tenants({ isPlatform }: { isPlatform: boolean }) {
     setDeleteError('');
     try {
       await api.deleteTenant(t.id);
-      load();
+      refreshTenants();
     } catch (e) {
       setDeleteError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -2132,7 +2322,7 @@ function Tenants({ isPlatform }: { isPlatform: boolean }) {
       setCreated(res);
       setDomain('');
       setName('');
-      load();
+      refreshTenants();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -2189,7 +2379,7 @@ function Tenants({ isPlatform }: { isPlatform: boolean }) {
       <div className="card">
         <div className="card-header">
           <h2>Tenants</h2>
-          <button className="btn" onClick={load}>Refresh</button>
+          <button className="btn" onClick={refreshTenants}>Refresh</button>
         </div>
         {deleteError && <ErrorBox message={deleteError} />}
         {tenants === null && <Spinner label="Loading tenants…" />}
@@ -2304,6 +2494,9 @@ function Settings() {
   const [currentlyRunningViewEnabled, setCurrentlyRunningViewEnabled] = useState(() =>
     readCurrentlyRunningViewEnabled()
   );
+  const [complianceSettings, setComplianceSettings] = useState<ComplianceSetting[] | null>(null);
+  const [busyProfile, setBusyProfile] = useState<string | null>(null);
+  const [showNamespaceModal, setShowNamespaceModal] = useState(false);
 
   const toggleCurrentlyRunningView = (enabled: boolean) => {
     writeCurrentlyRunningViewEnabled(enabled);
@@ -2321,9 +2514,34 @@ function Settings() {
       .then(setLeaves)
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
     api.hiddenNamespaces(tenantId).then((ns) => setHiddenNamespaces(new Set(ns))).catch(() => {});
+    api.complianceSettings(tenantId)
+      .then(setComplianceSettings)
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   }, [tenantId]);
 
   useEffect(load, [load]);
+
+  const setCompliance = async (profileId: string, enabled: boolean, enforceLevel: 'off' | 'minimum' | 'full') => {
+    // When disabling, always send enforce_level "off" regardless of what
+    // the select currently shows — otherwise a previously-configured
+    // "full" enforcement would stay live server-side even though the
+    // checkbox now reads unchecked.
+    const effectiveEnforceLevel = enabled ? enforceLevel : 'off';
+    setBusyProfile(profileId);
+    setError('');
+    try {
+      await api.setComplianceSetting(profileId, enabled, effectiveEnforceLevel, tenantId);
+      setComplianceSettings((prev) =>
+        (prev ?? []).map((s) =>
+          s.profile_id === profileId ? { ...s, enabled, enforce_level: effectiveEnforceLevel } : s
+        )
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyProfile(null);
+    }
+  };
 
   const namespaces = useMemo(() => {
     if (!leaves) return null;
@@ -2351,64 +2569,134 @@ function Settings() {
   };
 
   return (
-    <div className="card">
-      <div className="card-header">
-        <h2>Settings</h2>
-        <button className="btn" onClick={load}>Refresh</button>
-      </div>
-      <label className="checkbox-field settings-master-toggle">
-        <input
-          type="checkbox"
-          checked={currentlyRunningViewEnabled}
-          onChange={(e) => toggleCurrentlyRunningView(e.target.checked)}
-        />
-        Show the "Currently running" button and view in the Explorer
-      </label>
-      <p className="muted">
-        Per-browser — this just hides the tab, it doesn't change what any API call returns. When
-        shown, the table below controls which namespaces appear in it — a display filter only;
-        uploads, revocation, and the Merkle log are unaffected either way.
-      </p>
+    <div className="stack">
       {error && <ErrorBox message={error} />}
-      {!currentlyRunningViewEnabled && (
-        <div className="muted">
-          "Currently running" is hidden — the list below still works and takes effect immediately
-          if you turn it back on.
+
+      <div className="card">
+        <div className="card-header">
+          <h2>Display preferences</h2>
         </div>
+        <p className="muted">
+          Per-browser, stored locally — these don't change what any API call returns, only what
+          this browser shows.
+        </p>
+        <label className="checkbox-field settings-master-toggle">
+          <input
+            type="checkbox"
+            checked={currentlyRunningViewEnabled}
+            onChange={(e) => toggleCurrentlyRunningView(e.target.checked)}
+          />
+          Show the "Currently running" button and view in the Explorer
+        </label>
+        <button className="btn" onClick={() => setShowNamespaceModal(true)}>
+          Manage namespace visibility…
+        </button>
+      </div>
+
+      {showNamespaceModal && (
+        <Modal title="Currently running visibility" onClose={() => setShowNamespaceModal(false)}>
+          <p className="muted">
+            Which namespaces appear in the "Currently running" view — a display filter only;
+            uploads, revocation, and the Merkle log are unaffected either way.
+          </p>
+          {namespaces === null && !error && <Spinner label="Loading namespaces…" />}
+          {namespaces !== null && namespaces.length === 0 && <div className="muted">No namespaces yet.</div>}
+          {namespaces !== null && namespaces.length > 0 && (
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>namespace</th>
+                  <th>in "Currently running"</th>
+                </tr>
+              </thead>
+              <tbody>
+                {namespaces.map((ns) => {
+                  const isHidden = hiddenNamespaces.has(ns);
+                  return (
+                    <tr key={ns}>
+                      <td>{ns}</td>
+                      <td>
+                        <label className="checkbox-field">
+                          <input
+                            type="checkbox"
+                            checked={!isHidden}
+                            disabled={busyNamespace === ns}
+                            onChange={(e) => toggle(ns, !e.target.checked)}
+                          />
+                          {isHidden ? 'hidden' : 'visible'}
+                        </label>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </Modal>
       )}
-      {namespaces === null && !error && <Spinner label="Loading namespaces…" />}
-      {namespaces !== null && namespaces.length === 0 && <div className="muted">No namespaces yet.</div>}
-      {namespaces !== null && namespaces.length > 0 && (
-        <table className="table">
-          <thead>
-            <tr>
-              <th>namespace</th>
-              <th>in "Currently running"</th>
-            </tr>
-          </thead>
-          <tbody>
-            {namespaces.map((ns) => {
-              const isHidden = hiddenNamespaces.has(ns);
-              return (
-                <tr key={ns}>
-                  <td>{ns}</td>
+
+      <div className="card">
+        <div className="card-header">
+          <h2>Compliance profiles</h2>
+          <button className="btn" onClick={load}>Refresh</button>
+        </div>
+        <p className="muted">
+          Optional, off by default. When enabled, uploads are checked against the profile's rules
+          and the result is shown on each SBOM's detail view. Enforcement can additionally reject
+          uploads outright at the "minimum" or "full" bar — this affects every uploader on the
+          tenant, not just you.
+        </p>
+        {complianceSettings === null && !error && <Spinner label="Loading compliance profiles…" />}
+        {complianceSettings !== null && complianceSettings.length === 0 && (
+          <div className="muted">No compliance profiles registered.</div>
+        )}
+        {complianceSettings !== null && complianceSettings.length > 0 && (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>profile</th>
+                <th>status</th>
+                <th>enforcement</th>
+              </tr>
+            </thead>
+            <tbody>
+              {complianceSettings.map((s) => (
+                <tr key={s.profile_id}>
+                  <td>{s.profile_name}</td>
                   <td>
                     <label className="checkbox-field">
                       <input
                         type="checkbox"
-                        checked={!isHidden}
-                        disabled={busyNamespace === ns}
-                        onChange={(e) => toggle(ns, !e.target.checked)}
+                        checked={s.enabled}
+                        disabled={busyProfile === s.profile_id}
+                        onChange={(e) => setCompliance(s.profile_id, e.target.checked, s.enforce_level)}
                       />
-                      {isHidden ? 'hidden' : 'visible'}
+                      {s.enabled ? 'enabled' : 'disabled'}
                     </label>
                   </td>
+                  <td>
+                    {s.enabled ? (
+                      <select
+                        value={s.enforce_level}
+                        disabled={busyProfile === s.profile_id}
+                        onChange={(e) =>
+                          setCompliance(s.profile_id, s.enabled, e.target.value as 'off' | 'minimum' | 'full')
+                        }
+                      >
+                        <option value="off">off (report only)</option>
+                        <option value="minimum">reject below minimum</option>
+                        <option value="full">reject below full compliance</option>
+                      </select>
+                    ) : (
+                      <span className="muted">—</span>
+                    )}
+                  </td>
                 </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      )}
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
     </div>
   );
 }
@@ -2592,6 +2880,21 @@ export default function App() {
 
   useEffect(refreshHead, [refreshHead]);
 
+  // Single source of truth for the tenant list — shared between the sidebar
+  // TenantSelector and the Tenants admin tab, so creating/hiding a tenant in
+  // one place is immediately reflected in the other instead of each holding
+  // its own stale copy until a manual page reload. null = not loaded yet.
+  const [tenants, setTenants] = useState<Tenant[] | null>(null);
+  const refreshTenants = useCallback(() => {
+    if (!whoami?.is_platform_tenant) {
+      setTenants(null);
+      return;
+    }
+    api.listTenants().then(setTenants).catch(() => {});
+  }, [whoami]);
+
+  useEffect(refreshTenants, [refreshTenants]);
+
   const applyKey = (value: string) => {
     setKey(value);
     setApiKey(value);
@@ -2674,10 +2977,11 @@ export default function App() {
           </nav>
 
           <div className="sidebar-footer">
-            {whoami.is_platform_tenant && <TenantSelector />}
-            <span className="tenant-badge" title="tenant domain · role · namespace scope">
-              {whoami.domain} · {whoami.role} · {whoami.namespace_scope}
-            </span>
+            {whoami.is_platform_tenant && <TenantSelector tenants={tenants} />}
+            <div className="tenant-badge" title="role · tenant domain + namespace scope">
+              <span className="tenant-badge-role">{whoami.role}</span>
+              <span className="tenant-badge-scope">{whoami.domain}{whoami.namespace_scope}</span>
+            </div>
             <button className="btn" onClick={logOut}>
               Log out
             </button>
@@ -2714,10 +3018,10 @@ export default function App() {
             {tab === 'proofs' && roleCan(whoami.role, 'read') && <Proofs treeHead={treeHead} />}
             {tab === 'keys' && roleCan(whoami.role, 'manage_keys') && <Keys />}
             {tab === 'tenants' && roleCan(whoami.role, 'manage_tenants') && (
-              <Tenants isPlatform={whoami.is_platform_tenant} />
+              <Tenants isPlatform={whoami.is_platform_tenant} tenants={tenants} refreshTenants={refreshTenants} />
             )}
             {tab === 'audit' && roleCan(whoami.role, 'read') && <Audit />}
-            {tab === 'settings' && roleCan(whoami.role, 'annotate') && <Settings />}
+            {tab === 'settings' && roleCan(whoami.role, 'manage_settings') && <Settings />}
           </main>
         </div>
       </div>
