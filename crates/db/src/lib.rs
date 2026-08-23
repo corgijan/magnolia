@@ -233,7 +233,7 @@ impl Database {
             r#"
             SELECT ml.seq_id, ml.tenant_id, ml.tenant_leaf_index, ml.namespace, ml.sbom_s3_key,
                    ml.leaf_hash, ml.status, ml.created_at, m.manifest_hash,
-                   COALESCE(m.revoked, FALSE) AS revoked, t.domain
+                   COALESCE(m.revoked, FALSE) AS revoked, t.domain, m.version, m.document_type
             FROM merkle_leaves ml
             LEFT JOIN manifests m ON m.leaf_seq_id = ml.seq_id
             JOIN tenants t ON t.id = ml.tenant_id
@@ -260,7 +260,7 @@ impl Database {
             r#"
             SELECT ml.seq_id, ml.tenant_id, ml.tenant_leaf_index, ml.namespace, ml.sbom_s3_key,
                    ml.leaf_hash, ml.status, ml.created_at, m.manifest_hash,
-                   COALESCE(m.revoked, FALSE) AS revoked, t.domain
+                   COALESCE(m.revoked, FALSE) AS revoked, t.domain, m.version, m.document_type
             FROM merkle_leaves ml
             LEFT JOIN manifests m ON m.leaf_seq_id = ml.seq_id
             JOIN tenants t ON t.id = ml.tenant_id
@@ -442,15 +442,16 @@ impl Database {
         sbom_s3_key: &str,
         namespace: &str,
         previous_manifest_hash: Option<&str>,
-        signature: &[u8],
+        dsse_envelope: &serde_json::Value,
+        document_type: Option<&str>,
         created_by: &str,
         created_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), DbError> {
         sqlx::query(
             r#"
             INSERT INTO manifests (manifest_hash, leaf_seq_id, tenant_id, version, sbom_hash, sbom_format,
-                                   sbom_s3_key, namespace, previous_manifest_hash, signature, created_by, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                                   sbom_s3_key, namespace, previous_manifest_hash, dsse_envelope, document_type, created_by, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             "#,
         )
         .bind(manifest_hash)
@@ -462,7 +463,8 @@ impl Database {
         .bind(sbom_s3_key)
         .bind(namespace)
         .bind(previous_manifest_hash)
-        .bind(signature)
+        .bind(dsse_envelope)
+        .bind(document_type)
         .bind(created_by)
         .bind(created_at)
         .execute(&self.pool)
@@ -479,7 +481,7 @@ impl Database {
         sqlx::query_as::<_, ManifestRecord>(
             r#"
             SELECT manifest_hash, leaf_seq_id, tenant_id, version, sbom_hash, sbom_format,
-                   sbom_s3_key, namespace, previous_manifest_hash, signature, created_by, created_at,
+                   sbom_s3_key, namespace, previous_manifest_hash, signature, dsse_envelope, document_type, created_by, created_at,
                    revoked, revoked_at, revoked_by
             FROM manifests
             WHERE manifest_hash = $1
@@ -498,7 +500,7 @@ impl Database {
         sqlx::query_as::<_, ManifestRecord>(
             r#"
             SELECT manifest_hash, leaf_seq_id, tenant_id, version, sbom_hash, sbom_format,
-                   sbom_s3_key, namespace, previous_manifest_hash, signature, created_by, created_at,
+                   sbom_s3_key, namespace, previous_manifest_hash, signature, dsse_envelope, document_type, created_by, created_at,
                    revoked, revoked_at, revoked_by
             FROM manifests
             WHERE tenant_id = $1
@@ -527,11 +529,12 @@ impl Database {
             r#"
             SELECT DISTINCT ON (namespace)
                    manifest_hash, leaf_seq_id, tenant_id, version, sbom_hash, sbom_format,
-                   sbom_s3_key, namespace, previous_manifest_hash, signature, created_by, created_at,
+                   sbom_s3_key, namespace, previous_manifest_hash, signature, dsse_envelope, document_type, created_by, created_at,
                    revoked, revoked_at, revoked_by
             FROM manifests
             WHERE tenant_id = $1
               AND revoked = FALSE
+              AND document_type IS NULL
               AND ($2 = '/' OR namespace = $2 OR starts_with(namespace, $2 || '/'))
               AND NOT EXISTS (
                   SELECT 1 FROM namespace_current_hidden h

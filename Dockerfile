@@ -3,6 +3,7 @@ WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY migrations ./migrations
 
 RUN cargo build --release --bin magnolia-server
 

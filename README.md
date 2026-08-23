@@ -105,6 +105,16 @@ sbom_file=<binary>  format=cyclonedx|spdx  namespace=/product/v1  version=1.2.3
 ```
 `version` is required — a free-text label for the SBOM/product release it describes (e.g. `1.2.3`), stored on the manifest. `namespace` must fall within the key's own `namespace_scope` (segment-aware prefix match; `/` covers everything).
 
+**Basic example** (`sbom.json` is a CycloneDX or SPDX file on disk; `<key_id>:<secret>` must be a key belonging to a real tenant — the platform/bootstrap tenant is admin-only and rejects uploads):
+```bash
+curl -X POST http://127.0.0.1:3000/api/v1/upload \
+  -H "Authorization: Bearer <key_id>:<secret>" \
+  -F "sbom_file=@sbom.json" \
+  -F "format=cyclonedx" \
+  -F "namespace=/product/v1" \
+  -F "version=1.2.3"
+```
+
 Response:
 ```json
 {
@@ -209,7 +219,7 @@ DEV_MODE=true
 
 ### Local Development Setup
 
-**Quickest path:** `docker compose up --build` starts Postgres (with all migrations auto-applied via `docker-entrypoint-initdb.d`) and the API server on `127.0.0.1:3000` — and, out of the box, also **bootstraps a ready-to-use super_admin key** via the `BOOTSTRAP_SUPER_ADMIN_KEY` env var in `docker-compose.yml`:
+**Quickest path:** `docker compose up --build` starts Postgres and the API server on `127.0.0.1:3000`. The server migrates its own schema on every startup (nobody ever needs to run a `.sql` file by hand — see "Migrations" below) and, out of the box, also **bootstraps a ready-to-use super_admin key** via the `BOOTSTRAP_SUPER_ADMIN_KEY` env var in `docker-compose.yml`:
 ```
 deadbeef-dead-dead-dead-deadbeefdead:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
 ```
@@ -217,9 +227,7 @@ That's a tenant on `test.example` (from `BOOTSTRAP_TENANT_DOMAIN`), created idem
 
 Then just run the frontend natively (step 5 below) — its dev-server proxy already points at `127.0.0.1:3000`.
 
-**Manual path** (run each piece yourself, or if you'd rather bootstrap your own key/domain instead of the built-in `deadbeef` one):
-
-**Manual path** (run each piece yourself):
+**Manual path** (run each piece yourself, e.g. with your own Postgres instead of Docker):
 
 1. Start PostgreSQL
 ```bash
@@ -230,64 +238,45 @@ docker run --name magnolia-db \
   -d postgres:15
 ```
 
-2. Run schema (all six migrations, in order)
-```bash
-psql -h localhost -U postgres -d sbomstash < migrations/20240821000000_initial_schema.sql
-psql -h localhost -U postgres -d sbomstash < migrations/20260821000001_manifests.sql
-psql -h localhost -U postgres -d sbomstash < migrations/20260822000001_tenants.sql
-psql -h localhost -U postgres -d sbomstash < migrations/20260822000002_versions_and_namespace_scoping.sql
-psql -h localhost -U postgres -d sbomstash < migrations/20260822000003_platform_tenant.sql
-psql -h localhost -U postgres -d sbomstash < migrations/20260822000004_manifest_revocation.sql
-```
-
-3. (Optional) generate a signing key — the server auto-creates one at startup
+2. (Optional) generate a signing key — the server auto-creates one at startup
 ```bash
 openssl rand -hex 32 > .sbomstash_key
 chmod 600 .sbomstash_key
 ```
 
-4. Run server (listens on 127.0.0.1:3000)
+3. Run the server, with the same bootstrap env vars the Docker path uses
+   (see "Environment Variables" above). This one step replaces the entire
+   old manual dance: the server applies every pending migration itself on
+   startup (see "Migrations" below — no `.sql` file ever needs to be run by
+   hand), then creates `BOOTSTRAP_TENANT_DOMAIN`/`BOOTSTRAP_TENANT_NAME` and
+   the `BOOTSTRAP_SUPER_ADMIN_KEY` key if they don't already exist:
 ```bash
+export DATABASE_URL=postgres://postgres:postgres@localhost:5432/sbomstash
+export BOOTSTRAP_SUPER_ADMIN_KEY=deadbeef-dead-dead-dead-deadbeefdead:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+export BOOTSTRAP_TENANT_DOMAIN=acme.example
+export BOOTSTRAP_TENANT_NAME="Acme Corp"
 cargo run --bin magnolia-server
+# listens on 127.0.0.1:3000
 ```
 
-5. Run the web UI (port 4000, proxies `/api` and `/health` to the server)
+4. Run the web UI (port 4000, proxies `/api` and `/health` to the server)
 ```bash
 cd frontend && npm install && npm start
-# open http://localhost:4000
+# open http://localhost:4000 — paste the BOOTSTRAP_SUPER_ADMIN_KEY value above
 ```
 
-6. Bootstrap your first tenant + super_admin key, then use the key in the
-   UI header. There's no admin key yet for the very first tenant, so create
-   one directly. Generate a key_id/secret/hash triple:
-```bash
-cargo run -p magnolia-auth --example bootstrap_key
-# prints key_id=..., full_key=..., argon2_hash=...
-```
-   Then insert the tenant and its key (replace the UUID/domain/hash with
-   your generated values):
-```sql
-INSERT INTO tenants (id, domain, name, created_by, created_at)
-VALUES ('22222222-2222-4222-8222-222222222222', 'acme.example', 'Acme Corp', 'bootstrap', NOW());
-
-INSERT INTO api_keys (id, tenant_id, domain, namespace_scope, role, key_hash, revoked)
-VALUES (
-  '<key_id from bootstrap_key>',
-  '22222222-2222-4222-8222-222222222222',  -- must match the tenant row above
-  'acme.example',                           -- must match the tenant's domain
-  '/',                                      -- namespace scope
-  'super_admin',
-  '<argon2_hash from bootstrap_key>',
-  FALSE
-);
--- API key = "<key_id>:<secret>" (the full_key printed by bootstrap_key)
-```
    From here on, every *other* tenant is self-service: a super_admin calls
    `POST /api/v1/tenants` (or uses the Tenants tab in the UI), which creates
-   the tenant and mints its first `domain_admin` key in one step — no more
-   manual SQL. Each tenant only ever sees its own data (leaves, tree head,
-   proofs, manifests, keys, audit log); `tenant_id` in `api_keys` is a real
-   foreign key into `tenants` now, not a free-typed UUID.
+   the tenant and mints its first `domain_admin` key in one step.
+
+### Migrations
+
+The server applies every pending file in `migrations/` itself, on every
+startup — via `sqlx::migrate!`, tracked in a `_sqlx_migrations` table so
+already-applied ones are never re-run. Nobody should ever need to run
+`psql < migrations/....sql` by hand; just start the server. Adding a new
+migration is just adding a new `migrations/<timestamp>_<name>.sql` file —
+the next server restart picks it up automatically.
 
 ## Testing
 

@@ -1,12 +1,22 @@
 mod merkle;
 mod manifest;
 mod errors;
+mod schema_validation;
+mod dsse;
+mod keys;
 
 pub use merkle::{
     ConsistencyProof, InclusionProof, MerkleNode, MerkleTree, PeakProof, ProofStep,
 };
-pub use manifest::{Manifest, SbomFormat};
+pub use manifest::SbomFormat;
 pub use errors::CoreError;
+pub use schema_validation::validate_sbom_schema;
+pub use dsse::{
+    build_envelope, pae, DocumentPredicate, DocumentStatement, DsseEnvelope, DsseSignature,
+    ManifestPredicate, ManifestStatement, Statement, Subject, DOCUMENT_PREDICATE_TYPE,
+    DSSE_PAYLOAD_TYPE, IN_TOTO_STATEMENT_TYPE, MANIFEST_PREDICATE_TYPE,
+};
+pub use keys::{ed25519_public_key_base64, ed25519_public_key_pem};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SignedTreeHead {

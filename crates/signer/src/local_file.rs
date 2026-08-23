@@ -56,4 +56,8 @@ impl Signer for LocalFileSigner {
         let signature = Signature::from_bytes(&sig_bytes);
         Ok(signing_key.verifying_key().verify(data, &signature).is_ok())
     }
+
+    async fn public_key(&self) -> Result<Vec<u8>, SignerError> {
+        Ok(self.signing_key().await?.verifying_key().to_bytes().to_vec())
+    }
 }

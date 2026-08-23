@@ -24,6 +24,8 @@ pub struct MerkleLeafRecord {
     pub manifest_hash: Option<String>,
     pub revoked: bool,
     pub domain: String,
+    pub version: Option<String>,
+    pub document_type: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -75,12 +77,20 @@ pub struct ManifestRecord {
     pub leaf_seq_id: i64,
     pub tenant_id: uuid::Uuid,
     pub version: String,
+    // `sbom_hash`/`sbom_format` hold the hash/format of whatever was
+    // uploaded, not necessarily an SBOM — SBOM-specific only when
+    // `document_type` is None; otherwise they describe a general
+    // technical-documentation upload (risk assessment, test report, etc.)
+    // reusing the same content-hash/format columns rather than adding a
+    // parallel set for a documentation-only rename.
     pub sbom_hash: String,
     pub sbom_format: String,
     pub sbom_s3_key: String,
     pub namespace: String,
     pub previous_manifest_hash: Option<String>,
-    pub signature: Vec<u8>,
+    pub signature: Option<Vec<u8>>,
+    pub dsse_envelope: Option<serde_json::Value>,
+    pub document_type: Option<String>,
     pub created_by: String,
     pub created_at: DateTime<Utc>,
     pub revoked: bool,

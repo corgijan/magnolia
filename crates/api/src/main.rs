@@ -24,6 +24,7 @@ async fn main() {
         .await
         .expect("failed to connect to database");
 
+    run_migrations(&db.pool).await;
     bootstrap_super_admin_from_env(&db).await;
 
     let key_path = std::env::var("SIGNING_KEY_PATH")
@@ -86,6 +87,76 @@ async fn main() {
         .expect("failed to bind server address");
     tracing::info!(%addr, "magnolia listening");
     axum::serve(listener, app).await.expect("server failed");
+}
+
+/// Applies every migration in `migrations/` automatically at startup — no
+/// one should ever need to `psql < migrations/....sql` by hand, on a fresh
+/// database or an existing one. Idempotent and safe to run on every boot:
+/// sqlx tracks applied versions in `_sqlx_migrations` and only executes
+/// what's new.
+///
+/// One-time transition handling: this project's schema was previously
+/// applied by hand (`docker-entrypoint-initdb.d` on fresh volumes, manual
+/// `psql` on existing ones) with no `_sqlx_migrations` bookkeeping at all.
+/// If that's what this database is — schema clearly present, tracking
+/// table absent — every currently-known migration is recorded as already
+/// applied (using sqlx's own checksums, not hand-rolled ones) without
+/// re-executing its SQL, so the real `migrator.run()` below only ever
+/// applies genuinely new migrations from this point on. A truly fresh
+/// database has neither table, so this block is skipped entirely and
+/// `run()` just applies everything itself.
+async fn run_migrations(pool: &sqlx::PgPool) {
+    let migrator = sqlx::migrate!("../../migrations");
+
+    let schema_predates_tracking: bool = sqlx::query_scalar(
+        r#"
+        SELECT to_regclass('public.merkle_leaves') IS NOT NULL
+           AND to_regclass('public._sqlx_migrations') IS NULL
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false);
+
+    if schema_predates_tracking {
+        tracing::warn!(
+            "existing schema found with no migration history — recording it as already applied"
+        );
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS _sqlx_migrations (
+                version BIGINT PRIMARY KEY,
+                description TEXT NOT NULL,
+                installed_on TIMESTAMPTZ NOT NULL DEFAULT now(),
+                success BOOLEAN NOT NULL,
+                checksum BYTEA NOT NULL,
+                execution_time BIGINT NOT NULL
+            )
+            "#,
+        )
+        .execute(pool)
+        .await
+        .expect("failed to create migration history table");
+
+        for m in migrator.migrations.iter() {
+            sqlx::query(
+                "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+                 VALUES ($1, $2, TRUE, $3, 0)
+                 ON CONFLICT (version) DO NOTHING",
+            )
+            .bind(m.version)
+            .bind(m.description.as_ref())
+            .bind(m.checksum.as_ref())
+            .execute(pool)
+            .await
+            .expect("failed to backfill migration history");
+        }
+    }
+
+    migrator
+        .run(pool)
+        .await
+        .expect("failed to run database migrations");
 }
 
 /// Dev/test convenience: if `BOOTSTRAP_SUPER_ADMIN_KEY=<key_id>:<secret>` is

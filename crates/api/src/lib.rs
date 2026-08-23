@@ -21,6 +21,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/health", get(handlers::health))
         .route("/api/v1/whoami", get(handlers::whoami))
         .route("/api/v1/config", get(handlers::config))
+        .route("/api/v1/signing-key", get(handlers::signing_key))
         .route("/api/v1/upload", post(handlers::upload_sbom))
         .route(
             "/api/v1/tree-head/latest",

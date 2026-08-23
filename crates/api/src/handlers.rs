@@ -7,7 +7,10 @@ use chrono::{DateTime, Utc};
 use magnolia_audit::{AuditLogEntry, AuditResult};
 use magnolia_auth::{generate_server_key, Action, Role};
 use magnolia_core::{
-    ConsistencyProof, InclusionProof, Manifest, MerkleTree, SbomFormat, SignedTreeHead,
+    build_envelope, ed25519_public_key_base64, ed25519_public_key_pem, pae, ConsistencyProof,
+    DocumentPredicate, DocumentStatement, InclusionProof, ManifestPredicate, ManifestStatement,
+    MerkleTree, SbomFormat, SignedTreeHead, Statement, Subject, DOCUMENT_PREDICATE_TYPE,
+    DSSE_PAYLOAD_TYPE, IN_TOTO_STATEMENT_TYPE, MANIFEST_PREDICATE_TYPE,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -56,6 +59,8 @@ pub struct LeafJson {
     pub manifest_hash: Option<String>,
     pub revoked: bool,
     pub domain: String,
+    pub version: Option<String>,
+    pub document_type: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -70,7 +75,15 @@ pub struct ManifestJson {
     pub sbom_s3_key: String,
     pub namespace: String,
     pub previous_manifest_hash: Option<String>,
-    pub signature: String,
+    /// Legacy hex-encoded signature — only populated for manifests signed
+    /// before the DSSE migration. `None` for anything with `dsse_envelope`.
+    pub signature: Option<String>,
+    /// The canonical signed artifact for manifests signed after the DSSE
+    /// migration. `None` for legacy manifests, which cannot be
+    /// retroactively upgraded (no way to produce a new valid signature for
+    /// old content without the original signing context).
+    pub dsse_envelope: Option<serde_json::Value>,
+    pub document_type: Option<String>,
     pub created_by: String,
     pub created_at: DateTime<Utc>,
     pub sbom_hex: String,
@@ -264,41 +277,22 @@ fn normalize_domain(raw: &str) -> Result<String, ApiError> {
     Ok(domain)
 }
 
+/// Validates the uploaded bytes are a genuinely well-formed CycloneDX or
+/// SPDX document (real JSON Schema validation against the official spec,
+/// not just "valid JSON with the right marker field") — see
+/// `magnolia_core::validate_sbom_schema`.
 fn validate_sbom_content(data: &[u8], format: &str) -> Result<(), ApiError> {
-    let doc: serde_json::Value = serde_json::from_slice(data).map_err(|_| {
-        ApiError::BadRequest("SBOM must be valid JSON".to_string())
-    })?;
-    let obj = doc
-        .as_object()
-        .ok_or_else(|| ApiError::BadRequest("SBOM must be a JSON object".to_string()))?;
-
-    match format {
-        "cyclonedx" => {
-            let bom_format = obj
-                .get("bomFormat")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if bom_format != "CycloneDX" {
-                return Err(ApiError::BadRequest(
-                    "cyclonedx SBOM must have bomFormat == \"CycloneDX\"".to_string(),
-                ));
-            }
-        }
-        "spdx" => {
-            if !obj.contains_key("spdxVersion") {
-                return Err(ApiError::BadRequest(
-                    "spdx SBOM must have a spdxVersion field".to_string(),
-                ));
-            }
-        }
+    let sbom_format = match format {
+        "cyclonedx" => SbomFormat::CycloneDx,
+        "spdx" => SbomFormat::Spdx,
         other => {
             return Err(ApiError::BadRequest(format!(
                 "unsupported format: {} (use cyclonedx or spdx)",
                 other
             )))
         }
-    }
-    Ok(())
+    };
+    magnolia_core::validate_sbom_schema(data, sbom_format).map_err(|e| ApiError::BadRequest(e.to_string()))
 }
 
 async fn record_audit(
@@ -414,6 +408,36 @@ pub async fn config(State(state): State<AppState>, _grant: AuthGrant) -> Json<Co
     })
 }
 
+#[derive(serde::Serialize)]
+pub struct SigningKeyJson {
+    pub algorithm: String,
+    pub keyid: String,
+    pub public_key_base64: String,
+    pub public_key_pem: String,
+}
+
+/// Exposes the signing public key so DSSE-signed manifests can be verified
+/// by third-party tooling (`cosign verify-blob-attestation`, `openssl
+/// pkeyutl -verify -rawin`, etc.) without trusting Magnolia's own
+/// verification code. Same auth tier as `config`/`whoami`: any valid key,
+/// no RBAC action — server-operational material, not tenant data.
+pub async fn signing_key(
+    State(state): State<AppState>,
+    _grant: AuthGrant,
+) -> Result<Json<SigningKeyJson>, ApiError> {
+    let raw = state
+        .signer
+        .public_key()
+        .await
+        .map_err(|e| ApiError::InternalError(format!("public key lookup failed: {}", e)))?;
+    Ok(Json(SigningKeyJson {
+        algorithm: "ed25519".to_string(),
+        keyid: hex::encode(Sha256::digest(&raw)),
+        public_key_base64: ed25519_public_key_base64(&raw),
+        public_key_pem: ed25519_public_key_pem(&raw).map_err(|e| ApiError::InternalError(e.to_string()))?,
+    }))
+}
+
 pub async fn upload_sbom(
     State(state): State<AppState>,
     grant: AuthGrant,
@@ -435,6 +459,7 @@ pub async fn upload_sbom(
     let mut format = "cyclonedx".to_string();
     let mut namespace = "/".to_string();
     let mut version = String::new();
+    let mut document_type = String::new();
     while let Some(next) = multipart
         .next_field()
         .await
@@ -457,6 +482,12 @@ pub async fn upload_sbom(
                 .map_err(|_| ApiError::BadRequest("invalid version field".to_string()))?
                 .trim()
                 .to_string(),
+            Some("document_type") => document_type = next
+                .text()
+                .await
+                .map_err(|_| ApiError::BadRequest("invalid document_type field".to_string()))?
+                .trim()
+                .to_string(),
             _ => {}
         }
     }
@@ -474,13 +505,20 @@ pub async fn upload_sbom(
             "sbom_file exceeds 10 MiB limit".to_string(),
         ));
     }
-    if !matches!(format.as_str(), "cyclonedx" | "spdx") {
+    if !matches!(format.as_str(), "cyclonedx" | "spdx" | "document") {
         return Err(ApiError::BadRequest(format!(
-            "unsupported format: {} (use cyclonedx or spdx)",
+            "unsupported format: {} (use cyclonedx, spdx, or document)",
             format
         )));
     }
-    validate_sbom_content(&sbom_bytes, &format)?;
+    if format == "document" && document_type.is_empty() {
+        return Err(ApiError::BadRequest(
+            "document_type is required when format=document".to_string(),
+        ));
+    }
+    if format != "document" {
+        validate_sbom_content(&sbom_bytes, &format)?;
+    }
 
     let (tenant_id, cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
 
@@ -537,11 +575,6 @@ pub async fn upload_sbom(
         target_tenant.map(|t| t.domain).unwrap_or_default()
     } else {
         grant.domain.clone()
-    };
-
-    let sbom_format = match format.as_str() {
-        "cyclonedx" => SbomFormat::CycloneDx,
-        _ => SbomFormat::Spdx,
     };
 
     let sbom_hash = hex::encode(Sha256::digest(&sbom_bytes));
@@ -602,29 +635,79 @@ pub async fn upload_sbom(
     let previous_manifest_hash = previous.as_ref().map(|m| m.manifest_hash.clone());
 
     let manifest_created_at = Utc::now();
-    let mut manifest = Manifest::new(
-        version.clone(),
-        sbom_hash.clone(),
-        sbom_format,
-        s3_key.clone(),
-        tenant_id,
-        namespace.clone(),
-        domain.clone(),
-    );
-    if let Some(ref prev) = previous_manifest_hash {
-        manifest = manifest.with_previous(prev.clone());
-    }
-    let mut manifest_bytes = serde_json::to_vec_pretty(&manifest)
-        .map_err(|e| ApiError::InternalError(e.to_string()))?;
-    let manifest_signature = state
+
+    // The in-toto Statement's subject digest is the SAME sbom_hash already
+    // fed to tree.add_leaf() above — this is what makes DSSE verification
+    // also a structural binding check between "this metadata" and "this
+    // exact SBOM content", not just a signature over arbitrary bytes.
+    //
+    // Documents reuse the exact same Statement/PAE/sign/envelope pipeline
+    // as SBOM manifests, just with a different predicate shape and type —
+    // everything from here down operates only on `statement_bytes`.
+    let document_type_opt = if format == "document" {
+        Some(document_type.as_str())
+    } else {
+        None
+    };
+    let statement_bytes = if let Some(document_type) = document_type_opt {
+        let statement: DocumentStatement = Statement {
+            statement_type: IN_TOTO_STATEMENT_TYPE.to_string(),
+            subject: vec![Subject {
+                name: format!("{}{}@{}", domain, namespace, version),
+                digest: [("sha256".to_string(), sbom_hash.clone())].into_iter().collect(),
+            }],
+            predicate_type: DOCUMENT_PREDICATE_TYPE.to_string(),
+            predicate: DocumentPredicate {
+                document_type: document_type.to_string(),
+                version: version.clone(),
+                namespace: namespace.clone(),
+                previous_manifest_hash: previous_manifest_hash.clone(),
+                created_by: grant.principal(),
+                created_at: manifest_created_at,
+                tenant_id,
+            },
+        };
+        serde_json::to_vec(&statement).map_err(|e| ApiError::InternalError(e.to_string()))?
+    } else {
+        let statement: ManifestStatement = Statement {
+            statement_type: IN_TOTO_STATEMENT_TYPE.to_string(),
+            subject: vec![Subject {
+                name: format!("{}{}@{}", domain, namespace, version),
+                digest: [("sha256".to_string(), sbom_hash.clone())].into_iter().collect(),
+            }],
+            predicate_type: MANIFEST_PREDICATE_TYPE.to_string(),
+            predicate: ManifestPredicate {
+                version: version.clone(),
+                namespace: namespace.clone(),
+                previous_manifest_hash: previous_manifest_hash.clone(),
+                sbom_format: format.clone(),
+                created_by: grant.principal(),
+                created_at: manifest_created_at,
+                tenant_id,
+            },
+        };
+        serde_json::to_vec(&statement).map_err(|e| ApiError::InternalError(e.to_string()))?
+    };
+
+    let pae_bytes = pae(DSSE_PAYLOAD_TYPE, &statement_bytes);
+    let raw_signature = state
         .signer
-        .sign(&manifest_bytes)
+        .sign(&pae_bytes)
         .await
         .map_err(|e| ApiError::InternalError(format!("manifest signing failed: {}", e)))?;
-    manifest.signature = hex::encode(&manifest_signature);
-    manifest_bytes = serde_json::to_vec_pretty(&manifest)
-        .map_err(|e| ApiError::InternalError(e.to_string()))?;
-    let manifest_hash = hex::encode(Sha256::digest(&manifest_bytes));
+    let public_key = state
+        .signer
+        .public_key()
+        .await
+        .map_err(|e| ApiError::InternalError(format!("public key lookup failed: {}", e)))?;
+    let keyid = hex::encode(Sha256::digest(&public_key));
+
+    let envelope = build_envelope(DSSE_PAYLOAD_TYPE, &statement_bytes, &raw_signature, &keyid);
+    let envelope_json =
+        serde_json::to_value(&envelope).map_err(|e| ApiError::InternalError(e.to_string()))?;
+    let manifest_hash = hex::encode(Sha256::digest(
+        serde_json::to_vec(&envelope_json).map_err(|e| ApiError::InternalError(e.to_string()))?,
+    ));
 
     state
         .db
@@ -638,7 +721,8 @@ pub async fn upload_sbom(
             &s3_key,
             &namespace,
             previous_manifest_hash.as_deref(),
-            &manifest_signature,
+            &envelope_json,
+            document_type_opt,
             &grant.principal(),
             manifest_created_at,
         )
@@ -820,6 +904,8 @@ pub async fn leaves(
                 manifest_hash: row.manifest_hash,
                 revoked: row.revoked,
                 domain: row.domain,
+                version: row.version,
+                document_type: row.document_type,
             })
             .collect(),
     ))
@@ -881,7 +967,9 @@ pub async fn manifest(
         sbom_s3_key: record.sbom_s3_key,
         namespace: record.namespace,
         previous_manifest_hash: record.previous_manifest_hash,
-        signature: hex::encode(&record.signature),
+        signature: record.signature.as_ref().map(hex::encode),
+        dsse_envelope: record.dsse_envelope.clone(),
+        document_type: record.document_type.clone(),
         created_by: mask_principal(&record.created_by),
         created_at: record.created_at,
         revoked: record.revoked,

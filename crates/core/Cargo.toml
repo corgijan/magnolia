@@ -11,3 +11,8 @@ thiserror.workspace = true
 hex.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+jsonschema = "0.50"
+base64.workspace = true
+
+[dev-dependencies]
+ed25519-dalek = "2"

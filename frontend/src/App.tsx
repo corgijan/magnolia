@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import {
   api,
   ApiHttpError,
@@ -65,7 +65,7 @@ type TabGroup = 'workspace' | 'admin';
 const TABS: { id: Tab; label: string; requires: RbacAction; group: TabGroup }[] = [
   { id: 'leaves', label: 'Dashboard', requires: 'read', group: 'workspace' },
   { id: 'dashboard', label: 'Info', requires: 'read', group: 'workspace' },
-  { id: 'upload', label: 'Upload SBOM', requires: 'upload', group: 'workspace' },
+  { id: 'upload', label: 'Upload', requires: 'upload', group: 'workspace' },
   { id: 'proofs', label: 'Proofs', requires: 'read', group: 'workspace' },
   { id: 'keys', label: 'API Keys', requires: 'manage_keys', group: 'admin' },
   { id: 'tenants', label: 'Tenants', requires: 'manage_tenants', group: 'admin' },
@@ -280,7 +280,7 @@ function Dashboard({
         <ErrorBox message={headError} />
       ) : (
         <div className="muted">
-          No tree head yet — this tenant hasn't uploaded an SBOM.
+          No tree head yet — this tenant hasn't uploaded anything.
         </div>
       )}
       </div>
@@ -293,19 +293,30 @@ function Dashboard({
 function Upload({ onUploaded }: { onUploaded: (result: UploadResult) => void }) {
   const tenantId = useTenantOverride();
   const [file, setFile] = useState<File | null>(null);
-  const [format, setFormat] = useState<'cyclonedx' | 'spdx'>('cyclonedx');
+  const [format, setFormat] = useState<'cyclonedx' | 'spdx' | 'document'>('cyclonedx');
   const [namespace, setNamespace] = useState('/');
   const [version, setVersion] = useState('');
+  const [documentType, setDocumentType] = useState('');
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<UploadResult | null>(null);
   const [error, setError] = useState('');
 
+  const isDocument = format === 'document';
+  const canUpload = !!file && !!version.trim() && (!isDocument || !!documentType.trim());
+
   const upload = async () => {
-    if (!file || !version.trim()) return;
+    if (!canUpload || !file) return;
     setBusy(true);
     setError('');
     try {
-      const res = await api.upload(file, format, namespace, version.trim(), tenantId);
+      const res = await api.upload(
+        file,
+        format,
+        namespace,
+        version.trim(),
+        tenantId,
+        isDocument ? documentType.trim() : undefined
+      );
       setResult(res);
       onUploaded(res);
     } catch (e) {
@@ -317,9 +328,9 @@ function Upload({ onUploaded }: { onUploaded: (result: UploadResult) => void }) 
 
   return (
     <div className="card">
-      <h2>Upload SBOM</h2>
+      <h2>Upload</h2>
       <label className="field">
-        <span>SBOM file</span>
+        <span>File</span>
         <input
           type="file"
           onChange={(e) => setFile(e.target.files ? e.target.files[0] : null)}
@@ -329,12 +340,23 @@ function Upload({ onUploaded }: { onUploaded: (result: UploadResult) => void }) 
         <span>Format</span>
         <select
           value={format}
-          onChange={(e) => setFormat(e.target.value as 'cyclonedx' | 'spdx')}
+          onChange={(e) => setFormat(e.target.value as 'cyclonedx' | 'spdx' | 'document')}
         >
           <option value="cyclonedx">CycloneDX (JSON)</option>
           <option value="spdx">SPDX (JSON)</option>
+          <option value="document">Other technical documentation</option>
         </select>
       </label>
+      {isDocument && (
+        <label className="field">
+          <span>Document type</span>
+          <input
+            value={documentType}
+            onChange={(e) => setDocumentType(e.target.value)}
+            placeholder="e.g. risk-assessment, test-report, cvd-policy"
+          />
+        </label>
+      )}
       <label className="field">
         <span>Namespace</span>
         <input
@@ -351,7 +373,7 @@ function Upload({ onUploaded }: { onUploaded: (result: UploadResult) => void }) 
           placeholder="e.g. 1.2.3"
         />
       </label>
-      <button className="btn primary" disabled={!file || !version.trim() || busy} onClick={upload}>
+      <button className="btn primary" disabled={!canUpload || busy} onClick={upload}>
         {busy ? 'Uploading…' : 'Upload'}
       </button>
       {error && <ErrorBox message={error} />}
@@ -410,6 +432,18 @@ function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+// "risk-assessment" -> "Risk Assessment V1.0" — document_type is stored as
+// a free-form slug (kebab/snake case), so this is a display-only humanizer,
+// not something round-tripped back to the API.
+function documentDisplayName(documentType: string, version: string): string {
+  const name = documentType
+    .split(/[-_\s]+/)
+    .filter(Boolean)
+    .map((w) => w[0].toUpperCase() + w.slice(1))
+    .join(' ');
+  return version ? `${name} V${version}` : name;
 }
 
 // "created_by"/"principal" is `apikey:<full key_id uuid>` — only show the
@@ -640,8 +674,8 @@ function SbomTree({ roots }: { roots: SbomTreeNode[] }) {
   );
 }
 
-function downloadBytes(filename: string, bytes: Uint8Array) {
-  const blob = new Blob([bytes as BlobPart], { type: 'application/json' });
+function downloadBytes(filename: string, bytes: Uint8Array, mimeType = 'application/json') {
+  const blob = new Blob([bytes as BlobPart], { type: mimeType });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -696,6 +730,81 @@ function SbomArtifact({ manifest }: { manifest: Manifest }) {
       </div>
       {view === 'tree' && hasTree && <SbomTree roots={summary.tree as SbomTreeNode[]} />}
       {view === 'raw' && summary.pretty !== null && <pre className="json sbom-json">{summary.pretty}</pre>}
+    </div>
+  );
+}
+
+const PDF_MAGIC = [0x25, 0x50, 0x44, 0x46, 0x2d]; // "%PDF-"
+
+function isPdf(bytes: Uint8Array): boolean {
+  return PDF_MAGIC.every((b, i) => bytes[i] === b);
+}
+
+// Documents carry no stored MIME type, so "is this text worth rendering
+// inline" is a heuristic: it must decode as valid UTF-8 (no replacement
+// characters, ruling out arbitrary binary), and not be dominated by
+// non-printable control bytes (ruling out binary that happens to decode).
+function displayableText(bytes: Uint8Array): string | null {
+  if (bytes.length === 0) return '';
+  let text: string;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    return null;
+  }
+  let controlCount = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c < 32 && c !== 9 && c !== 10 && c !== 13) controlCount++;
+  }
+  if (controlCount / text.length > 0.01) return null;
+  return text;
+}
+
+function DocumentArtifact({ manifest }: { manifest: Manifest }) {
+  const bytes = useMemo(() => hexToBytes(manifest.sbom_hex), [manifest.sbom_hex]);
+  const pdf = useMemo(() => isPdf(bytes), [bytes]);
+  const text = useMemo(() => (pdf ? null : displayableText(bytes)), [pdf, bytes]);
+
+  const pdfUrl = useMemo(() => {
+    if (!pdf) return null;
+    const blob = new Blob([bytes as BlobPart], { type: 'application/pdf' });
+    return URL.createObjectURL(blob);
+  }, [pdf, bytes]);
+
+  useEffect(() => {
+    return () => {
+      if (pdfUrl) URL.revokeObjectURL(pdfUrl);
+    };
+  }, [pdfUrl]);
+
+  return (
+    <div className="sbom-artifact">
+      <div className="sbom-artifact-header">
+        <div>
+          <strong>{documentDisplayName(manifest.document_type ?? '', manifest.version)}</strong>
+          <span className="muted"> · document · {formatBytes(bytes.length)}</span>
+        </div>
+        <div className="form-row">
+          <button
+            className="btn"
+            onClick={() =>
+              downloadBytes(
+                `${manifest.sbom_hash.slice(0, 16)}.${manifest.document_type}`,
+                bytes,
+                pdf ? 'application/pdf' : 'application/octet-stream'
+              )
+            }
+          >
+            Download document
+          </button>
+        </div>
+      </div>
+      {pdf && pdfUrl && <iframe title="document preview" src={pdfUrl} className="document-pdf-preview" />}
+      {!pdf && text !== null && <pre className="json sbom-json">{text}</pre>}
+      {!pdf && text === null && (
+        <div className="muted">No preview available for this file type — download to view.</div>
+      )}
     </div>
   );
 }
@@ -766,12 +875,16 @@ function SbomDetailPanel({ hash, tenantId }: { hash: string; tenantId?: string }
 
   return (
     <div className="card">
-      <h2>SBOM Details</h2>
+      <h2>{manifest?.document_type ? 'Document Details' : 'SBOM Details'}</h2>
       {busy && <Spinner label="Loading…" />}
       {error && <ErrorBox message={error} />}
       {!busy && manifest && (
         <div className="result-box">
-          <SbomArtifact key={manifest.manifest_hash} manifest={manifest} />
+          {manifest.document_type ? (
+            <DocumentArtifact key={manifest.manifest_hash} manifest={manifest} />
+          ) : (
+            <SbomArtifact key={manifest.manifest_hash} manifest={manifest} />
+          )}
           <div className="kv-row">
             <span className="kv-label">status</span>
             <Badge ok={!manifest.revoked}>{manifest.revoked ? 'revoked' : 'active'}</Badge>
@@ -812,6 +925,27 @@ function SbomDetailPanel({ hash, tenantId }: { hash: string; tenantId?: string }
             <span className="kv-label">previous_manifest_hash</span>
             <span>{manifest.previous_manifest_hash ? <Hash value={manifest.previous_manifest_hash} chars={24} /> : 'none (first upload)'}</span>
           </div>
+          {manifest.dsse_envelope ? (
+            <>
+              <div className="kv-row">
+                <span className="kv-label">dsse signature</span>
+                <Hash value={manifest.dsse_envelope.signatures[0]?.sig ?? ''} chars={24} />
+              </div>
+              <div className="kv-row">
+                <span className="kv-label">attestation</span>
+                <DownloadButton filename={`${manifest.manifest_hash}.dsse.json`} data={manifest.dsse_envelope} />
+                <span className="muted"> — verify with cosign/openssl against this SBOM's hash</span>
+              </div>
+            </>
+          ) : (
+            <div className="kv-row">
+              <span className="kv-label">signature</span>
+              <span>
+                {manifest.signature ? <Hash value={manifest.signature} chars={24} /> : 'none'}
+                {' '}<em>(signed under legacy scheme, not third-party verifiable)</em>
+              </span>
+            </div>
+          )}
           <div className="kv-row">
             <span className="kv-label">created_by</span>
             <span>{manifest.created_by}</span>
@@ -878,15 +1012,18 @@ function SbomLeafRow({
       className={`sbom-tree-row${leaf.manifest_hash ? ' clickable' : ''}`}
       style={{ paddingLeft: depth * 18 }}
       onClick={() => leaf.manifest_hash && onViewSbom(leaf.manifest_hash)}
-      title={leaf.manifest_hash ? 'View SBOM' : 'No manifest available'}
+      title={leaf.manifest_hash ? (leaf.document_type ? 'View document' : 'View SBOM') : 'No manifest available'}
     >
       <FileIcon />
-      <span className="sbom-tree-label">
-        <Hash value={leaf.leaf_hash} chars={16} />
+      <span className="sbom-tree-label" title={leaf.leaf_hash}>
+        {leaf.document_type
+          ? documentDisplayName(leaf.document_type, leaf.version ?? '')
+          : leaf.version ?? 'no version'}
       </span>
       <span className="sbom-tree-detail">
-        seq {leaf.seq_id} · {new Date(leaf.created_at).toLocaleDateString()}
+        {new Date(leaf.created_at).toLocaleDateString()}
       </span>
+      {leaf.document_type && <Badge ok={true}>document</Badge>}
       {leaf.revoked && <Badge ok={false}>revoked</Badge>}
     </div>
   );
@@ -932,7 +1069,7 @@ function NamespaceFolderRow({
         <span className="sbom-tree-label">{node.name}</span>
         <span className="muted">
           {' '}
-          ({node.leaves.length} SBOM{node.leaves.length === 1 ? '' : 's'}
+          ({node.leaves.length} item{node.leaves.length === 1 ? '' : 's'}
           {node.children.length > 0 ? `, ${node.children.length} sub` : ''})
         </span>
         {isRealNamespace && (
@@ -1054,7 +1191,7 @@ function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
     <div className="explorer-layout">
       <div className="card explorer-left">
         <div className="card-header">
-          <h2>SBOM Explorer</h2>
+          <h2>Archive Explorer</h2>
           <button className="btn" onClick={load}>Refresh</button>
         </div>
         <SbomSearchBox onSelect={setSelectedHash} />
@@ -1153,7 +1290,7 @@ function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
           <SbomDetailPanel key={selectedHash} hash={selectedHash} tenantId={tenantId} />
         ) : (
           <div className="card">
-            <div className="muted">Select an SBOM on the left to view its details.</div>
+            <div className="muted">Select an item on the left to view its details.</div>
           </div>
         )}
       </div>
@@ -1446,7 +1583,7 @@ function Keys() {
           <label className="field">
             <span>Role</span>
             <select value={role} onChange={(e) => setRole(e.target.value)}>
-              <option value="uploader">uploader — can upload SBOMs</option>
+              <option value="uploader">uploader — can upload SBOMs/documents</option>
               <option value="auditor">auditor — can read/verify</option>
               <option value="domain_admin">domain_admin — can manage keys</option>
               <option value="super_admin">super_admin — full tenant access</option>
@@ -1574,8 +1711,8 @@ function Tenants({ isPlatform }: { isPlatform: boolean }) {
 
   const deleteTenant = async (t: Tenant) => {
     const confirmMessage = devMode
-      ? `Delete tenant "${t.name}" (${t.domain})?\n\nDEV_MODE is on: this is final and cannot be undone. It permanently removes ALL of that tenant's data: every API key, every uploaded SBOM, its entire Merkle tree/signed-tree-head history, and its audit log.\n\nType nothing needed — click OK only if you're certain.`
-      : `Hide tenant "${t.name}" (${t.domain})?\n\nThis removes it from tenant listings/selectors, but its data is NOT deleted — every API key, SBOM, and the Merkle tree/audit log stay fully intact and still reachable directly. (Full deletion is only available with DEV_MODE=true.)`;
+      ? `Delete tenant "${t.name}" (${t.domain})?\n\nDEV_MODE is on: this is final and cannot be undone. It permanently removes ALL of that tenant's data: every API key, every uploaded SBOM/document, its entire Merkle tree/signed-tree-head history, and its audit log.\n\nType nothing needed — click OK only if you're certain.`
+      : `Hide tenant "${t.name}" (${t.domain})?\n\nThis removes it from tenant listings/selectors, but its data is NOT deleted — every API key, SBOM/document, and the Merkle tree/audit log stay fully intact and still reachable directly. (Full deletion is only available with DEV_MODE=true.)`;
     if (!window.confirm(confirmMessage)) {
       return;
     }

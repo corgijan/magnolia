@@ -34,6 +34,8 @@ export interface Leaf {
   manifest_hash: string | null;
   revoked: boolean;
   domain: string;
+  version: string | null;
+  document_type: string | null;
 }
 
 export interface ProofStep {
@@ -64,6 +66,17 @@ export interface ConsistencyProof {
   peak_proofs: PeakProof[];
 }
 
+export interface DsseSignature {
+  keyid: string;
+  sig: string;
+}
+
+export interface DsseEnvelope {
+  payload: string;
+  payloadType: string;
+  signatures: DsseSignature[];
+}
+
 export interface Manifest {
   manifest_hash: string;
   leaf_seq_id: number;
@@ -75,7 +88,15 @@ export interface Manifest {
   sbom_s3_key: string;
   namespace: string;
   previous_manifest_hash: string | null;
-  signature: string;
+  // Legacy hex signature — only set for manifests signed before the DSSE
+  // migration; null for anything with dsse_envelope.
+  signature: string | null;
+  // Canonical signed artifact for manifests signed after the DSSE
+  // migration; null for legacy manifests (can't be retroactively upgraded).
+  dsse_envelope: DsseEnvelope | null;
+  // Set for a general technical-documentation upload (risk assessment,
+  // test report, etc.); null for a regular SBOM manifest.
+  document_type: string | null;
   created_by: string;
   created_at: string;
   sbom_hex: string;
@@ -229,16 +250,18 @@ export const api = {
 
   upload: (
     file: File,
-    format: 'cyclonedx' | 'spdx',
+    format: 'cyclonedx' | 'spdx' | 'document',
     namespace: string,
     version: string,
-    tenantId?: string
+    tenantId?: string,
+    documentType?: string
   ): Promise<UploadResult> => {
     const form = new FormData();
     form.append('sbom_file', file);
     form.append('format', format);
     form.append('namespace', namespace);
     form.append('version', version);
+    if (documentType) form.append('document_type', documentType);
     return request(`/api/v1/upload${tenantQs(tenantId)}`, { method: 'POST', body: form });
   },
 
