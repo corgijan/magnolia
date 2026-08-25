@@ -30,3 +30,4 @@ magnolia-signer = { path = "../signer" }
 magnolia-storage = { path = "../storage" }
 magnolia-db = { path = "../db" }
 magnolia-audit = { path = "../audit" }
+magnolia-dtrack = { path = "../dtrack" }

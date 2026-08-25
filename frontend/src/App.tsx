@@ -6,11 +6,15 @@ import {
   AuditEntry,
   ConsistencyProof,
   BackendConfig,
+  ComplianceReport,
   ComplianceSetting,
   ComponentSearchResult,
   CreateKeyResponse,
   CreateTenantResponse,
   CurrentManifest,
+  DtrackSyncResult,
+  FindingComment,
+  FindingWithContext,
   InclusionProof,
   Leaf,
   Manifest,
@@ -19,6 +23,7 @@ import {
   Tenant,
   TreeHead,
   UploadResult,
+  VulnerabilityFinding,
   WhoAmI,
 } from './api';
 import {
@@ -29,7 +34,18 @@ import {
 } from './merkle';
 import './App.css';
 
-type Tab = 'dashboard' | 'upload' | 'leaves' | 'proofs' | 'search' | 'keys' | 'tenants' | 'audit' | 'settings';
+type Tab =
+  | 'dashboard'
+  | 'upload'
+  | 'tools'
+  | 'leaves'
+  | 'proofs'
+  | 'search'
+  | 'findings'
+  | 'keys'
+  | 'tenants'
+  | 'audit'
+  | 'settings';
 
 // Mirrors the backend RBAC matrix (crates/auth/src/rbac.rs) so the UI only
 // ever shows tabs/actions the current key is actually allowed to use.
@@ -73,8 +89,10 @@ const TABS: { id: Tab; label: string; requires: RbacAction; group: TabGroup }[] 
   { id: 'leaves', label: 'Dashboard', requires: 'read', group: 'workspace' },
   { id: 'dashboard', label: 'Info', requires: 'read', group: 'workspace' },
   { id: 'upload', label: 'Upload', requires: 'upload', group: 'workspace' },
+  { id: 'tools', label: 'Tools', requires: 'read', group: 'workspace' },
   { id: 'proofs', label: 'Proofs', requires: 'read', group: 'workspace' },
   { id: 'search', label: 'Component Search', requires: 'read', group: 'workspace' },
+  { id: 'findings', label: 'Findings', requires: 'read', group: 'workspace' },
   { id: 'settings', label: 'Settings', requires: 'manage_settings', group: 'workspace' },
   { id: 'keys', label: 'API Keys', requires: 'manage_keys', group: 'admin' },
   { id: 'tenants', label: 'Tenants', requires: 'manage_tenants', group: 'admin' },
@@ -229,6 +247,28 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
+// Inline text that copies itself to the clipboard on click — for a value
+// (like a purl) sitting inline in a dense row where a full CopyButton would
+// break the layout. Native `title` already shows the full value on hover;
+// this adds the "grab it" half.
+function CopyableText({ text, className, title }: { text: string; className?: string; title?: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <span
+      className={className}
+      title={copied ? 'Copied!' : title}
+      onClick={(e) => {
+        e.stopPropagation();
+        navigator.clipboard.writeText(text);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      }}
+    >
+      {copied ? 'Copied!' : text}
+    </span>
+  );
+}
+
 function downloadJson(filename: string, data: unknown) {
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
@@ -313,6 +353,10 @@ function Dashboard({
             <span>{config.signer_backend}</span>
           </div>
           <div className="kv-row">
+            <span className="kv-label">Dependency-Track</span>
+            <Badge ok={config.dtrack_enabled}>{config.dtrack_enabled ? 'enabled' : 'disabled'}</Badge>
+          </div>
+          <div className="kv-row">
             <span className="kv-label">DEV_MODE</span>
             <Badge ok={!config.dev_mode}>{config.dev_mode ? 'on — RBAC relaxed' : 'off'}</Badge>
           </div>
@@ -387,7 +431,16 @@ function isGitRepoDocumentType(documentType: string | null | undefined): boolean
   return (documentType ?? '').trim().toLowerCase() === GIT_REPO_DOCUMENT_TYPE;
 }
 
-function Upload({ onUploaded }: { onUploaded: (result: UploadResult) => void }) {
+function Upload({
+  onUploaded,
+  onOpenTools,
+}: {
+  onUploaded: (result: UploadResult) => void;
+  /** Called when the compliance-check hint below is clicked — the caller
+   * switches to the Tools tab. Optional so Upload doesn't hard-depend on
+   * tab-switching wiring in contexts that don't need it. */
+  onOpenTools?: () => void;
+}) {
   const tenantId = useTenantOverride();
   const [file, setFile] = useState<File | null>(null);
   const [format, setFormat] = useState<'cyclonedx' | 'spdx' | 'document' | 'git-repo'>('cyclonedx');
@@ -427,6 +480,15 @@ function Upload({ onUploaded }: { onUploaded: (result: UploadResult) => void }) 
   return (
     <div className="card">
       <h2>Upload</h2>
+      {onOpenTools && (
+        <div className="muted upload-hint">
+          Not sure this SBOM meets BSI TR-03183 or NTIA minimum-elements requirements?{' '}
+          <button className="link-button" onClick={onOpenTools}>
+            Check it in Tools
+          </button>{' '}
+          first — nothing you check there is archived.
+        </div>
+      )}
       <label className="field">
         <span>File</span>
         <input
@@ -518,6 +580,106 @@ function Upload({ onUploaded }: { onUploaded: (result: UploadResult) => void }) 
   );
 }
 
+// ---------- Tools (standalone compliance check, nothing archived) ----------
+
+function Tools() {
+  const [file, setFile] = useState<File | null>(null);
+  const [format, setFormat] = useState<'cyclonedx' | 'spdx'>('cyclonedx');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [reports, setReports] = useState<ComplianceReport[] | null>(null);
+
+  const check = async () => {
+    if (!file) return;
+    setBusy(true);
+    setError('');
+    setReports(null);
+    try {
+      setReports(await api.checkCompliance(file, format));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="card">
+      <h2>Tools</h2>
+      <p className="muted">
+        Check whether an SBOM meets compliance requirements — BSI TR-03183, NTIA minimum
+        elements — before uploading it for real. Nothing checked here is stored, indexed, or
+        added to the Merkle log; it's a scratch check, not an upload.
+      </p>
+      <label className="field">
+        <span>File</span>
+        <input
+          type="file"
+          onChange={(e) => {
+            setFile(e.target.files ? e.target.files[0] : null);
+            setReports(null);
+          }}
+        />
+      </label>
+      <label className="field">
+        <span>Format</span>
+        <select value={format} onChange={(e) => setFormat(e.target.value as 'cyclonedx' | 'spdx')}>
+          <option value="cyclonedx">CycloneDX (JSON)</option>
+          <option value="spdx">SPDX (JSON)</option>
+        </select>
+      </label>
+      <button className="btn primary" disabled={!file || busy} onClick={check}>
+        {busy ? 'Checking…' : 'Check compliance'}
+      </button>
+      {error && <ErrorBox message={error} />}
+      {reports && reports.length === 0 && (
+        <div className="muted" style={{ marginTop: 12 }}>
+          No compliance profile applies to this format.
+        </div>
+      )}
+      {reports && reports.length > 0 && (
+        <div className="compliance-block">
+          {reports.map((r) => {
+            const hasIssues = r.minimum_issues.length > 0 || r.missing_fields.length > 0;
+            return (
+              <div key={r.profile_id} className="compliance-profile">
+                <div className="cell-actions">
+                  <strong>{r.profile_name}</strong>
+                  <Badge ok={r.meets_minimum}>{r.meets_minimum ? 'meets minimum' : 'below minimum'}</Badge>
+                  <Badge ok={r.fully_compliant}>
+                    {r.fully_compliant ? 'fully compliant' : 'not fully compliant'}
+                  </Badge>
+                </div>
+                {r.minimum_issues.length > 0 && (
+                  <div className="muted">
+                    Missing for minimum compliance:
+                    <ul>
+                      {r.minimum_issues.map((m, i) => (
+                        <li key={i}>{m}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {r.meets_minimum && !r.fully_compliant && r.missing_fields.length > 0 && (
+                  <div className="muted">
+                    Missing for full compliance:
+                    <ul>
+                      {r.missing_fields.map((m, i) => (
+                        <li key={i}>{m}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {!hasIssues && <div className="muted">No issues found.</div>}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ---------- Manifest lookup / SBOM artifact view ----------
 
 function hexToBytes(hex: string): Uint8Array {
@@ -558,20 +720,24 @@ function shortPrincipal(value: string): string {
   return `…${value.slice(-5)}`;
 }
 
+// "up to about 10 minutes" from a raw seconds count — used to give the
+// dtrack "not synced yet" messaging a real wait-time instead of a vague
+// "check back later" (the sync loop only runs once per this interval, so a
+// manifest uploaded right after a pass has to wait almost the full
+// interval before the next one picks it up).
+function formatSyncWaitTime(intervalSecs: number | null): string {
+  if (!intervalSecs || intervalSecs <= 0) return 'shortly';
+  const minutes = Math.max(1, Math.round(intervalSecs / 60));
+  return `up to about ${minutes} minute${minutes === 1 ? '' : 's'}`;
+}
+
 interface SbomTreeNode {
   id: string;
   label: string;
-  detail?: string;
+  version?: string;
+  packageType?: string;
+  purl?: string;
   children: SbomTreeNode[];
-}
-
-// CycloneDX component fields vary a lot; pull whatever's useful for the
-// detail line without assuming a strict shape.
-function cycloneDxDetail(c: unknown): string | undefined {
-  if (!c || typeof c !== 'object') return undefined;
-  const obj = c as Record<string, unknown>;
-  const bits = [obj.version, obj.type, obj.purl].filter((v) => typeof v === 'string') as string[];
-  return bits.length ? bits.join(' · ') : undefined;
 }
 
 /// Prefers the real dependency graph (`dependencies[]`: bom-ref -> dependsOn)
@@ -602,7 +768,14 @@ function buildCycloneDxTree(doc: Record<string, unknown>): SbomTreeNode[] {
   const nodeFor = (ref: string): SbomTreeNode => {
     const c = byRef.get(ref);
     const name = (c?.name as string | undefined) ?? ref;
-    return { id: ref, label: name, detail: cycloneDxDetail(c), children: [] };
+    return {
+      id: ref,
+      label: name,
+      version: typeof c?.version === 'string' ? (c.version as string) : undefined,
+      packageType: typeof c?.type === 'string' ? (c.type as string) : undefined,
+      purl: typeof c?.purl === 'string' ? (c.purl as string) : undefined,
+      children: [],
+    };
   };
 
   const deps = doc.dependencies;
@@ -641,7 +814,9 @@ function buildCycloneDxTree(doc: Record<string, unknown>): SbomTreeNode[] {
       return {
         id,
         label: (obj.name as string | undefined) ?? id,
-        detail: cycloneDxDetail(obj),
+        version: typeof obj.version === 'string' ? (obj.version as string) : undefined,
+        packageType: typeof obj.type === 'string' ? (obj.type as string) : undefined,
+        purl: typeof obj.purl === 'string' ? (obj.purl as string) : undefined,
         children: fromComponents(obj.components),
       };
     });
@@ -666,7 +841,14 @@ function buildSpdxTree(doc: Record<string, unknown>): SbomTreeNode[] {
     const p = byId.get(id);
     const name = (p?.name as string | undefined) ?? id;
     const version = p?.versionInfo as string | undefined;
-    return { id, label: name, detail: version, children: [] };
+    let purl: string | undefined;
+    if (Array.isArray(p?.externalRefs)) {
+      const ref = (p!.externalRefs as unknown[]).find(
+        (r) => r && typeof r === 'object' && (r as Record<string, unknown>).referenceType === 'purl'
+      ) as Record<string, unknown> | undefined;
+      if (ref && typeof ref.referenceLocator === 'string') purl = ref.referenceLocator as string;
+    }
+    return { id, label: name, version, purl, children: [] };
   };
 
   const rels = doc.relationships;
@@ -755,7 +937,9 @@ function SbomTreeRow({ node, depth }: { node: SbomTreeNode; depth: number }) {
       >
         <span className="sbom-tree-toggle">{hasChildren ? (open ? '▾' : '▸') : '·'}</span>
         <span className="sbom-tree-label">{node.label}</span>
-        {node.detail && <span className="sbom-tree-detail">{node.detail}</span>}
+        {node.version && <span className="sbom-tree-version">{node.version}</span>}
+        {node.packageType && <span className="sbom-tree-type muted">{node.packageType}</span>}
+        {node.purl && <CopyableText className="sbom-tree-purl" text={node.purl} title={node.purl} />}
         {hasChildren && <span className="muted"> ({node.children.length})</span>}
       </div>
       {hasChildren && open && node.children.map((child, i) => (
@@ -1238,6 +1422,7 @@ function SbomDetailPanel({
   hash,
   tenantId,
   onRevoked,
+  onViewFindings,
 }: {
   hash: string;
   tenantId?: string;
@@ -1245,6 +1430,10 @@ function SbomDetailPanel({
    * list this detail view was opened from (e.g. the Explorer tree), which
    * otherwise keeps showing the now-revoked item until manually refreshed. */
   onRevoked?: () => void;
+  /** Called with this manifest's hash when the findings summary's link is
+   * clicked — the caller switches to the Findings tab, filtered to just
+   * this manifest, where triage and comments actually happen. */
+  onViewFindings?: (manifestHash: string) => void;
 }) {
   const [manifest, setManifest] = useState<Manifest | null>(null);
   const [busy, setBusy] = useState(true);
@@ -1252,6 +1441,22 @@ function SbomDetailPanel({
   const [revoking, setRevoking] = useState(false);
   const [revokeError, setRevokeError] = useState('');
   const [complianceReportFor, setComplianceReportFor] = useState<string | null>(null);
+  const [dtrackEnabled, setDtrackEnabled] = useState(false);
+  const [dtrackSyncDisabled, setDtrackSyncDisabled] = useState(false);
+  const [dtrackSyncIntervalSecs, setDtrackSyncIntervalSecs] = useState<number | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    api.config().then((c) => {
+      if (!mounted) return;
+      setDtrackEnabled(c.dtrack_enabled);
+      setDtrackSyncIntervalSecs(c.dtrack_sync_interval_secs);
+    }).catch(() => {});
+    api.dtrackSyncSetting(tenantId).then((s) => mounted && setDtrackSyncDisabled(s.disabled)).catch(() => {});
+    return () => {
+      mounted = false;
+    };
+  }, [tenantId]);
 
   // Only bothers sniffing document uploads — a real SBOM is validated
   // CycloneDX/SPDX JSON server-side already, so it can never collide with
@@ -1376,6 +1581,61 @@ function SbomDetailPanel({
                   })}
                 </>
               )}
+              {/* Only real SBOMs ever get pushed to dtrack (document_type is
+                  set for everything else — risk assessments, CVD policies,
+                  git-repo entries, ...) — showing "not synced" on those would
+                  be flat wrong, not just premature, since they're never
+                  going to sync no matter how long you wait.
+                  Once this tenant has turned sync off, the whole section is
+                  hidden here — including any already-cached findings — so
+                  the SBOM overview doesn't keep showing vulnerability data
+                  the tenant asked to stop tracking. Cached rows aren't
+                  deleted (same "mark, don't delete" idiom used elsewhere),
+                  they're just not surfaced on this page while sync is off;
+                  re-enabling sync brings them back into view immediately. */}
+              {!manifest.document_type && dtrackEnabled && !dtrackSyncDisabled && (
+                <>
+                  <tr>
+                    <td colSpan={2}><strong>Vulnerability findings</strong></td>
+                  </tr>
+                  <tr>
+                    <td colSpan={2}>
+                      {manifest.vulnerability_findings.length > 0 ? (
+                        <span className="cell-actions">
+                          <FindingsSummaryBadges findings={manifest.vulnerability_findings} />
+                          <button
+                            className="btn"
+                            onClick={() => onViewFindings?.(manifest.manifest_hash)}
+                          >
+                            View &amp; triage findings →
+                          </button>
+                        </span>
+                      ) : manifest.dtrack_synced_at ? (
+                        <>
+                          <Badge ok={true}>0 vulnerabilities found</Badge>{' '}
+                          <span className="muted">
+                            Last checked {new Date(manifest.dtrack_synced_at).toLocaleString()}.
+                          </span>
+                        </>
+                      ) : manifest.dtrack_push_error ? (
+                        <>
+                          <Badge ok={false}>sync error</Badge>{' '}
+                          <span className="muted">{manifest.dtrack_push_error}</span>
+                        </>
+                      ) : (
+                        <>
+                          <Badge ok={false}>not synced</Badge>{' '}
+                          <span className="muted">
+                            This SBOM hasn't finished vulnerability scanning yet. Dependency-Track checks for new
+                            uploads every {formatSyncWaitTime(dtrackSyncIntervalSecs)} — if this was uploaded
+                            recently, please wait and check back.
+                          </span>
+                        </>
+                      )}
+                    </td>
+                  </tr>
+                </>
+              )}
               <tr>
                 <td>version</td>
                 <td>{manifest.version}</td>
@@ -1457,6 +1717,199 @@ function SbomDetailPanel({
           })()}
         </div>
       )}
+    </div>
+  );
+}
+
+function severityBadgeOk(severity: string): boolean {
+  return ['low', 'medium', 'info', 'unassigned'].includes(severity.toLowerCase());
+}
+
+// A finding's vulnerability id (CVE/GHSA/OSV/...), rendered as a monospace
+// tag so it reads as an identifier rather than running text.
+function VulnerabilityId({ vulnerabilityId }: { vulnerabilityId: string }) {
+  return <span className="vuln-id">{vulnerabilityId}</span>;
+}
+
+// Compact severity-count summary shown on the SBOM Details overview, e.g.
+// "3 critical · 5 high · 2 medium" — enough context to gauge urgency
+// without duplicating the full triage UI, which lives on the Findings tab
+// now (see SbomDetailPanel's "View & triage findings" link).
+function FindingsSummaryBadges({ findings }: { findings: VulnerabilityFinding[] }) {
+  const counts = new Map<string, number>();
+  for (const f of findings) {
+    const key = f.severity || 'unassigned';
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  const order = ['critical', 'high', 'medium', 'low', 'info', 'unassigned'];
+  const entries = Array.from(counts.entries()).sort((a, b) => {
+    const ai = order.indexOf(a[0].toLowerCase());
+    const bi = order.indexOf(b[0].toLowerCase());
+    return (ai === -1 ? order.length : ai) - (bi === -1 ? order.length : bi);
+  });
+  return (
+    <span className="cell-actions">
+      {entries.map(([severity, count]) => (
+        <Badge key={severity} ok={severityBadgeOk(severity)}>
+          {count} {severity}
+        </Badge>
+      ))}
+    </span>
+  );
+}
+
+// A finding's VEX-status triage control, as a standalone block rather than
+// a table row — used inside the Findings tab's expanded finding panel.
+// Kept separate from FindingComments below because each has its own
+// independent busy/error/draft state.
+function FindingTriageControls({
+  finding,
+  manifestHash,
+  tenantId,
+  onSaved,
+}: {
+  finding: VulnerabilityFinding;
+  manifestHash: string;
+  tenantId?: string;
+  /** Called after a successful save so the parent re-fetches the finding
+   * list and picks up the new triaged_by/triaged_at from the server. */
+  onSaved: () => void;
+}) {
+  const [status, setStatus] = useState(finding.vex_status ?? '');
+  const [justification, setJustification] = useState(finding.vex_justification ?? '');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  const save = async () => {
+    if (!status) return;
+    setBusy(true);
+    setError('');
+    try {
+      await api.triageFinding(manifestHash, finding.finding_key, status, justification.trim() || undefined, tenantId);
+      onSaved();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div>
+      {finding.vex_status && (
+        <div className="muted">
+          triaged: {finding.vex_status}
+          {finding.triaged_by ? ` by ${shortPrincipal(finding.triaged_by)}` : ''}
+          {finding.triaged_at ? ` on ${new Date(finding.triaged_at).toLocaleString()}` : ''}
+        </div>
+      )}
+      <div className="form-row" style={{ marginTop: 6 }}>
+        <select value={status} onChange={(e) => setStatus(e.target.value)} disabled={busy}>
+          <option value="">untriaged</option>
+          <option value="affected">affected</option>
+          <option value="not_affected">not_affected</option>
+          <option value="fixed">fixed</option>
+          <option value="under_investigation">under_investigation</option>
+        </select>
+        {status === 'not_affected' && (
+          <textarea
+            placeholder="justification (required)"
+            value={justification}
+            onChange={(e) => setJustification(e.target.value)}
+            disabled={busy}
+          />
+        )}
+        <button className="btn" disabled={busy || !status} onClick={save}>
+          {busy ? 'Saving…' : 'Save'}
+        </button>
+      </div>
+      {error && <ErrorBox message={error} />}
+    </div>
+  );
+}
+
+// A finding's discussion thread — loaded lazily (only once its parent row
+// is expanded) since most findings in a long list are never opened.
+// `author` always comes back as the calling API key's principal (see the
+// backend's `add_finding_comment`), matching how `triaged_by` is
+// attributed — there's no separate human-identity concept to show instead.
+function FindingComments({
+  manifestHash,
+  findingKey,
+  tenantId,
+}: {
+  manifestHash: string;
+  findingKey: string;
+  tenantId?: string;
+}) {
+  const [comments, setComments] = useState<FindingComment[] | null>(null);
+  const [busy, setBusy] = useState(true);
+  const [error, setError] = useState('');
+  const [draft, setDraft] = useState('');
+  const [posting, setPosting] = useState(false);
+  const [postError, setPostError] = useState('');
+
+  const load = useCallback(async () => {
+    setBusy(true);
+    setError('');
+    try {
+      setComments(await api.listFindingComments(manifestHash, findingKey, tenantId));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [manifestHash, findingKey, tenantId]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const post = async () => {
+    if (!draft.trim()) return;
+    setPosting(true);
+    setPostError('');
+    try {
+      await api.addFindingComment(manifestHash, findingKey, draft.trim(), tenantId);
+      setDraft('');
+      await load();
+    } catch (e) {
+      setPostError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPosting(false);
+    }
+  };
+
+  return (
+    <div style={{ marginTop: 10 }}>
+      <strong>Comments</strong>
+      {busy && <Spinner label="Loading comments…" />}
+      {error && <ErrorBox message={error} />}
+      {comments && comments.length === 0 && <div className="muted">No comments yet.</div>}
+      {comments && comments.length > 0 && (
+        <ul className="comment-list">
+          {comments.map((c) => (
+            <li key={c.id}>
+              <span className="muted">
+                {shortPrincipal(c.author)} · {new Date(c.created_at).toLocaleString()}
+              </span>
+              <div>{c.body}</div>
+            </li>
+          ))}
+        </ul>
+      )}
+      <div className="form-row" style={{ marginTop: 6 }}>
+        <textarea
+          placeholder="Add a comment…"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          disabled={posting}
+        />
+        <button className="btn" disabled={posting || !draft.trim()} onClick={post}>
+          {posting ? 'Posting…' : 'Add comment'}
+        </button>
+      </div>
+      {postError && <ErrorBox message={postError} />}
     </div>
   );
 }
@@ -1715,7 +2168,7 @@ function NamespaceTree({
   const domain = leaves[0]?.domain ?? '';
   const root = buildNamespaceTree(leaves, domain);
   if (root.children.length === 0 && root.leaves.length === 0) {
-    return <div className="muted">No leaves yet.</div>;
+    return <div className="muted">Nothing found, please upload under "upload".</div>;
   }
   return (
     <div className="sbom-tree">
@@ -1749,7 +2202,13 @@ function writeCurrentlyRunningViewEnabled(enabled: boolean): void {
   localStorage.setItem(CURRENTLY_RUNNING_VIEW_KEY, String(enabled));
 }
 
-function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
+function Leaves({
+  initialSelectedHash,
+  onViewFindings,
+}: {
+  initialSelectedHash?: string;
+  onViewFindings?: (manifestHash: string) => void;
+}) {
   const tenantId = useTenantOverride();
   const [leaves, setLeaves] = useState<Leaf[] | null>(null);
   const [error, setError] = useState('');
@@ -1934,7 +2393,13 @@ function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
                 ← All versions
               </button>
             )}
-            <SbomDetailPanel key={selectedHash} hash={selectedHash} tenantId={tenantId} onRevoked={load} />
+            <SbomDetailPanel
+              key={selectedHash}
+              hash={selectedHash}
+              tenantId={tenantId}
+              onRevoked={load}
+              onViewFindings={onViewFindings}
+            />
           </>
         ) : (
           <div className="card">
@@ -2337,6 +2802,401 @@ function ComponentSearch({ onViewManifest }: { onViewManifest: (hash: string) =>
   );
 }
 
+// ---------- Findings ----------
+
+const SEVERITY_OPTIONS = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO', 'UNASSIGNED'];
+const FINDINGS_PAGE_SIZE = 50;
+
+function Findings({
+  onViewManifest,
+  initialManifestHash,
+}: {
+  onViewManifest: (hash: string) => void;
+  /** Seeds the manifest filter when arriving from a specific SBOM's
+   * "View & triage findings" link — cleared by the user like any other
+   * filter, not re-applied on a later mount. */
+  initialManifestHash?: string;
+}) {
+  const tenantId = useTenantOverride();
+  const [severity, setSeverity] = useState('CRITICAL,HIGH');
+  const [vexStatus, setVexStatus] = useState('untriaged');
+  // Defaults on: old versions can still have real findings worth knowing
+  // about (what was running and attackable at the time), but day-to-day
+  // triage should default to what's actually deployed right now — same
+  // "latest non-revoked upload per namespace" the Dashboard calls
+  // "currently running". Off shows the full history across every version.
+  const [currentOnly, setCurrentOnly] = useState(true);
+  // Unlike currentOnly above, this can't be defeated by the admin-curated
+  // "currently running" namespace visibility (Settings) — it's a flat
+  // guarantee that only the single newest version per namespace is ever
+  // included, even for a namespace an admin has hidden from that view.
+  const [hideStale, setHideStale] = useState(true);
+  const [page, setPage] = useState(0);
+  const [hasNextPage, setHasNextPage] = useState(false);
+  const [manifestFilter, setManifestFilter] = useState(initialManifestHash ?? '');
+  // Namespace/version are free text, so they're only applied to the query
+  // on Enter/blur (via the committed namespace/releaseVersion state below)
+  // rather than on every keystroke — the drafts hold the live input value.
+  const [namespaceDraft, setNamespaceDraft] = useState('');
+  const [namespace, setNamespace] = useState('');
+  const [versionDraft, setVersionDraft] = useState('');
+  const [releaseVersion, setReleaseVersion] = useState('');
+  const [results, setResults] = useState<FindingWithContext[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [dtrackEnabled, setDtrackEnabled] = useState<boolean | null>(null);
+  const [dtrackSyncDisabled, setDtrackSyncDisabled] = useState(false);
+  const [dtrackSyncIntervalSecs, setDtrackSyncIntervalSecs] = useState<number | null>(null);
+  const [syncBusy, setSyncBusy] = useState(false);
+  const [syncError, setSyncError] = useState('');
+  const [syncResult, setSyncResult] = useState<DtrackSyncResult | null>(null);
+  const [expandedKey, setExpandedKey] = useState<string | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    api.config().then((c) => {
+      if (!mounted) return;
+      setDtrackEnabled(c.dtrack_enabled);
+      setDtrackSyncIntervalSecs(c.dtrack_sync_interval_secs);
+    }).catch(() => mounted && setDtrackEnabled(null));
+    api.dtrackSyncSetting(tenantId).then((s) => mounted && setDtrackSyncDisabled(s.disabled)).catch(() => {});
+    return () => {
+      mounted = false;
+    };
+  }, [tenantId]);
+
+  const load = useCallback(async () => {
+    setBusy(true);
+    setError('');
+    try {
+      // Fetches one extra row past the page size — its presence (not a
+      // separate count query) is what tells the Next button whether
+      // there's anything past this page, then gets trimmed back off.
+      const rows = await api.listFindings(
+        {
+          severity: severity || undefined,
+          manifestHash: manifestFilter || undefined,
+          namespace: namespace || undefined,
+          releaseVersion: releaseVersion || undefined,
+          vexStatus: vexStatus || undefined,
+          currentOnly,
+          hideStale,
+          limit: FINDINGS_PAGE_SIZE + 1,
+          offset: page * FINDINGS_PAGE_SIZE,
+        },
+        tenantId
+      );
+      setHasNextPage(rows.length > FINDINGS_PAGE_SIZE);
+      setResults(rows.slice(0, FINDINGS_PAGE_SIZE));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setResults(null);
+      setHasNextPage(false);
+    } finally {
+      setBusy(false);
+    }
+  }, [severity, manifestFilter, namespace, releaseVersion, vexStatus, currentOnly, hideStale, page, tenantId]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const forceSync = async () => {
+    setSyncBusy(true);
+    setSyncError('');
+    setSyncResult(null);
+    try {
+      const result = await api.forceDtrackSync(tenantId);
+      setSyncResult(result);
+      await load(); // pick up whatever the sync pass just pushed/refreshed
+    } catch (e) {
+      setSyncError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+
+  return (
+    <div className="card">
+      <div className="card-header">
+        <h2>Findings</h2>
+        <span className="cell-actions">
+          {dtrackEnabled && !dtrackSyncDisabled && (
+            <button className="btn" disabled={syncBusy} onClick={forceSync}>
+              {syncBusy ? 'Syncing…' : 'Force sync to dtrack'}
+            </button>
+          )}
+          <button className="btn" onClick={load}>Refresh</button>
+        </span>
+      </div>
+      {syncResult && (
+        <div className="muted">
+          Sync pass complete — pushed {syncResult.manifests_pushed} new manifest
+          {syncResult.manifests_pushed === 1 ? '' : 's'}, refreshed {syncResult.projects_refreshed} project
+          {syncResult.projects_refreshed === 1 ? '' : 's'}. One pass only covers a bounded batch — run it again
+          if you have more than that still pending.
+        </div>
+      )}
+      {syncError && <ErrorBox message={syncError} />}
+      <p className="muted">
+        Every cached Dependency-Track finding across the archive, within your namespace scope. Cleared
+        (not synced yet) manifests don't appear here — check a manifest's own detail view for that.
+      </p>
+      {dtrackEnabled === false && (
+        <div className="muted">
+          <Badge ok={false}>disabled</Badge> Dependency-Track integration is off for this deployment — see
+          Settings/Dashboard.
+        </div>
+      )}
+      {dtrackEnabled && dtrackSyncDisabled && (
+        <div className="muted">
+          <Badge ok={false}>sync disabled</Badge> This tenant has opted out of sync (see Settings) — results
+          below are whatever was cached before that, nothing new is being pushed/refreshed.
+        </div>
+      )}
+      <div className="form-row">
+        <label className="field" style={{ flex: '0 1 200px', minWidth: 150 }}>
+          <span>Severity</span>
+          <select
+            value={severity}
+            onChange={(e) => {
+              setSeverity(e.target.value);
+              setPage(0);
+            }}
+          >
+            <option value="">all</option>
+            <option value="CRITICAL,HIGH">CRITICAL + HIGH</option>
+            {SEVERITY_OPTIONS.map((s) => (
+              <option key={s} value={s}>
+                {s}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="field" style={{ flex: '0 1 200px', minWidth: 170 }}>
+          <span>Triage status</span>
+          <select
+            value={vexStatus}
+            onChange={(e) => {
+              setVexStatus(e.target.value);
+              setPage(0);
+            }}
+          >
+            <option value="">all</option>
+            <option value="untriaged">untriaged</option>
+            <option value="affected">affected</option>
+            <option value="not_affected">not_affected</option>
+            <option value="fixed">fixed</option>
+            <option value="under_investigation">under_investigation</option>
+          </select>
+        </label>
+        <label className="field" style={{ flex: '0 1 200px', minWidth: 150 }}>
+          <span>Namespace</span>
+          <input
+            type="text"
+            placeholder="/products/v1"
+            value={namespaceDraft}
+            onChange={(e) => setNamespaceDraft(e.target.value)}
+            onBlur={() => {
+              setNamespace(namespaceDraft.trim());
+              setPage(0);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                setNamespace(namespaceDraft.trim());
+                setPage(0);
+              }
+            }}
+          />
+        </label>
+        <label className="field" style={{ flex: '0 1 160px', minWidth: 130 }}>
+          <span>Version</span>
+          <input
+            type="text"
+            placeholder="1.0.0"
+            value={versionDraft}
+            onChange={(e) => setVersionDraft(e.target.value)}
+            onBlur={() => {
+              setReleaseVersion(versionDraft.trim());
+              setPage(0);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                setReleaseVersion(versionDraft.trim());
+                setPage(0);
+              }
+            }}
+          />
+        </label>
+        <label
+          className="checkbox-field"
+          style={{ marginBottom: 0 }}
+          title={
+            'Uses the same namespace visibility as the "Currently running" view (Settings → ' +
+            'Manage namespace visibility). A namespace hidden there is excluded here too, even ' +
+            "if it has findings. If you don't have access to Settings, ask an admin to check " +
+            'that list.'
+          }
+        >
+          <input
+            type="checkbox"
+            checked={currentOnly}
+            onChange={(e) => {
+              setCurrentOnly(e.target.checked);
+              setPage(0);
+            }}
+          />
+          <span>
+            Currently running only
+            <span className="muted" style={{ display: 'block', fontSize: 11 }}>
+              latest version per namespace, per Settings visibility
+            </span>
+          </span>
+        </label>
+        <label className="checkbox-field" style={{ marginBottom: 0 }}>
+          <input
+            type="checkbox"
+            checked={hideStale}
+            onChange={(e) => {
+              setHideStale(e.target.checked);
+              setPage(0);
+            }}
+          />
+          <span>
+            Don't show stale versions
+            <span className="muted" style={{ display: 'block', fontSize: 11 }}>
+              always just the newest version per namespace
+            </span>
+          </span>
+        </label>
+        {manifestFilter && (
+          <span className="cell-actions" style={{ alignItems: 'center' }}>
+            <span className="muted">
+              Filtered to SBOM <Hash value={manifestFilter} chars={16} />
+            </span>
+            <button
+              className="btn"
+              onClick={() => {
+                setManifestFilter('');
+                setPage(0);
+              }}
+            >
+              Clear
+            </button>
+          </span>
+        )}
+      </div>
+      {busy && <Spinner label="Loading findings…" />}
+      {error && <ErrorBox message={error} />}
+      {results !== null && results.length === 0 && !busy && (
+        <div className="muted">
+          No findings.
+          {dtrackEnabled && !dtrackSyncDisabled && (
+            <>
+              {' '}
+              If SBOMs were uploaded recently, they may not be fully processed yet — Dependency-Track checks
+              for new uploads every {formatSyncWaitTime(dtrackSyncIntervalSecs)}. Please wait and check back.
+            </>
+          )}
+        </div>
+      )}
+      {results !== null && results.length > 0 && (
+        <table className="table">
+          <thead>
+            <tr>
+              <th>severity</th>
+              <th>vulnerability</th>
+              <th>component</th>
+              <th>namespace / release</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {results.map((f) => {
+              const key = `${f.manifest_hash}-${f.finding_key}`;
+              const expanded = expandedKey === key;
+              return (
+                <React.Fragment key={key}>
+                  <tr
+                    className="row-clickable"
+                    onClick={() => setExpandedKey(expanded ? null : key)}
+                  >
+                    <td>
+                      <Badge ok={severityBadgeOk(f.severity)}>{f.severity}</Badge>
+                    </td>
+                    <td>
+                      <VulnerabilityId vulnerabilityId={f.vulnerability_id} />
+                      {f.vex_status && (
+                        <div className="muted">triaged: {f.vex_status}</div>
+                      )}
+                      {f.comment_count > 0 && (
+                        <div className="muted">
+                          {f.comment_count} comment{f.comment_count === 1 ? '' : 's'}
+                        </div>
+                      )}
+                    </td>
+                    <td>
+                      {f.component_name}
+                      {f.component_version ? `@${f.component_version}` : ''}
+                    </td>
+                    <td>
+                      {f.domain}
+                      {f.namespace} <span className="muted">{f.release_version}</span>
+                    </td>
+                    <td>
+                      <span className="cell-actions">
+                        {f.revoked && <Badge ok={false}>revoked</Badge>}
+                        <button
+                          className="btn"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onViewManifest(f.manifest_hash);
+                          }}
+                        >
+                          View SBOM
+                        </button>
+                      </span>
+                    </td>
+                  </tr>
+                  {expanded && (
+                    <tr>
+                      <td colSpan={5} className="findings-detail-cell">
+                        {f.description && <div className="muted">{f.description}</div>}
+                        <FindingTriageControls
+                          finding={f}
+                          manifestHash={f.manifest_hash}
+                          tenantId={tenantId}
+                          onSaved={load}
+                        />
+                        <FindingComments
+                          manifestHash={f.manifest_hash}
+                          findingKey={f.finding_key}
+                          tenantId={tenantId}
+                        />
+                      </td>
+                    </tr>
+                  )}
+                </React.Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+      {results !== null && (page > 0 || hasNextPage) && (
+        <div className="form-row" style={{ marginTop: 12, alignItems: 'center' }}>
+          <button className="btn" disabled={page === 0 || busy} onClick={() => setPage((p) => p - 1)}>
+            ← Previous
+          </button>
+          <span className="muted">Page {page + 1}</span>
+          <button className="btn" disabled={!hasNextPage || busy} onClick={() => setPage((p) => p + 1)}>
+            Next →
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ---------- Keys ----------
 
 function Keys() {
@@ -2350,6 +3210,7 @@ function Keys() {
   const [error, setError] = useState('');
   const [revokingId, setRevokingId] = useState<string | null>(null);
   const [revokeError, setRevokeError] = useState('');
+  const [showRevoked, setShowRevoked] = useState(false);
 
   const load = useCallback(() => {
     api.listKeys(tenantId)
@@ -2436,47 +3297,72 @@ function Keys() {
       <div className="card">
         <div className="card-header">
           <h2>{tenantId ? 'Keys for selected tenant' : 'Keys for your tenant'}</h2>
-          <button className="btn" onClick={load}>Refresh</button>
+          <span className="cell-actions">
+            <label className="checkbox-field" style={{ marginBottom: 0 }}>
+              <input
+                type="checkbox"
+                checked={showRevoked}
+                onChange={(e) => setShowRevoked(e.target.checked)}
+              />
+              <span>Show revoked</span>
+            </label>
+            <button className="btn" onClick={load}>Refresh</button>
+          </span>
         </div>
         {revokeError && <ErrorBox message={revokeError} />}
         {keys === null && <Spinner label="Loading keys…" />}
-        {keys && keys.length === 0 && <div className="muted">No keys.</div>}
-        {keys && keys.length > 0 && (
-          <table className="table">
-            <thead>
-              <tr>
-                <th>key id</th>
-                <th>scope</th>
-                <th>role</th>
-                <th>expires</th>
-                <th>revoked</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {keys.map((k) => (
-                <tr key={k.id}>
-                  <td title={k.id}>{k.id.slice(0, 8)}</td>
-                  <td>{k.namespace_scope}</td>
-                  <td>{k.role}</td>
-                  <td>{k.expires_at ? new Date(k.expires_at).toLocaleString() : 'never'}</td>
-                  <td><Badge ok={!k.revoked}>{k.revoked ? 'yes' : 'no'}</Badge></td>
-                  <td>
-                    {!k.revoked && (
-                      <button
-                        className="btn"
-                        disabled={revokingId === k.id}
-                        onClick={() => revoke(k.id)}
-                      >
-                        {revokingId === k.id ? 'Revoking…' : 'Revoke'}
-                      </button>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
+        {(() => {
+          const visibleKeys = keys
+            ? keys
+                .filter((k) => showRevoked || !k.revoked)
+                // Active first, revoked at the bottom — stable sort keeps
+                // each group in its original (creation) order.
+                .sort((a, b) => Number(a.revoked) - Number(b.revoked))
+            : null;
+          return (
+            <>
+              {visibleKeys && visibleKeys.length === 0 && (
+                <div className="muted">{keys && keys.length === 0 ? 'No keys.' : 'No active keys.'}</div>
+              )}
+              {visibleKeys && visibleKeys.length > 0 && (
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>key id</th>
+                      <th>scope</th>
+                      <th>role</th>
+                      <th>expires</th>
+                      <th>status</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {visibleKeys.map((k) => (
+                      <tr key={k.id}>
+                        <td title={k.id}>{k.id.slice(0, 8)}</td>
+                        <td>{k.namespace_scope}</td>
+                        <td>{k.role}</td>
+                        <td>{k.expires_at ? new Date(k.expires_at).toLocaleString() : 'never'}</td>
+                        <td>{k.revoked && <Badge ok={false}>revoked</Badge>}</td>
+                        <td>
+                          {!k.revoked && (
+                            <button
+                              className="btn"
+                              disabled={revokingId === k.id}
+                              onClick={() => revoke(k.id)}
+                            >
+                              {revokingId === k.id ? 'Revoking…' : 'Revoke'}
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </>
+          );
+        })()}
       </div>
     </div>
   );
@@ -2718,7 +3604,17 @@ function Audit() {
 
 // ---------- Settings (per-namespace "Currently running" visibility) ----------
 
-function Settings() {
+function Settings({
+  onDtrackSyncDisabledChange,
+}: {
+  /** The nav bar's Findings-tab visibility is computed from a separate copy
+   * of this same flag held by the top-level App component (fetched once,
+   * not re-derived from this component's own state) — without this
+   * callback, toggling it here would leave the nav showing/hiding the tab
+   * based on stale data until something else forced App to refetch (a
+   * tenant switch, a reload). */
+  onDtrackSyncDisabledChange?: (disabled: boolean) => void;
+}) {
   const tenantId = useTenantOverride();
   const [leaves, setLeaves] = useState<Leaf[] | null>(null);
   const [hiddenNamespaces, setHiddenNamespaces] = useState<Set<string>>(new Set());
@@ -2735,6 +3631,35 @@ function Settings() {
   const [snapshotVersion, setSnapshotVersion] = useState('');
   const [snapshotBusy, setSnapshotBusy] = useState(false);
   const [snapshotError, setSnapshotError] = useState('');
+  const [dtrackEnabled, setDtrackEnabled] = useState<boolean | null>(null);
+  const [dtrackSyncDisabled, setDtrackSyncDisabled] = useState<boolean | null>(null);
+  const [dtrackSyncBusy, setDtrackSyncBusy] = useState(false);
+  const [dtrackSyncError, setDtrackSyncError] = useState('');
+
+  useEffect(() => {
+    let mounted = true;
+    api.config().then((c) => mounted && setDtrackEnabled(c.dtrack_enabled)).catch(() => mounted && setDtrackEnabled(null));
+    api.dtrackSyncSetting(tenantId)
+      .then((s) => mounted && setDtrackSyncDisabled(s.disabled))
+      .catch(() => mounted && setDtrackSyncDisabled(null));
+    return () => {
+      mounted = false;
+    };
+  }, [tenantId]);
+
+  const toggleDtrackSync = async (disabled: boolean) => {
+    setDtrackSyncBusy(true);
+    setDtrackSyncError('');
+    try {
+      await api.setDtrackSyncSetting(disabled, tenantId);
+      setDtrackSyncDisabled(disabled);
+      onDtrackSyncDisabledChange?.(disabled);
+    } catch (e) {
+      setDtrackSyncError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDtrackSyncBusy(false);
+    }
+  };
 
   const toggleCurrentlyRunningView = (enabled: boolean) => {
     writeCurrentlyRunningViewEnabled(enabled);
@@ -2828,6 +3753,48 @@ function Settings() {
 
       <div className="card">
         <div className="card-header">
+          <h2>Dependency-Track</h2>
+        </div>
+        <p className="muted">
+          Whether an instance runs at all is deployment-wide — an operator either runs Dependency-Track
+          for the whole deployment or doesn't, set via the <code>DTRACK_URL</code>/<code>DTRACK_API_KEY</code>{' '}
+          environment variables, not configurable from here (see the README). Your own tenant can still
+          opt out of being synced even while the deployment runs it.
+        </p>
+        <div className="kv-row">
+          <span className="kv-label">Deployment sync</span>
+          {dtrackEnabled === null ? (
+            <span className="muted">unknown</span>
+          ) : (
+            <Badge ok={dtrackEnabled}>{dtrackEnabled ? 'enabled' : 'disabled'}</Badge>
+          )}
+          {dtrackEnabled === false && (
+            <span className="muted"> — the Findings tab is hidden while this is off</span>
+          )}
+        </div>
+        {dtrackEnabled && (
+          <div className="kv-row">
+            <span className="kv-label">This tenant</span>
+            <label className="checkbox-field">
+              <input
+                type="checkbox"
+                checked={dtrackSyncDisabled ?? false}
+                disabled={dtrackSyncBusy || dtrackSyncDisabled === null}
+                onChange={(e) => toggleDtrackSync(e.target.checked)}
+              />
+              Disable sync for this tenant
+            </label>
+            <span className="muted">
+              {' '}
+              — {dtrackSyncDisabled ? "this tenant's manifests are no longer pushed/refreshed, and cached findings are hidden from the SBOM overview until sync is re-enabled" : 'manifests are pushed and findings refreshed as normal'}
+            </span>
+          </div>
+        )}
+        {dtrackSyncError && <ErrorBox message={dtrackSyncError} />}
+      </div>
+
+      <div className="card">
+        <div className="card-header">
           <h2>Display preferences</h2>
         </div>
         <p className="muted">
@@ -2918,7 +3885,11 @@ function Settings() {
                 <tr key={s.profile_id}>
                   <td>
                     {s.profile_name}
-                    {s.description && <div className="muted" style={{ fontSize: '0.85em', marginTop: 2 }}>{s.description}</div>}
+                    {s.description && (
+                      <div className="muted" style={{ fontSize: '0.85em', marginTop: 2, whiteSpace: 'normal' }}>
+                        {s.description}
+                      </div>
+                    )}
                   </td>
                   <td>
                     <label className="checkbox-field">
@@ -3087,9 +4058,18 @@ export default function App() {
   const [treeHead, setTreeHead] = useState<TreeHead | null>(null);
   const [headError, setHeadError] = useState('');
   const [pendingSbomHash, setPendingSbomHash] = useState<string | undefined>(undefined);
+  const [pendingFindingsManifestHash, setPendingFindingsManifestHash] = useState<string | undefined>(undefined);
   const [whoami, setWhoami] = useState<WhoAmI | null>(null);
   const [checkingKey, setCheckingKey] = useState(false);
   const [keyError, setKeyError] = useState('');
+  // Deployment-wide, not per-tenant (see DTRACK_PLAN.md) — gates the
+  // Findings tab out of the nav entirely when the integration is off,
+  // rather than showing a tab that can only ever be empty.
+  const [dtrackEnabled, setDtrackEnabled] = useState(false);
+  // This tenant's own opt-out (see DTRACK_PLAN.md's per-tenant toggle) —
+  // also gates the Findings tab out of the nav, same reasoning: if this
+  // tenant has turned sync off, there's nothing new to browse there either.
+  const [dtrackSyncDisabled, setDtrackSyncDisabled] = useState(false);
   // Seeded from the URL, not '', so the URL-sync effect below doesn't
   // immediately strip a bookmarked ?tenant= before whoami gets a chance to
   // read and confirm it (that race made the tenant silently reset to the
@@ -3159,6 +4139,34 @@ export default function App() {
     };
   }, [apiKey]);
 
+  useEffect(() => {
+    if (!apiKey) {
+      setDtrackEnabled(false);
+      return;
+    }
+    let mounted = true;
+    api.config()
+      .then((c) => mounted && setDtrackEnabled(c.dtrack_enabled))
+      .catch(() => mounted && setDtrackEnabled(false));
+    return () => {
+      mounted = false;
+    };
+  }, [apiKey]);
+
+  useEffect(() => {
+    if (!apiKey || !whoami) {
+      setDtrackSyncDisabled(false);
+      return;
+    }
+    let mounted = true;
+    api.dtrackSyncSetting(viewTenantId || undefined)
+      .then((s) => mounted && setDtrackSyncDisabled(s.disabled))
+      .catch(() => mounted && setDtrackSyncDisabled(false));
+    return () => {
+      mounted = false;
+    };
+  }, [apiKey, whoami, viewTenantId]);
+
   const refreshHead = useCallback(() => {
     if (!whoami || !roleCan(whoami.role, 'read')) {
       setTreeHead(null);
@@ -3206,7 +4214,11 @@ export default function App() {
 
   const logOut = () => applyKey('');
 
-  const visibleTabs = whoami ? TABS.filter((t) => roleCan(whoami.role, t.requires)) : [];
+  const visibleTabs = whoami
+    ? TABS.filter(
+        (t) => roleCan(whoami.role, t.requires) && (t.id !== 'findings' || (dtrackEnabled && !dtrackSyncDisabled))
+      )
+    : [];
   const workspaceTabs = visibleTabs.filter((t) => t.group === 'workspace');
   const adminTabs = visibleTabs.filter((t) => t.group === 'admin');
 
@@ -3219,7 +4231,7 @@ export default function App() {
       setTab(visibleTabs[0].id);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, whoami]);
+  }, [tab, whoami, dtrackEnabled, dtrackSyncDisabled]);
 
   if (!whoami) {
     return (
@@ -3314,14 +4326,31 @@ export default function App() {
                     setTab('leaves');
                   }
                 }}
+                onOpenTools={roleCan(whoami.role, 'read') ? () => setTab('tools') : undefined}
               />
             )}
+            {tab === 'tools' && roleCan(whoami.role, 'read') && <Tools />}
             {tab === 'leaves' && roleCan(whoami.role, 'read') && (
-              <Leaves initialSelectedHash={pendingSbomHash} />
+              <Leaves
+                initialSelectedHash={pendingSbomHash}
+                onViewFindings={(hash) => {
+                  setPendingFindingsManifestHash(hash);
+                  setTab('findings');
+                }}
+              />
             )}
             {tab === 'proofs' && roleCan(whoami.role, 'read') && <Proofs treeHead={treeHead} />}
             {tab === 'search' && roleCan(whoami.role, 'read') && (
               <ComponentSearch
+                onViewManifest={(hash) => {
+                  setPendingSbomHash(hash);
+                  setTab('leaves');
+                }}
+              />
+            )}
+            {tab === 'findings' && roleCan(whoami.role, 'read') && (
+              <Findings
+                initialManifestHash={pendingFindingsManifestHash}
                 onViewManifest={(hash) => {
                   setPendingSbomHash(hash);
                   setTab('leaves');
@@ -3333,7 +4362,9 @@ export default function App() {
               <Tenants isPlatform={whoami.is_platform_tenant} tenants={tenants} refreshTenants={refreshTenants} />
             )}
             {tab === 'audit' && roleCan(whoami.role, 'read') && <Audit />}
-            {tab === 'settings' && roleCan(whoami.role, 'manage_settings') && <Settings />}
+            {tab === 'settings' && roleCan(whoami.role, 'manage_settings') && (
+              <Settings onDtrackSyncDisabledChange={setDtrackSyncDisabled} />
+            )}
           </main>
         </div>
       </div>

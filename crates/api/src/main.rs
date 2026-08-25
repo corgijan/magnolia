@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use magnolia_api::{create_router, AppState};
+use magnolia_api::{create_router, run_sync_loop, AppState};
 use magnolia_audit::AuditLogger;
 use magnolia_core::MerkleTree;
 use magnolia_db::Database;
+use magnolia_dtrack::DtrackClient;
 use magnolia_signer::LocalFileSigner;
 use magnolia_storage::{FileStore, InMemoryStore, ObjectStore};
 use tokio::sync::Mutex;
@@ -70,15 +71,68 @@ async fn main() {
         tracing::warn!("DEV_MODE=true — RBAC is relaxed for manifest revocation; never set this in production");
     }
 
+    // Optional, deployment-wide (not per-tenant) — an operator either runs a
+    // dtrack instance or doesn't, same presence-gated pattern as
+    // STORAGE_PATH/SIGNING_KEY_PATH above. Both env vars must be set and
+    // non-empty for the integration to turn on.
+    //
+    // DTRACK_API_KEY_FILE is the fully-automatic path (see
+    // docker-compose.dtrack.yml): a one-shot bootstrap container mints the
+    // key and writes it to a shared volume *before* this container starts
+    // (`depends_on: condition: service_completed_successfully`), so reading
+    // it fresh at our own startup is enough — no restart of this process
+    // needed. A plain DTRACK_API_KEY env var still wins if both are set.
+    let dtrack_url = std::env::var("DTRACK_URL").ok().filter(|s| !s.is_empty());
+    let dtrack_api_key = std::env::var("DTRACK_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let path = std::env::var("DTRACK_API_KEY_FILE").ok()?;
+            let key = std::fs::read_to_string(&path).ok()?.trim().to_string();
+            if key.is_empty() {
+                None
+            } else {
+                tracing::info!(path = %path, "read Dependency-Track API key from DTRACK_API_KEY_FILE");
+                Some(key)
+            }
+        });
+    let dtrack = match (dtrack_url, dtrack_api_key) {
+        (Some(url), Some(key)) => {
+            tracing::info!(url = %url, "Dependency-Track integration enabled");
+            Some(Arc::new(DtrackClient::new(url, key)))
+        }
+        _ => {
+            tracing::info!("DTRACK_URL/DTRACK_API_KEY not both set — Dependency-Track integration disabled");
+            None
+        }
+    };
+
+    let dtrack_sync_interval_secs = std::env::var("DTRACK_SYNC_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(600);
+
+    let db = Arc::new(db);
     let state = AppState {
-        db: Arc::new(db),
-        storage,
+        db: Arc::clone(&db),
+        storage: Arc::clone(&storage),
         signer,
         trees: Arc::new(Mutex::new(trees)),
         audit: Arc::new(AuditLogger::new()),
         dev_mode,
         storage_backend,
+        dtrack: dtrack.clone(),
+        dtrack_sync_interval_secs,
     };
+
+    if let Some(client) = dtrack {
+        tokio::spawn(run_sync_loop(
+            db,
+            storage,
+            client,
+            std::time::Duration::from_secs(dtrack_sync_interval_secs),
+        ));
+    }
 
     let app = create_router(state);
     let addr = std::env::var("SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());

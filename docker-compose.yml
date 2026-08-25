@@ -46,11 +46,77 @@ services:
       # lets an uploader-role key revoke its own manifests, not just
       # domain_admin/auditor/super_admin). Never set this in production.
       DEV_MODE: "true"
+      # Optional, deployment-wide Dependency-Track integration (see
+      # DTRACK_PLAN.md) — only takes effect when the "dtrack" profile is
+      # also started (`docker compose --profile dtrack up`). DTRACK_URL
+      # points at the dependency-track service below. DTRACK_API_KEY is read
+      # from a local .env file (git-ignored — never commit a real key here),
+      # written automatically by `scripts/bootstrap-dtrack.sh` after the
+      # one-time manual bootstrap dtrack itself requires (it has no way to
+      # pre-provision a key via env vars alone — see README). Defaults to
+      # empty via the `:-` fallback when .env doesn't set it, which keeps
+      # the integration disabled even if dependency-track is running.
+      DTRACK_URL: http://dependency-track:8080
+      DTRACK_API_KEY: "${DTRACK_API_KEY:-}"
+      DTRACK_SYNC_INTERVAL_SECS: "${DTRACK_SYNC_INTERVAL_SECS:-600}"
     ports:
       - "3000:3000"
     volumes:
       - signing_key:/data
 
+  # ---- Optional Dependency-Track integration (docker compose --profile dtrack up) ----
+  # Not started by a plain `docker compose up` — opt-in only. See
+  # DTRACK_PLAN.md for the full design and the one-time bootstrap steps.
+
+  dtrack-db:
+    image: postgres:15
+    profiles: ["dtrack"]
+    environment:
+      POSTGRES_USER: dtrack
+      POSTGRES_PASSWORD: dtrack
+      POSTGRES_DB: dtrack
+    volumes:
+      - dtrack_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dtrack"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  dependency-track:
+    # Pinned to a real version tag, not :latest — verify against
+    # https://hub.docker.com/r/dependencytrack/apiserver/tags for a newer
+    # stable release before deploying.
+    image: dependencytrack/apiserver:5.0.5
+    profiles: ["dtrack"]
+    depends_on:
+      dtrack-db:
+        condition: service_healthy
+    environment:
+      # External-Postgres env var names for dependencytrack/apiserver 5.x —
+      # v5 renamed these from the legacy alpine.database.* properties
+      # (confirmed against the official upgrade guide: ALPINE_DATABASE_URL
+      # -> DT_DATASOURCE_URL, ALPINE_DATABASE_USERNAME ->
+      # DT_DATASOURCE_USERNAME, ALPINE_DATABASE_PASSWORD ->
+      # DT_DATASOURCE_PASSWORD). v4.x needed ALPINE_DATABASE_MODE/
+      # ALPINE_DATABASE_DRIVER too; v5 dropped both — the driver is now
+      # inferred from the JDBC URL scheme and there's no more embedded-vs-
+      # external "mode" to pick. If you pin back to a 4.x image, revert to
+      # the ALPINE_DATABASE_* names (see git history) instead.
+      DT_DATASOURCE_URL: jdbc:postgresql://dtrack-db:5432/dtrack
+      DT_DATASOURCE_USERNAME: dtrack
+      DT_DATASOURCE_PASSWORD: dtrack
+    ports:
+      - "8080:8080"
+    volumes:
+      - dtrack_data:/data
+    # dependencytrack/frontend is deliberately not included — Magnolia's
+    # own UI is the intended findings surface; the dtrack web UI is only
+    # useful for the one-time manual bootstrap (see README), reachable
+    # directly against this service's REST API without it.
+
 volumes:
   db_data:
   signing_key:
+  dtrack_db_data:
+  dtrack_data:

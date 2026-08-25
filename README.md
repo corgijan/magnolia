@@ -149,6 +149,7 @@ Response:
 | GET | `/api/v1/leaves?limit=&offset=` | auditor, domain_admin, super_admin | Recent leaves for your tenant, filtered to your key's `namespace_scope` (newest first) |
 | GET | `/api/v1/manifest/:manifest_hash` | auditor, domain_admin, super_admin | Manifest record + SBOM content (hex) — 404 if it belongs to another tenant or is outside your `namespace_scope` |
 | POST | `/api/v1/manifest/:manifest_hash/revoke` | auditor, domain_admin, super_admin (+ uploader if `DEV_MODE=true`) | Marks a manifest revoked — a status flag, not a delete; nothing is removed from the log or the Merkle tree. 400 if already revoked. |
+| POST | `/api/v1/manifest/:manifest_hash/findings/:finding_key/triage` | auditor, domain_admin, super_admin | Sets Magnolia's own VEX-status triage (see "Optional: Dependency-Track integration" below) on one cached finding. 400 if `vex_status` isn't one of the four VEX values, or if it's `not_affected` without a `justification`. 404 if the finding no longer exists (e.g. resolved by a later dtrack sync). |
 | POST | `/api/v1/keys` | domain_admin, super_admin | Create a key for your own tenant (key shown once) |
 | GET | `/api/v1/keys` | domain_admin, super_admin | List keys for your tenant |
 | POST | `/api/v1/keys/:key_id/revoke` | domain_admin, super_admin | Revoke a key belonging to your own tenant (irreversible) |
@@ -268,6 +269,91 @@ cd frontend && npm install && npm start
    From here on, every *other* tenant is self-service: a super_admin calls
    `POST /api/v1/tenants` (or uses the Tenants tab in the UI), which creates
    the tenant and mints its first `domain_admin` key in one step.
+
+### Optional: Dependency-Track integration
+
+Magnolia can optionally push uploaded CycloneDX SBOMs to a self-hosted
+[OWASP Dependency-Track](https://dependencytrack.org/) instance and cache its
+vulnerability findings, surfaced directly in the SBOM detail view — SBOMs
+themselves deliberately carry no vulnerability data (it's dynamic; SBOM
+content is static), so this closes that gap. This is **deployment-wide and
+env-var-gated, not a per-tenant setting** — an operator either runs a dtrack
+instance for the whole deployment or doesn't.
+
+**Not started by a plain `docker compose up`.** Two ways to turn it on:
+
+**Fully automatic (recommended)** — `docker-compose.dtrack.yml` starts
+`dtrack-db`/`dependency-track` (no `--profile` flag needed) *and* runs the
+one-time bootstrap dtrack itself requires (see below) via a one-shot init
+container, writing the resulting API key to a volume `api` reads at its own
+startup. Genuinely one command, including on a completely fresh volume,
+and safe to re-run (idempotent — reuses an already-bootstrapped password
+and an already-minted key rather than redoing either):
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dtrack.yml up -d
+```
+If bootstrap ever fails (dtrack slow to start, network hiccup, etc.) it's
+logged clearly by the `dtrack-bootstrap` service, but `api` still starts
+normally with the integration simply left disabled — dtrack is optional and
+must never block Magnolia's own core service from coming up.
+`docker-compose.yml` alone (no `-f docker-compose.dtrack.yml`) is completely
+unaffected either way — dtrack stays off by default.
+
+**Manual, if you'd rather control it yourself** — start just the containers
+via the profile, then run the bootstrap script by hand:
+```bash
+docker compose --profile dtrack up -d
+DTRACK_ADMIN_PASSWORD='pick-one' ./scripts/bootstrap-dtrack.sh
+docker compose --profile dtrack up -d api   # pick up the new key
+```
+Either way, give dtrack a while to finish its first-boot
+vulnerability-database sync before expecting real findings.
+
+**What the bootstrap actually does (dtrack itself requires this; verified
+there's no env var or config property on dtrack's side to skip it — see
+`DTRACK_PLAN.md`'s "Confidence check" section):** dtrack creates a default
+`admin`/`admin` account on first boot with a forced password change, and an
+API key can only be minted through its own REST API/UI, not pre-provisioned
+via env vars. The bootstrap (whether run automatically by
+`docker-compose.dtrack.yml` or by hand via the script) changes the
+password, grants the `Automation` team the three permissions actually
+needed (verified live: `BOM_UPLOAD` alone is **not** enough for
+`autoCreate` to work; it also needs `PROJECT_CREATION_UPLOAD`, plus
+`VIEW_VULNERABILITY` for findings-read), and generates an API key. In
+manual mode the key lands in a local `.env` file (git-ignored) that
+`docker-compose.yml` reads via `${DTRACK_API_KEY:-}`; in automatic mode it
+lands on a shared volume that `api` reads via `DTRACK_API_KEY_FILE`. Run by
+hand, it's safe to re-run with the same `DTRACK_ADMIN_PASSWORD` — it
+detects an already-changed password and an already-granted permission and
+skips them; pass `--new-key` to mint a fresh API key instead of reusing the
+existing one. Until a key is actually wired in, the integration silently
+stays disabled (`dtrack_enabled: false` in `GET /api/v1/config`) even with
+`dependency-track` running.
+
+**Multi-tenancy caveat:** a single shared dtrack instance has no concept of
+Magnolia's tenant boundaries — all tenants' BOMs land in the same dtrack
+project list, visible to anyone holding the shared `DTRACK_API_KEY` or
+dtrack admin login. Magnolia's own API stays correctly tenant-scoped
+(findings are only ever looked up by `manifest_hash`, after the existing
+tenant-ownership check), so there's no cross-tenant leak through Magnolia
+itself — but dtrack's own admin surface is a shared resource across the
+whole deployment.
+
+**VEX-style triage.** Beyond dtrack's own findings, Magnolia lets an
+analyst set a VEX status per finding — `affected`, `not_affected`, `fixed`,
+or `under_investigation` — with a justification, tracked to who/when. This
+is Magnolia's own product-specific exploitability judgment (e.g. "this
+vulnerable component isn't reachable in our build"), independent of
+dtrack's own generic analysis state — the two can legitimately disagree.
+`not_affected` requires a non-empty `justification`; every other status
+does not. Every triage action is also recorded in `GET /api/v1/audit-logs`.
+
+```bash
+env:
+  DTRACK_URL: http://dependency-track:8080   # set automatically in docker-compose.yml
+  DTRACK_API_KEY: ""                          # fill in after the bootstrap step above
+  DTRACK_SYNC_INTERVAL_SECS: "600"            # optional, defaults to 600
+```
 
 ### Migrations
 

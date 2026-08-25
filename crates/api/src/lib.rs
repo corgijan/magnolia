@@ -1,9 +1,11 @@
+mod dtrack_sync;
 mod errors;
 mod handlers;
 mod snapshot;
 mod state;
 mod auth;
 
+pub use dtrack_sync::{run_sync_loop, sync_now};
 pub use errors::ApiError;
 pub use state::AppState;
 pub use auth::AuthGrant;
@@ -47,6 +49,14 @@ pub fn create_router(state: AppState) -> Router {
             post(handlers::revoke_manifest),
         )
         .route(
+            "/api/v1/manifest/:manifest_hash/findings/:finding_key/triage",
+            post(handlers::triage_finding),
+        )
+        .route(
+            "/api/v1/manifest/:manifest_hash/findings/:finding_key/comments",
+            get(handlers::list_finding_comments).post(handlers::add_finding_comment),
+        )
+        .route(
             "/api/v1/manifests/current",
             get(handlers::current_manifests),
         )
@@ -55,8 +65,16 @@ pub fn create_router(state: AppState) -> Router {
             get(handlers::list_hidden_namespaces).post(handlers::set_namespace_hidden),
         )
         .route(
+            "/api/v1/settings/dtrack-sync",
+            get(handlers::dtrack_sync_setting).post(handlers::set_dtrack_sync_setting),
+        )
+        .route(
             "/api/v1/compliance/profiles",
             get(handlers::list_compliance_profiles),
+        )
+        .route(
+            "/api/v1/tools/compliance-check",
+            post(handlers::check_compliance),
         )
         .route(
             "/api/v1/compliance/settings",
@@ -71,6 +89,8 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/search/reindex",
             post(handlers::reindex_components),
         )
+        .route("/api/v1/findings", get(handlers::list_findings))
+        .route("/api/v1/dtrack/sync", post(handlers::force_dtrack_sync))
         .route(
             "/api/v1/keys",
             get(handlers::list_keys).post(handlers::create_key),

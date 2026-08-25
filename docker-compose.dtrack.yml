@@ -1,0 +1,73 @@
+# Override that starts AND fully enables the optional Dependency-Track
+# integration (see README's "Optional: Dependency-Track integration" and
+# DTRACK_PLAN.md) in one command — no --profile flag, no manual bootstrap
+# step. A one-shot init container (dtrack-bootstrap) runs the exact same
+# sequence scripts/bootstrap-dtrack.sh does by hand, and `api` reads the
+# resulting key straight off a shared volume (DTRACK_API_KEY_FILE) at its
+# own startup, which only happens after bootstrap has finished successfully.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.dtrack.yml up -d
+#
+# Plain `docker compose up` (docker-compose.yml alone) is completely
+# unaffected — this file is only ever used when explicitly included.
+#
+# Safe to re-run / tear down and bring back up: the bootstrap script is
+# idempotent (reuses an already-changed admin password, reuses an
+# already-minted key on the shared volume rather than minting a new one
+# each time).
+services:
+  # The base compose file gates these behind `profiles: ["dtrack"]" so a
+  # plain `docker compose up` never starts them — this override removes
+  # that gate for the two files it's used with, no --profile flag needed.
+  dtrack-db:
+    profiles: !override []
+
+  dependency-track:
+    profiles: !override []
+
+  dtrack-bootstrap:
+    image: python:3-alpine
+    depends_on:
+      dependency-track:
+        condition: service_started
+    environment:
+      DTRACK_URL: http://dependency-track:8080
+      # Only matters if you want to log into dtrack's own web UI directly —
+      # the API key Magnolia actually uses is minted and wired in
+      # automatically either way. Override via .env if you care to log in.
+      DTRACK_ADMIN_PASSWORD: "${DTRACK_ADMIN_PASSWORD:-change-me-dtrack-admin}"
+      DTRACK_BOOTSTRAP_KEY_FILE: /dtrack-key/api-key
+    volumes:
+      - ./scripts/bootstrap-dtrack.sh:/bootstrap-dtrack.sh:ro
+      - dtrack_key:/dtrack-key
+    # A failure here must never block Magnolia's own api service from
+    # starting — dtrack is an optional integration. Log clearly and always
+    # exit 0, so api's `service_completed_successfully` dependency below is
+    # satisfied either way; api just comes up with dtrack disabled (no key
+    # file written) if bootstrap ever fails.
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -u
+        apk add --no-cache bash curl > /dev/null
+        if bash /bootstrap-dtrack.sh; then
+          echo "dtrack bootstrap succeeded"
+        else
+          echo "dtrack bootstrap FAILED -- api will start with Dependency-Track disabled; see the log above and scripts/bootstrap-dtrack.sh" >&2
+        fi
+        exit 0
+
+  api:
+    depends_on:
+      dtrack-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      DTRACK_URL: http://dependency-track:8080
+      DTRACK_API_KEY_FILE: /dtrack-key/api-key
+    volumes:
+      - dtrack_key:/dtrack-key:ro
+
+volumes:
+  dtrack_key:

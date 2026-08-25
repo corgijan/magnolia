@@ -2,9 +2,10 @@ mod models;
 mod errors;
 
 pub use models::{
-    ApiKeyRecord, AuditLogRecord, ComplianceSettingRecord, ManifestRecord, MerkleLeafRecord,
-    MerkleNodeRecord, NewSbomComponent, SbomComponentSearchRow, SignedTreeHeadRecord,
-    TenantRecord,
+    ApiKeyRecord, AuditLogRecord, ComplianceSettingRecord, DtrackFindingRecord,
+    DtrackFindingWithContextRecord, DtrackProjectRecord, DtrackPushFailureRecord,
+    FindingCommentRecord, ManifestRecord, MerkleLeafRecord, MerkleNodeRecord, NewDtrackFinding,
+    NewSbomComponent, SbomComponentSearchRow, SignedTreeHeadRecord, TenantRecord,
 };
 pub use errors::DbError;
 
@@ -88,7 +89,7 @@ impl Database {
 
     pub async fn get_tenant(&self, id: Uuid) -> Result<Option<TenantRecord>, DbError> {
         sqlx::query_as::<_, TenantRecord>(
-            "SELECT id, domain, name, created_by, created_at, is_platform, hidden FROM tenants WHERE id = $1",
+            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled FROM tenants WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -101,7 +102,7 @@ impl Database {
         domain: &str,
     ) -> Result<Option<TenantRecord>, DbError> {
         sqlx::query_as::<_, TenantRecord>(
-            "SELECT id, domain, name, created_by, created_at, is_platform, hidden FROM tenants WHERE domain = $1",
+            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled FROM tenants WHERE domain = $1",
         )
         .bind(domain)
         .fetch_optional(&self.pool)
@@ -115,11 +116,25 @@ impl Database {
     /// reachable directly (e.g. `?tenant_id=` override), just not listed.
     pub async fn list_tenants(&self) -> Result<Vec<TenantRecord>, DbError> {
         sqlx::query_as::<_, TenantRecord>(
-            "SELECT id, domain, name, created_by, created_at, is_platform, hidden FROM tenants WHERE hidden = FALSE ORDER BY created_at DESC",
+            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled FROM tenants WHERE hidden = FALSE ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
         .await
         .map_err(|e| DbError::QueryError(e.to_string()))
+    }
+
+    /// Per-tenant opt-out of the deployment-wide dtrack sync (see the
+    /// `dtrack_sync_disabled` migration comment) — does not touch any
+    /// already-cached `dtrack_findings`, only whether future sync passes
+    /// push/refresh this tenant's manifests.
+    pub async fn set_tenant_dtrack_sync_disabled(&self, tenant_id: Uuid, disabled: bool) -> Result<(), DbError> {
+        sqlx::query("UPDATE tenants SET dtrack_sync_disabled = $1 WHERE id = $2")
+            .bind(disabled)
+            .bind(tenant_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DbError::QueryError(e.to_string()))?;
+        Ok(())
     }
 
     /// Marks a tenant hidden instead of deleting it — used outside
@@ -868,5 +883,450 @@ impl Database {
         .map_err(|e| DbError::QueryError(e.to_string()))?;
 
         Ok(result.rows_affected() > 0)
+    }
+
+    // ---- Dependency-Track integration ----
+
+    /// Manifests still needing a dtrack project pushed — CycloneDX only for
+    /// v1 (dtrack's SPDX BOM support is unverified), and never revoked
+    /// manifests (nothing to gain from scanning something already
+    /// superseded). `tenant_id: None` means every tenant (the periodic
+    /// loop's own pass); `Some(id)` scopes to one tenant (the "force sync
+    /// now" button, so a tenant can only ever trigger work for its own
+    /// archive, not everyone else's).
+    pub async fn list_manifests_without_dtrack_project(
+        &self,
+        tenant_id: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<ManifestRecord>, DbError> {
+        sqlx::query_as::<_, ManifestRecord>(
+            r#"
+            SELECT m.manifest_hash, m.leaf_seq_id, m.tenant_id, m.version, m.sbom_hash, m.sbom_format,
+                   m.sbom_s3_key, m.namespace, m.previous_manifest_hash, m.signature, m.dsse_envelope, m.document_type, m.created_by, m.created_at,
+                   m.revoked, m.revoked_at, m.revoked_by
+            FROM manifests m
+            JOIN tenants t ON t.id = m.tenant_id
+            WHERE m.sbom_format = 'cyclonedx'
+              AND m.revoked = FALSE
+              AND t.dtrack_sync_disabled = FALSE
+              AND ($1::uuid IS NULL OR m.tenant_id = $1)
+              AND m.manifest_hash NOT IN (SELECT manifest_hash FROM dtrack_projects)
+            ORDER BY m.created_at
+            LIMIT $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    pub async fn insert_dtrack_project(&self, manifest_hash: &str, project_uuid: Uuid) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO dtrack_projects (manifest_hash, dtrack_project_uuid) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(manifest_hash)
+        .bind(project_uuid)
+        .execute(&self.pool)
+        .await
+        .map_err(map_query_error)?;
+        Ok(())
+    }
+
+    /// Looks up whether this manifest has a dtrack project at all, and if
+    /// so, whether it's ever been refreshed (`last_synced_at`) — lets a
+    /// caller distinguish "not synced yet, still pending" from "synced and
+    /// genuinely has zero findings" instead of treating an empty
+    /// `dtrack_findings` result as always meaning the former (see
+    /// `manifest()`'s `dtrack_synced_at` field).
+    pub async fn get_dtrack_project(&self, manifest_hash: &str) -> Result<Option<DtrackProjectRecord>, DbError> {
+        sqlx::query_as::<_, DtrackProjectRecord>(
+            "SELECT manifest_hash, dtrack_project_uuid, pushed_at, last_synced_at
+             FROM dtrack_projects WHERE manifest_hash = $1",
+        )
+        .bind(manifest_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// Records why a manifest's push to dtrack failed, replacing any
+    /// earlier failure — called from `push_phase` on every failed attempt,
+    /// so a permanent rejection (dtrack will never accept this content) is
+    /// visible instead of looking identical to "hasn't been picked up yet".
+    pub async fn record_dtrack_push_failure(&self, manifest_hash: &str, error: &str) -> Result<(), DbError> {
+        sqlx::query(
+            r#"
+            INSERT INTO dtrack_push_failures (manifest_hash, error, failed_at)
+            VALUES ($1, $2, now())
+            ON CONFLICT (manifest_hash) DO UPDATE SET error = EXCLUDED.error, failed_at = EXCLUDED.failed_at
+            "#,
+        )
+        .bind(manifest_hash)
+        .bind(error)
+        .execute(&self.pool)
+        .await
+        .map_err(map_query_error)?;
+        Ok(())
+    }
+
+    /// Clears a manifest's recorded push failure — called from `push_phase`
+    /// as soon as a push succeeds, since the manifest is no longer stuck.
+    pub async fn clear_dtrack_push_failure(&self, manifest_hash: &str) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM dtrack_push_failures WHERE manifest_hash = $1")
+            .bind(manifest_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(map_query_error)?;
+        Ok(())
+    }
+
+    pub async fn get_dtrack_push_failure(
+        &self,
+        manifest_hash: &str,
+    ) -> Result<Option<DtrackPushFailureRecord>, DbError> {
+        sqlx::query_as::<_, DtrackPushFailureRecord>(
+            "SELECT manifest_hash, error, failed_at FROM dtrack_push_failures WHERE manifest_hash = $1",
+        )
+        .bind(manifest_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// Self-heal for a project dtrack no longer knows about (e.g. its own
+    /// database was reset independently of Magnolia's) — called when a
+    /// refresh pass gets a 404 for a project. Deleting the stale record
+    /// makes the manifest eligible for `list_manifests_without_dtrack_project`
+    /// again, so the next push phase re-creates the project from scratch
+    /// instead of 404ing on the same dead UUID forever.
+    pub async fn delete_dtrack_project(&self, manifest_hash: &str) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM dtrack_projects WHERE manifest_hash = $1")
+            .bind(manifest_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(map_query_error)?;
+        Ok(())
+    }
+
+    /// Stalest-first (`last_synced_at ASC NULLS FIRST`) so never-synced
+    /// projects always get priority each pass.
+    /// Excludes projects whose manifest belongs to a tenant that has since
+    /// disabled dtrack sync (`dtrack_sync_disabled`) — refresh stops for
+    /// that tenant going forward, but existing cached `dtrack_findings`
+    /// rows are left untouched (not deleted) so the archive detail view
+    /// keeps showing whatever was last synced, same "mark, don't delete"
+    /// idiom as `list_manifests_without_dtrack_project`. Same `tenant_id`
+    /// scoping convention as that method: `None` = every tenant (periodic
+    /// loop), `Some(id)` = just one (force-sync button).
+    pub async fn list_dtrack_projects(
+        &self,
+        tenant_id: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<DtrackProjectRecord>, DbError> {
+        sqlx::query_as::<_, DtrackProjectRecord>(
+            r#"
+            SELECT dp.manifest_hash, dp.dtrack_project_uuid, dp.pushed_at, dp.last_synced_at
+            FROM dtrack_projects dp
+            JOIN manifests m ON m.manifest_hash = dp.manifest_hash
+            JOIN tenants t ON t.id = m.tenant_id
+            WHERE t.dtrack_sync_disabled = FALSE
+              AND ($1::uuid IS NULL OR m.tenant_id = $1)
+            ORDER BY dp.last_synced_at ASC NULLS FIRST
+            LIMIT $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    pub async fn touch_dtrack_project_synced(&self, manifest_hash: &str) -> Result<(), DbError> {
+        sqlx::query("UPDATE dtrack_projects SET last_synced_at = now() WHERE manifest_hash = $1")
+            .bind(manifest_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(map_query_error)?;
+        Ok(())
+    }
+
+    /// Replaces the cached findings for one manifest with a fresh set from
+    /// dtrack. Findings no longer present (remediated, reanalyzed away) are
+    /// deleted; findings still present are upserted rather than
+    /// delete-then-inserted, so an analyst's `vex_status`/`vex_justification`/
+    /// `triaged_by`/`triaged_at` on a still-present finding survives a
+    /// routine sync pass instead of being silently wiped.
+    pub async fn replace_dtrack_findings(
+        &self,
+        manifest_hash: &str,
+        findings: &[NewDtrackFinding],
+    ) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await.map_err(map_query_error)?;
+
+        let keys: Vec<String> = findings.iter().map(|f| f.finding_key.clone()).collect();
+        sqlx::query("DELETE FROM dtrack_findings WHERE manifest_hash = $1 AND NOT (finding_key = ANY($2))")
+            .bind(manifest_hash)
+            .bind(&keys)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_query_error)?;
+
+        for f in findings {
+            sqlx::query(
+                r#"
+                INSERT INTO dtrack_findings
+                    (manifest_hash, finding_key, component_name, component_version,
+                     vulnerability_id, severity, description, analysis_state, synced_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+                ON CONFLICT (manifest_hash, finding_key)
+                DO UPDATE SET component_name = EXCLUDED.component_name,
+                               component_version = EXCLUDED.component_version,
+                               vulnerability_id = EXCLUDED.vulnerability_id,
+                               severity = EXCLUDED.severity,
+                               description = EXCLUDED.description,
+                               analysis_state = EXCLUDED.analysis_state,
+                               synced_at = EXCLUDED.synced_at
+                "#,
+            )
+            .bind(manifest_hash)
+            .bind(&f.finding_key)
+            .bind(&f.component_name)
+            .bind(&f.component_version)
+            .bind(&f.vulnerability_id)
+            .bind(&f.severity)
+            .bind(&f.description)
+            .bind(&f.analysis_state)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_query_error)?;
+        }
+
+        tx.commit().await.map_err(map_query_error)?;
+        Ok(())
+    }
+
+    pub async fn list_dtrack_findings(&self, manifest_hash: &str) -> Result<Vec<DtrackFindingRecord>, DbError> {
+        sqlx::query_as::<_, DtrackFindingRecord>(
+            r#"
+            SELECT manifest_hash, finding_key, component_name, component_version,
+                   vulnerability_id, severity, description, analysis_state, synced_at,
+                   vex_status, vex_justification, triaged_by, triaged_at
+            FROM dtrack_findings
+            WHERE manifest_hash = $1
+            ORDER BY severity, vulnerability_id
+            "#,
+        )
+        .bind(manifest_hash)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// Every cached finding across the tenant's archive (within
+    /// `namespace_scope`), for the standalone Findings tab — unlike
+    /// `list_dtrack_findings` above, which is always scoped to one
+    /// already-known, already-authorized manifest. Severity filter is
+    /// case-insensitive exact match (dtrack's own vocabulary is uppercase,
+    /// e.g. "CRITICAL"/"HIGH", but this doesn't assume callers get the case
+    /// right). Critical-first ordering, since this view exists for triage
+    /// review — most-urgent-first is far more useful here than the
+    /// alphabetical order `list_dtrack_findings` uses for a single
+    /// manifest's much shorter list.
+    pub async fn list_findings_for_tenant(
+        &self,
+        tenant_id: Uuid,
+        namespace_scope: &str,
+        severity: Option<&str>,
+        manifest_hash: Option<&str>,
+        namespace_filter: Option<&str>,
+        release_version_filter: Option<&str>,
+        // "untriaged" matches vex_status IS NULL; any other value is
+        // matched exactly against the vex_status column.
+        vex_status_filter: Option<&str>,
+        // When true, only findings on each namespace's currently-running
+        // manifest are returned — same "latest non-revoked upload per
+        // namespace" definition as `latest_manifests_by_namespace`/the
+        // Dashboard's "currently running" view, reused here (not
+        // duplicated) via the identical DISTINCT ON query as a subquery.
+        // Old versions can still carry real findings worth knowing about
+        // (what was running and attackable at the time), so this narrows
+        // the *default* triage view rather than deleting/hiding that
+        // history anywhere else.
+        current_only: bool,
+        // When true, only the single newest non-revoked manifest per
+        // namespace is returned — an unconditional guarantee, unlike
+        // `current_only` above, which additionally respects the
+        // admin-curated `namespace_current_hidden` exclusion (a namespace
+        // hidden from "currently running" drops out of `current_only`
+        // entirely, but this still shows its newest version). Deliberately
+        // duplicates `current_only`'s DISTINCT ON pattern rather than
+        // reusing it, since the two intentionally differ by exactly that
+        // one clause.
+        hide_stale: bool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<DtrackFindingWithContextRecord>, DbError> {
+        sqlx::query_as::<_, DtrackFindingWithContextRecord>(
+            r#"
+            SELECT df.manifest_hash, df.finding_key, df.component_name, df.component_version,
+                   df.vulnerability_id, df.severity, df.description, df.analysis_state, df.synced_at,
+                   df.vex_status, df.vex_justification, df.triaged_by, df.triaged_at,
+                   m.namespace, m.version AS release_version, m.revoked,
+                   (SELECT count(*) FROM finding_comments fc
+                    WHERE fc.manifest_hash = df.manifest_hash AND fc.finding_key = df.finding_key) AS comment_count
+            FROM dtrack_findings df
+            JOIN manifests m ON m.manifest_hash = df.manifest_hash
+            WHERE m.tenant_id = $1
+              AND ($2 = '/' OR m.namespace = $2 OR starts_with(m.namespace, $2 || '/'))
+              -- $3 accepts a comma-separated list (e.g. "CRITICAL,HIGH" for
+              -- the frontend's "critical + high" quick filter) as well as a
+              -- single value — both go through the same array match.
+              AND ($3::text IS NULL OR upper(df.severity) = ANY(string_to_array(upper($3), ',')))
+              AND ($6::text IS NULL OR df.manifest_hash = $6)
+              AND ($7::text IS NULL OR m.namespace = $7 OR starts_with(m.namespace, $7 || '/'))
+              AND ($8::text IS NULL OR m.version = $8)
+              AND (
+                $9::text IS NULL
+                OR ($9 = 'untriaged' AND df.vex_status IS NULL)
+                OR df.vex_status = $9
+              )
+              AND (
+                $10::bool IS NOT TRUE
+                OR m.manifest_hash IN (
+                  SELECT DISTINCT ON (namespace) manifest_hash
+                  FROM manifests
+                  WHERE tenant_id = $1
+                    AND revoked = FALSE
+                    AND document_type IS NULL
+                    AND NOT EXISTS (
+                      SELECT 1 FROM namespace_current_hidden h
+                      WHERE h.tenant_id = manifests.tenant_id AND h.namespace = manifests.namespace
+                    )
+                  ORDER BY namespace, created_at DESC, leaf_seq_id DESC
+                )
+              )
+              AND (
+                $11::bool IS NOT TRUE
+                OR m.manifest_hash IN (
+                  SELECT DISTINCT ON (namespace) manifest_hash
+                  FROM manifests
+                  WHERE tenant_id = $1
+                    AND revoked = FALSE
+                    AND document_type IS NULL
+                  ORDER BY namespace, created_at DESC, leaf_seq_id DESC
+                )
+              )
+            ORDER BY
+              CASE upper(df.severity)
+                WHEN 'CRITICAL' THEN 0
+                WHEN 'HIGH' THEN 1
+                WHEN 'MEDIUM' THEN 2
+                WHEN 'LOW' THEN 3
+                WHEN 'INFO' THEN 4
+                ELSE 5
+              END,
+              df.vulnerability_id
+            LIMIT $4 OFFSET $5
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(namespace_scope)
+        .bind(severity)
+        .bind(limit)
+        .bind(offset)
+        .bind(manifest_hash)
+        .bind(namespace_filter)
+        .bind(release_version_filter)
+        .bind(vex_status_filter)
+        .bind(current_only)
+        .bind(hide_stale)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// Adds one comment to a finding's discussion thread. `None` if the
+    /// finding doesn't exist (never posted, or since resolved away by a
+    /// dtrack sync) — resolved to `ApiError::NotFound` at the handler layer,
+    /// matching `set_finding_triage`'s convention.
+    pub async fn add_finding_comment(
+        &self,
+        manifest_hash: &str,
+        finding_key: &str,
+        author: &str,
+        body: &str,
+    ) -> Result<Option<FindingCommentRecord>, DbError> {
+        sqlx::query_as::<_, FindingCommentRecord>(
+            r#"
+            INSERT INTO finding_comments (id, manifest_hash, finding_key, author, body)
+            SELECT $1, $2, $3, $4, $5
+            WHERE EXISTS (
+                SELECT 1 FROM dtrack_findings WHERE manifest_hash = $2 AND finding_key = $3
+            )
+            RETURNING id, manifest_hash, finding_key, author, body, created_at
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(manifest_hash)
+        .bind(finding_key)
+        .bind(author)
+        .bind(body)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    pub async fn list_finding_comments(
+        &self,
+        manifest_hash: &str,
+        finding_key: &str,
+    ) -> Result<Vec<FindingCommentRecord>, DbError> {
+        sqlx::query_as::<_, FindingCommentRecord>(
+            r#"
+            SELECT id, manifest_hash, finding_key, author, body, created_at
+            FROM finding_comments
+            WHERE manifest_hash = $1 AND finding_key = $2
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(manifest_hash)
+        .bind(finding_key)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// Sets this tenant's VEX-style triage on one finding. `None` if the
+    /// finding no longer exists (e.g. resolved by a later dtrack sync) —
+    /// resolved to `ApiError::NotFound` at the handler layer.
+    pub async fn set_finding_triage(
+        &self,
+        manifest_hash: &str,
+        finding_key: &str,
+        vex_status: &str,
+        justification: Option<&str>,
+        triaged_by: &str,
+    ) -> Result<Option<DtrackFindingRecord>, DbError> {
+        sqlx::query_as::<_, DtrackFindingRecord>(
+            r#"
+            UPDATE dtrack_findings
+            SET vex_status = $1, vex_justification = $2, triaged_by = $3, triaged_at = now()
+            WHERE manifest_hash = $4 AND finding_key = $5
+            RETURNING manifest_hash, finding_key, component_name, component_version,
+                      vulnerability_id, severity, description, analysis_state, synced_at,
+                      vex_status, vex_justification, triaged_by, triaged_at
+            "#,
+        )
+        .bind(vex_status)
+        .bind(justification)
+        .bind(triaged_by)
+        .bind(manifest_hash)
+        .bind(finding_key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_query_error)
     }
 }

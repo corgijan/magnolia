@@ -104,6 +104,57 @@ export interface Manifest {
   revoked_at: string | null;
   revoked_by: string | null;
   compliance: ComplianceReport[];
+  vulnerability_findings: VulnerabilityFinding[];
+  // Set once dtrack has actually refreshed this manifest's findings at
+  // least once — null means "not synced yet, still pending", distinct
+  // from a non-null value with vulnerability_findings still empty, which
+  // means dtrack looked and genuinely found nothing.
+  dtrack_synced_at: string | null;
+  // Set when the most recent push to dtrack failed — e.g. dtrack rejected
+  // the BOM as schema-invalid, which will never succeed on retry without
+  // different content. null once a later push succeeds.
+  dtrack_push_error: string | null;
+}
+
+export interface VulnerabilityFinding {
+  finding_key: string;
+  component_name: string;
+  component_version: string | null;
+  vulnerability_id: string;
+  severity: string;
+  description: string | null;
+  // dtrack's own generic analysis state, synced verbatim — independent of
+  // vex_status below (the two can legitimately disagree; dtrack has no
+  // notion of Magnolia's product/manifest context).
+  analysis_state: string | null;
+  vex_status: 'affected' | 'not_affected' | 'fixed' | 'under_investigation' | null;
+  vex_justification: string | null;
+  triaged_by: string | null;
+  triaged_at: string | null;
+}
+
+// A finding plus enough manifest context to place it in the archive — the
+// shape returned by the cross-manifest GET /api/v1/findings, distinct from
+// VulnerabilityFinding (always scoped to one already-known manifest).
+export interface FindingWithContext extends VulnerabilityFinding {
+  manifest_hash: string;
+  domain: string;
+  namespace: string;
+  release_version: string;
+  revoked: boolean;
+  comment_count: number;
+}
+
+export interface FindingComment {
+  id: string;
+  author: string;
+  body: string;
+  created_at: string;
+}
+
+export interface DtrackSyncResult {
+  manifests_pushed: number;
+  projects_refreshed: number;
 }
 
 export interface ComplianceProfileInfo {
@@ -207,6 +258,15 @@ export interface BackendConfig {
   storage_backend: string;
   signer_backend: string;
   dev_mode: boolean;
+  dtrack_enabled: boolean;
+  // Present only when dtrack_enabled.
+  dtrack_sync_interval_secs: number | null;
+}
+
+// This tenant's own opt-out of the deployment-wide dtrack sync — distinct
+// from BackendConfig.dtrack_enabled, which is deployment-wide/read-only.
+export interface DtrackSyncSetting {
+  disabled: boolean;
 }
 
 export interface AuditEntry {
@@ -309,6 +369,19 @@ export const api = {
     return request(`/api/v1/upload${tenantQs(tenantId)}`, { method: 'POST', body: form });
   },
 
+  // Standalone compliance check — never archived, never touches the
+  // Merkle log or any tenant's manifests. Runs every registered profile
+  // regardless of this tenant's own enable/enforce settings.
+  checkCompliance: (file: File, format: 'cyclonedx' | 'spdx'): Promise<ComplianceReport[]> => {
+    const form = new FormData();
+    form.append('sbom_file', file);
+    form.append('format', format);
+    return request<{ reports: ComplianceReport[] }>('/api/v1/tools/compliance-check', {
+      method: 'POST',
+      body: form,
+    }).then((r) => r.reports);
+  },
+
   leaves: (limit = 50, offset = 0, tenantId?: string): Promise<Leaf[]> =>
     request(`/api/v1/leaves${tenantQs(tenantId, { limit, offset })}`),
 
@@ -328,6 +401,68 @@ export const api = {
   revokeManifest: (manifestHash: string, tenantId?: string): Promise<void> =>
     request(`/api/v1/manifest/${manifestHash}/revoke${tenantQs(tenantId)}`, { method: 'POST' }),
 
+  triageFinding: (
+    manifestHash: string,
+    findingKey: string,
+    vexStatus: string,
+    justification: string | undefined,
+    tenantId?: string
+  ): Promise<VulnerabilityFinding> =>
+    request(`/api/v1/manifest/${manifestHash}/findings/${findingKey}/triage${tenantQs(tenantId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ vex_status: vexStatus, justification }),
+    }),
+
+  listFindings: (
+    opts: {
+      severity?: string;
+      manifestHash?: string;
+      namespace?: string;
+      releaseVersion?: string;
+      vexStatus?: string;
+      currentOnly?: boolean;
+      hideStale?: boolean;
+      limit?: number;
+      offset?: number;
+    },
+    tenantId?: string
+  ): Promise<FindingWithContext[]> => {
+    const extra: Record<string, string | number> = {};
+    if (opts.severity) extra.severity = opts.severity;
+    if (opts.manifestHash) extra.manifest_hash = opts.manifestHash;
+    if (opts.namespace) extra.namespace = opts.namespace;
+    if (opts.releaseVersion) extra.release_version = opts.releaseVersion;
+    if (opts.vexStatus) extra.vex_status = opts.vexStatus;
+    if (opts.currentOnly) extra.current_only = 'true';
+    if (opts.hideStale) extra.hide_stale = 'true';
+    if (opts.limit) extra.limit = opts.limit;
+    if (opts.offset) extra.offset = opts.offset;
+    return request(`/api/v1/findings${tenantQs(tenantId, extra)}`);
+  },
+
+  listFindingComments: (
+    manifestHash: string,
+    findingKey: string,
+    tenantId?: string
+  ): Promise<FindingComment[]> =>
+    request(`/api/v1/manifest/${manifestHash}/findings/${findingKey}/comments${tenantQs(tenantId)}`),
+
+  addFindingComment: (
+    manifestHash: string,
+    findingKey: string,
+    body: string,
+    tenantId?: string
+  ): Promise<FindingComment> =>
+    request(`/api/v1/manifest/${manifestHash}/findings/${findingKey}/comments${tenantQs(tenantId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ body }),
+    }),
+
+  forceDtrackSync: (tenantId?: string): Promise<DtrackSyncResult> =>
+    request(`/api/v1/dtrack/sync${tenantQs(tenantId)}`, { method: 'POST' }),
+
   currentManifests: (tenantId?: string): Promise<CurrentManifest[]> =>
     request(`/api/v1/manifests/current${tenantQs(tenantId)}`),
 
@@ -339,6 +474,16 @@ export const api = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ namespace, hidden }),
+    }),
+
+  dtrackSyncSetting: (tenantId?: string): Promise<DtrackSyncSetting> =>
+    request(`/api/v1/settings/dtrack-sync${tenantQs(tenantId)}`),
+
+  setDtrackSyncSetting: (disabled: boolean, tenantId?: string): Promise<void> =>
+    request(`/api/v1/settings/dtrack-sync${tenantQs(tenantId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ disabled }),
     }),
 
   complianceProfiles: (): Promise<ComplianceProfileInfo[]> =>

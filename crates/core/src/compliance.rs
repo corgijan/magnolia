@@ -307,8 +307,8 @@ impl ComplianceProfile for NtiaProfile {
 
     fn description(&self) -> &'static str {
         "Checks NTIA's Data Fields and Automation Support elements (EO 14028). Practices and Processes \
-         (frequency, depth, known-unknowns marking, distribution/access control, accommodation of \
-         mistakes) are organizational requirements this tool cannot verify from SBOM content alone."
+         (frequency, distribution, etc.) are organizational requirements not verifiable from SBOM \
+         content alone."
     }
 
     fn check(&self, format: &str, sbom_bytes: &[u8]) -> ComplianceReport {

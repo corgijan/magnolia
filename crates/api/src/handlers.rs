@@ -14,6 +14,7 @@ use magnolia_core::{
     MerkleTree, SbomFormat, SignedTreeHead, Statement, Subject, DOCUMENT_PREDICATE_TYPE,
     DSSE_PAYLOAD_TYPE, IN_TOTO_STATEMENT_TYPE, MANIFEST_PREDICATE_TYPE,
 };
+use magnolia_db::DtrackFindingRecord;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -96,6 +97,17 @@ pub struct ManifestJson {
     /// when none are enabled, or when the enabled ones don't apply to this
     /// upload's format — e.g. a generic `document`).
     pub compliance: Vec<ComplianceReportJson>,
+    pub vulnerability_findings: Vec<DtrackFindingJson>,
+    /// Set once dtrack has actually refreshed this manifest's findings at
+    /// least once — lets the frontend tell "not synced yet" apart from
+    /// "synced, and genuinely has zero findings" instead of reading an
+    /// empty `vulnerability_findings` as always meaning the former.
+    pub dtrack_synced_at: Option<DateTime<Utc>>,
+    /// Set when the most recent attempt to push this manifest to dtrack
+    /// failed — e.g. dtrack rejected the BOM as schema-invalid, which will
+    /// never succeed on retry without different content. `None` once a
+    /// later push succeeds (see `push_phase`'s `clear_dtrack_push_failure`).
+    pub dtrack_push_error: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -144,6 +156,171 @@ impl From<CoreComplianceReport> for ComplianceReportJson {
             missing_fields: r.missing_fields,
         }
     }
+}
+
+#[derive(serde::Serialize)]
+pub struct DtrackFindingJson {
+    pub finding_key: String,
+    pub component_name: String,
+    pub component_version: Option<String>,
+    pub vulnerability_id: String,
+    pub severity: String,
+    pub description: Option<String>,
+    /// dtrack's own generic analysis state, synced verbatim — independent
+    /// of `vex_status` below (see `dtrack_findings`' migration comment for
+    /// why the two can legitimately disagree).
+    pub analysis_state: Option<String>,
+    pub vex_status: Option<String>,
+    pub vex_justification: Option<String>,
+    pub triaged_by: Option<String>,
+    pub triaged_at: Option<DateTime<Utc>>,
+}
+
+impl From<DtrackFindingRecord> for DtrackFindingJson {
+    fn from(r: DtrackFindingRecord) -> Self {
+        Self {
+            finding_key: r.finding_key,
+            component_name: r.component_name,
+            component_version: r.component_version,
+            vulnerability_id: r.vulnerability_id,
+            severity: r.severity,
+            description: r.description,
+            analysis_state: r.analysis_state,
+            vex_status: r.vex_status,
+            vex_justification: r.vex_justification,
+            triaged_by: r.triaged_by,
+            triaged_at: r.triaged_at,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct FindingWithContextJson {
+    pub manifest_hash: String,
+    pub finding_key: String,
+    pub component_name: String,
+    pub component_version: Option<String>,
+    pub vulnerability_id: String,
+    pub severity: String,
+    pub description: Option<String>,
+    pub analysis_state: Option<String>,
+    pub vex_status: Option<String>,
+    pub vex_justification: Option<String>,
+    pub triaged_by: Option<String>,
+    pub triaged_at: Option<DateTime<Utc>>,
+    pub domain: String,
+    pub namespace: String,
+    pub release_version: String,
+    pub revoked: bool,
+    pub comment_count: i64,
+}
+
+#[derive(serde::Deserialize)]
+pub struct ListFindingsQuery {
+    pub severity: Option<String>,
+    /// Narrows to one manifest's findings — set when arriving from that
+    /// manifest's own detail view (see `SbomDetailPanel`'s findings
+    /// summary), otherwise every finding in scope is returned.
+    pub manifest_hash: Option<String>,
+    /// Exact-or-prefix match against the owning manifest's namespace, same
+    /// semantics as `search_sbom_components`'s namespace filter.
+    pub namespace: Option<String>,
+    /// Exact match against the owning manifest's version.
+    pub release_version: Option<String>,
+    /// One of the four VEX statuses, or "untriaged" for findings with no
+    /// vex_status set yet.
+    pub vex_status: Option<String>,
+    /// When true, only findings on each namespace's currently-running
+    /// (latest non-revoked) manifest are returned — narrows triage to
+    /// what's actually deployed, same "current" definition used by
+    /// `GET /api/v1/manifests/current`.
+    #[serde(default)]
+    pub current_only: bool,
+    /// When true, only the single newest non-revoked manifest per
+    /// namespace is returned — an unconditional guarantee, independent of
+    /// the admin-curated "currently running" namespace visibility that
+    /// `current_only` also respects.
+    #[serde(default)]
+    pub hide_stale: bool,
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+    pub tenant_id: Option<Uuid>,
+}
+
+/// Every cached finding across the tenant's archive (within the caller's
+/// namespace scope), for the standalone Findings tab — `Action::Read`, same
+/// as browsing the archive itself. DB read only, same as `manifest()`'s own
+/// findings — never a live dtrack call in the request path.
+pub async fn list_findings(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(query): Query<ListFindingsQuery>,
+) -> Result<Json<Vec<FindingWithContextJson>>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, query.tenant_id)?;
+    let scope = if cross_tenant { "/" } else { &grant.namespace_scope };
+
+    let domain = if cross_tenant {
+        state.db.get_tenant(tenant_id).await.map_err(db_err)?.map(|t| t.domain).unwrap_or_default()
+    } else {
+        grant.domain.clone()
+    };
+
+    let limit = query.limit.clamp(1, 500);
+    let offset = query.offset.max(0);
+    let severity_filter = query.severity.as_deref().filter(|s| !s.is_empty());
+    let namespace_filter = query.namespace.as_deref().filter(|s| !s.is_empty());
+    let release_version_filter = query.release_version.as_deref().filter(|s| !s.is_empty());
+    let vex_status_filter = query.vex_status.as_deref().filter(|s| !s.is_empty());
+    if let Some(v) = vex_status_filter {
+        if !["untriaged", "affected", "not_affected", "fixed", "under_investigation"].contains(&v) {
+            return Err(ApiError::BadRequest("invalid vex_status filter".to_string()));
+        }
+    }
+
+    let rows = state
+        .db
+        .list_findings_for_tenant(
+            tenant_id,
+            scope,
+            severity_filter,
+            query.manifest_hash.as_deref(),
+            namespace_filter,
+            release_version_filter,
+            vex_status_filter,
+            query.current_only,
+            query.hide_stale,
+            limit,
+            offset,
+        )
+        .await
+        .map_err(db_err)?;
+
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| FindingWithContextJson {
+                manifest_hash: r.manifest_hash,
+                finding_key: r.finding_key,
+                component_name: r.component_name,
+                component_version: r.component_version,
+                vulnerability_id: r.vulnerability_id,
+                severity: r.severity,
+                description: r.description,
+                analysis_state: r.analysis_state,
+                vex_status: r.vex_status,
+                vex_justification: r.vex_justification,
+                triaged_by: r.triaged_by,
+                triaged_at: r.triaged_at,
+                domain: domain.clone(),
+                namespace: r.namespace,
+                release_version: r.release_version,
+                revoked: r.revoked,
+                comment_count: r.comment_count,
+            })
+            .collect(),
+    ))
 }
 
 #[derive(serde::Serialize)]
@@ -552,6 +729,10 @@ pub struct ConfigJson {
     pub storage_backend: String,
     pub signer_backend: String,
     pub dev_mode: bool,
+    pub dtrack_enabled: bool,
+    /// Present only when `dtrack_enabled` — lets the UI say "check back in
+    /// about N minutes" instead of a made-up number.
+    pub dtrack_sync_interval_secs: Option<u64>,
 }
 
 /// Server-operational info, not tenant data — safe for any authenticated
@@ -564,7 +745,64 @@ pub async fn config(State(state): State<AppState>, _grant: AuthGrant) -> Json<Co
         storage_backend: state.storage_backend.to_string(),
         signer_backend: "local_file".to_string(),
         dev_mode: state.dev_mode,
+        dtrack_enabled: state.dtrack.is_some(),
+        dtrack_sync_interval_secs: state.dtrack.is_some().then_some(state.dtrack_sync_interval_secs),
     })
+}
+
+#[derive(serde::Serialize)]
+pub struct DtrackSyncSettingJson {
+    pub disabled: bool,
+}
+
+/// This tenant's opt-out of the deployment-wide dtrack sync — distinct from
+/// `ConfigJson.dtrack_enabled`, which is deployment-wide and read-only here.
+/// `Action::Read`, same as viewing any other tenant-wide setting (e.g.
+/// hidden namespaces).
+pub async fn dtrack_sync_setting(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+) -> Result<Json<DtrackSyncSettingJson>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    let tenant = state.db.get_tenant(tenant_id).await.map_err(db_err)?.ok_or(ApiError::NotFound)?;
+    Ok(Json(DtrackSyncSettingJson { disabled: tenant.dtrack_sync_disabled }))
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetDtrackSyncSettingRequest {
+    pub disabled: bool,
+}
+
+/// Toggles this tenant's opt-out of the deployment-wide dtrack sync — the
+/// sync loop's push/refresh phases skip a tenant with this set, but nothing
+/// already cached in `dtrack_findings` is touched (see the
+/// `dtrack_sync_disabled` migration comment). `Action::ManageSettings`,
+/// same tenant-wide-setting gate as `set_namespace_hidden`/compliance
+/// enforcement — a plain `auditor` may view this but not change it.
+pub async fn set_dtrack_sync_setting(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+    Json(body): Json<SetDtrackSyncSettingRequest>,
+) -> Result<StatusCode, ApiError> {
+    require(&grant, Action::ManageSettings, &grant.namespace_scope)?;
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+
+    state.db.set_tenant_dtrack_sync_disabled(tenant_id, body.disabled).await.map_err(db_err)?;
+
+    let _ = record_audit(
+        &state,
+        &grant,
+        "dtrack_sync_setting",
+        &tenant_id.to_string(),
+        true,
+        Some(format!("disabled={}", body.disabled)),
+    )
+    .await;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(serde::Serialize)]
@@ -896,6 +1134,24 @@ pub async fn upload_sbom(
         if let Err(e) = index_manifest_components(&state, tenant_id, &manifest_hash, &format, &sbom_bytes).await {
             tracing::warn!(manifest_hash = %manifest_hash, error = %e, "component indexing failed (upload still succeeded)");
         }
+
+        // Nudges dtrack to pick this upload up right away instead of
+        // waiting for the next periodic tick (up to
+        // `dtrack_sync_interval_secs` away). Spawned, not awaited — dtrack
+        // sync is a secondary concern that must never block or fail the
+        // upload response, same idiom as the periodic loop itself (see
+        // dtrack_sync.rs's module doc comment: no dtrack call is ever made
+        // synchronously from inside a handler). `sync_now` re-checks
+        // per-tenant sync-disabled and format eligibility on its own, so
+        // nothing needs duplicating here beyond "is dtrack configured at
+        // all".
+        if let Some(client) = state.dtrack.clone() {
+            let db = state.db.clone();
+            let storage = state.storage.clone();
+            tokio::spawn(async move {
+                crate::dtrack_sync::sync_now(&db, &storage, &client, tenant_id).await;
+            });
+        }
     }
 
     let sth_json = sth_to_json(&sth, true);
@@ -1140,6 +1396,32 @@ pub async fn manifest(
             .collect()
     };
 
+    // DB read only — never a live dtrack call in the request path. Stays
+    // available (returns whatever's cached, possibly empty) independent of
+    // dtrack's uptime.
+    let vulnerability_findings: Vec<DtrackFindingJson> = state
+        .db
+        .list_dtrack_findings(&record.manifest_hash)
+        .await
+        .map_err(db_err)?
+        .into_iter()
+        .map(DtrackFindingJson::from)
+        .collect();
+
+    let dtrack_synced_at = state
+        .db
+        .get_dtrack_project(&record.manifest_hash)
+        .await
+        .map_err(db_err)?
+        .and_then(|p| p.last_synced_at);
+
+    let dtrack_push_error = state
+        .db
+        .get_dtrack_push_failure(&record.manifest_hash)
+        .await
+        .map_err(db_err)?
+        .map(|f| f.error);
+
     Ok(Json(ManifestJson {
         sbom_hex: hex::encode(&sbom_bytes),
         manifest_hash: record.manifest_hash,
@@ -1161,6 +1443,9 @@ pub async fn manifest(
         revoked_at: record.revoked_at,
         revoked_by: record.revoked_by,
         compliance,
+        vulnerability_findings,
+        dtrack_synced_at,
+        dtrack_push_error,
     }))
 }
 
@@ -1347,6 +1632,70 @@ pub async fn list_compliance_profiles(grant: AuthGrant) -> Result<Json<Vec<Compl
     ))
 }
 
+#[derive(serde::Serialize)]
+pub struct ComplianceCheckResponse {
+    pub reports: Vec<ComplianceReportJson>,
+}
+
+/// Standalone "does this SBOM meet requirements" check — the Tools tab's
+/// compliance checker. Runs the exact same profile `check()` logic
+/// `upload_sbom`/`manifest()` use, but on caller-supplied bytes that are
+/// never stored, indexed, or added to the Merkle log: nothing here
+/// persists, so it's safe to try an SBOM that doesn't belong in the
+/// archive yet (a draft, a "does this even qualify" spot check) without
+/// creating a real, permanent manifest. Every registered profile is
+/// checked regardless of this tenant's own enable/enforce settings — the
+/// point is exploring what a document would score, not tenant policy.
+pub async fn check_compliance(
+    grant: AuthGrant,
+    mut multipart: Multipart,
+) -> Result<Json<ComplianceCheckResponse>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+
+    let field = multipart
+        .next_field()
+        .await
+        .map_err(|_| ApiError::BadRequest("invalid multipart body".to_string()))?
+        .ok_or_else(|| ApiError::BadRequest("missing sbom_file field".to_string()))?;
+    let sbom_bytes = field
+        .bytes()
+        .await
+        .map_err(|_| ApiError::BadRequest("invalid sbom_file field".to_string()))?
+        .to_vec();
+
+    let mut format = "cyclonedx".to_string();
+    while let Some(next) = multipart
+        .next_field()
+        .await
+        .map_err(|_| ApiError::BadRequest("invalid multipart body".to_string()))?
+    {
+        if next.name() == Some("format") {
+            format = next
+                .text()
+                .await
+                .map_err(|_| ApiError::BadRequest("invalid format field".to_string()))?
+                .to_lowercase();
+        }
+    }
+
+    if sbom_bytes.is_empty() {
+        return Err(ApiError::BadRequest("sbom_file is empty".to_string()));
+    }
+    if sbom_bytes.len() > MAX_SBOM_BYTES {
+        return Err(ApiError::BadRequest("sbom_file exceeds 10 MiB limit".to_string()));
+    }
+    validate_sbom_content(&sbom_bytes, &format)?;
+
+    let reports: Vec<ComplianceReportJson> = registered_profiles()
+        .iter()
+        .map(|p| p.check(&format, &sbom_bytes))
+        .filter(|r| r.applicable)
+        .map(ComplianceReportJson::from)
+        .collect();
+
+    Ok(Json(ComplianceCheckResponse { reports }))
+}
+
 /// This tenant's setting for every registered profile — always the full
 /// list, even for profiles the tenant has never touched (those default to
 /// disabled/off). Viewing is `Action::Read`; only `set_compliance_setting`
@@ -1526,6 +1875,48 @@ pub async fn reindex_components(
     Ok(Json(ReindexResponse { manifests_indexed, components_indexed }))
 }
 
+#[derive(serde::Serialize)]
+pub struct DtrackSyncResponse {
+    pub manifests_pushed: usize,
+    pub projects_refreshed: usize,
+}
+
+/// "Force sync now" — runs one push+refresh pass immediately instead of
+/// waiting for the periodic background loop, scoped to the caller's own
+/// tenant only (never another tenant's, even for a cross-tenant
+/// super_admin override — `sync_now` always takes the *resolved* tenant,
+/// same as every other tenant-scoped write here). `Action::ManageSettings`,
+/// same gate as `reindex_components` — an on-demand bulk/external-API
+/// action, not a routine read. 400 if dtrack isn't configured for this
+/// deployment at all (nothing to sync against).
+pub async fn force_dtrack_sync(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+) -> Result<Json<DtrackSyncResponse>, ApiError> {
+    require(&grant, Action::ManageSettings, &grant.namespace_scope)?;
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+
+    let client = state.dtrack.as_ref().ok_or_else(|| {
+        ApiError::BadRequest("Dependency-Track is not enabled for this deployment".to_string())
+    })?;
+
+    let (manifests_pushed, projects_refreshed) =
+        crate::dtrack_sync::sync_now(&state.db, &state.storage, client, tenant_id).await;
+
+    let _ = record_audit(
+        &state,
+        &grant,
+        "dtrack_force_sync",
+        &format!("manifests_pushed={manifests_pushed} projects_refreshed={projects_refreshed}"),
+        true,
+        None,
+    )
+    .await;
+
+    Ok(Json(DtrackSyncResponse { manifests_pushed, projects_refreshed }))
+}
+
 /// Marks a manifest revoked — a status flag, not a delete: the manifest
 /// row, its signature, and the Merkle leaf/hash it's chained from are
 /// untouched, so the append-only log and tamper-evidence are unaffected.
@@ -1578,6 +1969,166 @@ pub async fn revoke_manifest(
     let _ = record_audit(&state, &grant, "manifest_revoke", &manifest_hash, true, None).await;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+pub struct TriageFindingRequest {
+    pub vex_status: String,
+    pub justification: Option<String>,
+}
+
+/// Sets Magnolia's own VEX-style triage on one cached dtrack finding — this
+/// is Magnolia's product-specific exploitability judgment, independent of
+/// dtrack's own `analysis_state` (see the `dtrack_findings` migration
+/// comment). Follows `revoke_manifest`'s exact pattern: `Action::Annotate`,
+/// tenant/namespace isolation before touching the row, audit-logged via the
+/// existing `record_audit` (the justification rides in its `reason` field —
+/// no schema change needed there).
+pub async fn triage_finding(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Path((manifest_hash, finding_key)): Path<(String, String)>,
+    Query(q): Query<TenantOverrideQuery>,
+    Json(body): Json<TriageFindingRequest>,
+) -> Result<Json<DtrackFindingJson>, ApiError> {
+    require(&grant, Action::Annotate, &grant.namespace_scope)?;
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+
+    let record = state.db.get_manifest(&manifest_hash).await.map_err(db_err)?.ok_or(ApiError::NotFound)?;
+    if record.tenant_id != tenant_id
+        || (!cross_tenant && !magnolia_auth::namespace_in_scope(&record.namespace, &grant.namespace_scope))
+    {
+        return Err(ApiError::NotFound);
+    }
+
+    if !["affected", "not_affected", "fixed", "under_investigation"].contains(&body.vex_status.as_str()) {
+        return Err(ApiError::BadRequest("invalid vex_status".to_string()));
+    }
+    if body.vex_status == "not_affected" && body.justification.as_deref().unwrap_or("").is_empty() {
+        return Err(ApiError::BadRequest(
+            "justification is required when vex_status is not_affected".to_string(),
+        ));
+    }
+
+    let updated = state
+        .db
+        .set_finding_triage(
+            &manifest_hash,
+            &finding_key,
+            &body.vex_status,
+            body.justification.as_deref(),
+            &grant.principal(),
+        )
+        .await
+        .map_err(db_err)?
+        .ok_or(ApiError::NotFound)?;
+
+    let _ = record_audit(
+        &state,
+        &grant,
+        "finding_triage",
+        &format!("{manifest_hash}:{finding_key}"),
+        true,
+        body.justification,
+    )
+    .await;
+
+    Ok(Json(updated.into()))
+}
+
+#[derive(serde::Serialize)]
+pub struct FindingCommentJson {
+    pub id: Uuid,
+    pub author: String,
+    pub body: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<magnolia_db::FindingCommentRecord> for FindingCommentJson {
+    fn from(r: magnolia_db::FindingCommentRecord) -> Self {
+        Self { id: r.id, author: r.author, body: r.body, created_at: r.created_at }
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct AddFindingCommentRequest {
+    pub body: String,
+}
+
+/// Fetches (and, for the tenant/namespace check, discards) the manifest
+/// behind a finding — shared by the comment endpoints below, mirroring the
+/// same isolation check `triage_finding` does before touching the finding.
+async fn authorize_finding_access(
+    state: &AppState,
+    grant: &AuthGrant,
+    manifest_hash: &str,
+    tenant_id: Uuid,
+    cross_tenant: bool,
+) -> Result<(), ApiError> {
+    let record = state.db.get_manifest(manifest_hash).await.map_err(db_err)?.ok_or(ApiError::NotFound)?;
+    if record.tenant_id != tenant_id
+        || (!cross_tenant && !magnolia_auth::namespace_in_scope(&record.namespace, &grant.namespace_scope))
+    {
+        return Err(ApiError::NotFound);
+    }
+    Ok(())
+}
+
+/// Adds one comment to a finding's discussion thread — a lighter-weight
+/// counterpart to `triage_finding`'s single VEX status: comments are a
+/// free-text, multi-entry log for analysts to work through a finding
+/// together, so they get their own append-only table (`finding_comments`)
+/// instead of a mutable column. The author is always `grant.principal()`
+/// (the calling API key), same as `triaged_by` — Magnolia's auth model has
+/// no separate human-identity concept to attribute a comment to instead.
+pub async fn add_finding_comment(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Path((manifest_hash, finding_key)): Path<(String, String)>,
+    Query(q): Query<TenantOverrideQuery>,
+    Json(body): Json<AddFindingCommentRequest>,
+) -> Result<Json<FindingCommentJson>, ApiError> {
+    require(&grant, Action::Annotate, &grant.namespace_scope)?;
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    authorize_finding_access(&state, &grant, &manifest_hash, tenant_id, cross_tenant).await?;
+
+    let text = body.body.trim();
+    if text.is_empty() {
+        return Err(ApiError::BadRequest("comment body must not be empty".to_string()));
+    }
+
+    let comment = state
+        .db
+        .add_finding_comment(&manifest_hash, &finding_key, &grant.principal(), text)
+        .await
+        .map_err(db_err)?
+        .ok_or(ApiError::NotFound)?;
+
+    let _ = record_audit(
+        &state,
+        &grant,
+        "finding_comment",
+        &format!("{manifest_hash}:{finding_key}"),
+        true,
+        Some(text.to_string()),
+    )
+    .await;
+
+    Ok(Json(comment.into()))
+}
+
+pub async fn list_finding_comments(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Path((manifest_hash, finding_key)): Path<(String, String)>,
+    Query(q): Query<TenantOverrideQuery>,
+) -> Result<Json<Vec<FindingCommentJson>>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    authorize_finding_access(&state, &grant, &manifest_hash, tenant_id, cross_tenant).await?;
+
+    let comments = state.db.list_finding_comments(&manifest_hash, &finding_key).await.map_err(db_err)?;
+    Ok(Json(comments.into_iter().map(Into::into).collect()))
 }
 
 /// Mints a key for `tenant_id`/`domain`. Shared by `create_key` (caller
@@ -1651,15 +2202,39 @@ pub async fn create_key(
 
     // A key is created for the caller's own tenant/domain by default; only
     // super_admin can target another tenant (and must supply its domain
-    // explicitly, since a key row always carries one).
+    // explicitly, since a key row always carries one). Also fetched
+    // (same-tenant or not) whenever the requested role is super_admin, to
+    // check platform status below.
+    let target_tenant = if cross_tenant || role == Role::SuperAdmin {
+        Some(
+            state
+                .db
+                .get_tenant(tenant_id)
+                .await
+                .map_err(db_err)?
+                .ok_or_else(|| ApiError::BadRequest("unknown tenant_id".to_string()))?,
+        )
+    } else {
+        None
+    };
+
+    // super_admin is only meaningful on the platform tenant — it's the
+    // role that bootstraps and administers every other tenant. Minting one
+    // for a regular product tenant would let that tenant's own
+    // domain_admin (who already holds ManageKeys) grant itself
+    // unconditional access to every RBAC-gated action within its tenant
+    // (`(Role::SuperAdmin, _) => Ok(())` in the RBAC matrix), plus
+    // Action::ManageTenants — a privilege-escalation path with no
+    // legitimate use, so it's rejected outright rather than left to the
+    // caller's discretion.
+    if role == Role::SuperAdmin && !target_tenant.as_ref().map(|t| t.is_platform).unwrap_or(false) {
+        return Err(ApiError::BadRequest(
+            "super_admin keys can only be created for the platform tenant".to_string(),
+        ));
+    }
+
     let domain = if cross_tenant {
-        state
-            .db
-            .get_tenant(tenant_id)
-            .await
-            .map_err(db_err)?
-            .ok_or_else(|| ApiError::BadRequest("unknown tenant_id".to_string()))?
-            .domain
+        target_tenant.map(|t| t.domain).unwrap_or_default()
     } else {
         grant.domain.clone()
     };
@@ -1685,6 +2260,16 @@ pub async fn create_tenant(
     Json(request): Json<CreateTenantRequest>,
 ) -> Result<Json<CreateTenantResponse>, ApiError> {
     require(&grant, Action::ManageTenants, "")?;
+    // The RBAC matrix's ManageTenants check only verifies `role ==
+    // SuperAdmin`, not platform-tenant status (the base `Grant` type it
+    // operates on doesn't carry that field at all) — this handler-level
+    // check closes that gap directly, same pattern `upload_sbom` already
+    // uses for its own extra `is_platform_target` check beyond `require`.
+    if !grant.is_platform_tenant {
+        return Err(ApiError::Forbidden(
+            "only the platform super_admin can create tenants".to_string(),
+        ));
+    }
 
     let domain = normalize_domain(&request.domain)?;
     let name = request.name.trim();
