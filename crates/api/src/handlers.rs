@@ -1,7 +1,8 @@
 use std::str::FromStr;
 
 use axum::extract::{Multipart, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
+use axum::response::IntoResponse;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use magnolia_audit::{AuditLogEntry, AuditResult};
@@ -101,12 +102,14 @@ pub struct ManifestJson {
 pub struct ComplianceProfileJson {
     pub id: String,
     pub name: String,
+    pub description: String,
 }
 
 #[derive(serde::Serialize)]
 pub struct ComplianceSettingJson {
     pub profile_id: String,
     pub profile_name: String,
+    pub description: String,
     pub enabled: bool,
     pub enforce_level: String,
 }
@@ -141,6 +144,27 @@ impl From<CoreComplianceReport> for ComplianceReportJson {
             missing_fields: r.missing_fields,
         }
     }
+}
+
+#[derive(serde::Serialize)]
+pub struct ComponentSearchResultJson {
+    pub name: String,
+    pub version: Option<String>,
+    pub purl: Option<String>,
+    pub cpe: Option<String>,
+    pub is_primary: bool,
+    pub manifest_hash: String,
+    pub domain: String,
+    pub namespace: String,
+    pub release_version: String,
+    pub revoked: bool,
+    pub document_type: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ReindexResponse {
+    pub manifests_indexed: usize,
+    pub components_indexed: usize,
 }
 
 #[derive(serde::Serialize)]
@@ -244,6 +268,19 @@ pub struct AuditQuery {
     pub tenant_id: Option<Uuid>,
 }
 
+#[derive(serde::Deserialize)]
+pub struct SearchComponentsQuery {
+    pub name: Option<String>,
+    pub version: Option<String>,
+    pub namespace: Option<String>,
+    pub purl: Option<String>,
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+    pub tenant_id: Option<Uuid>,
+}
+
 fn default_limit() -> i64 {
     50
 }
@@ -294,7 +331,7 @@ fn db_err(e: impl std::fmt::Display) -> ApiError {
 /// out in full to anyone with read access to a namespace. Only the last 5
 /// characters ever leave the server; the rest is truncated here, not just
 /// hidden client-side, so the full value never reaches the browser at all.
-fn mask_principal(principal: &str) -> String {
+pub(crate) fn mask_principal(principal: &str) -> String {
     let tail_len = 5.min(principal.len());
     format!("…{}", &principal[principal.len() - tail_len..])
 }
@@ -380,6 +417,41 @@ async fn enforce_compliance(state: &AppState, tenant_id: Uuid, format: &str, sbo
         }
     }
     Ok(())
+}
+
+/// Extracts and indexes one manifest's components into the reverse-search
+/// table — shared by the upload-time hook and the one-time reindex
+/// endpoint, so there's exactly one implementation of "extract and index
+/// one manifest." Returns how many components were indexed (0 for formats
+/// with nothing to extract, e.g. an SBOM with no components at all).
+async fn index_manifest_components(
+    state: &AppState,
+    tenant_id: Uuid,
+    manifest_hash: &str,
+    sbom_format: &str,
+    sbom_bytes: &[u8],
+) -> Result<usize, ApiError> {
+    let extracted = magnolia_core::extract_components(sbom_format, sbom_bytes);
+    if extracted.is_empty() {
+        return Ok(0);
+    }
+    let components: Vec<magnolia_db::NewSbomComponent> = extracted
+        .into_iter()
+        .map(|c| magnolia_db::NewSbomComponent {
+            name: c.name,
+            version: c.version,
+            purl: c.purl,
+            cpe: c.cpe,
+            is_primary: c.is_primary,
+        })
+        .collect();
+    let count = components.len();
+    state
+        .db
+        .insert_sbom_components(tenant_id, manifest_hash, &components)
+        .await
+        .map_err(db_err)?;
+    Ok(count)
 }
 
 async fn record_audit(
@@ -820,6 +892,12 @@ pub async fn upload_sbom(
         .await
         .map_err(db_err)?;
 
+    if format != "document" {
+        if let Err(e) = index_manifest_components(&state, tenant_id, &manifest_hash, &format, &sbom_bytes).await {
+            tracing::warn!(manifest_hash = %manifest_hash, error = %e, "component indexing failed (upload still succeeded)");
+        }
+    }
+
     let sth_json = sth_to_json(&sth, true);
     let _ = record_audit(
         &state,
@@ -1133,6 +1211,72 @@ pub async fn current_manifests(
     ))
 }
 
+#[derive(serde::Deserialize, Default)]
+pub struct SnapshotRequest {
+    pub namespace: Option<String>,
+    pub version: Option<String>,
+}
+
+/// A signed, downloadable audit archive (tar) of every manifest/document
+/// matching the requested scope — deliberately uncurated (see
+/// `list_manifests_for_export`'s doc comment), unlike "currently running".
+/// Defaults to everything within the caller's RBAC namespace scope; the
+/// optional `namespace`/`version` fields narrow further. `POST`, not `GET`,
+/// since every call mints a fresh signature/timestamp — not idempotent.
+pub async fn snapshot(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+    Json(req): Json<SnapshotRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    let scope = if cross_tenant { "/" } else { &grant.namespace_scope };
+
+    let domain = if cross_tenant {
+        state
+            .db
+            .get_tenant(tenant_id)
+            .await
+            .map_err(db_err)?
+            .map(|t| t.domain)
+            .unwrap_or_default()
+    } else {
+        grant.domain.clone()
+    };
+
+    let namespace_filter = req.namespace.as_deref();
+    let version_filter = req.version.as_deref();
+
+    let tar_bytes = crate::snapshot::build_snapshot_tar(
+        &state,
+        tenant_id,
+        &domain,
+        &grant.principal(),
+        scope,
+        namespace_filter,
+        version_filter,
+    )
+    .await?;
+
+    let scope_desc = match (namespace_filter, version_filter) {
+        (None, None) => "all".to_string(),
+        (Some(ns), None) => format!("namespace={ns}"),
+        (None, Some(v)) => format!("version={v}"),
+        (Some(ns), Some(v)) => format!("namespace={ns} version={v}"),
+    };
+    let _ = record_audit(&state, &grant, "snapshot", &scope_desc, true, None).await;
+
+    let filename = format!("magnolia-audit-{}-{}.tar", domain, Utc::now().timestamp());
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/x-tar".to_string()),
+            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{filename}\"")),
+        ],
+        tar_bytes,
+    ))
+}
+
 /// Namespaces currently opted out of the "current" view for this tenant
 /// (scoped to the caller's `namespace_scope`, or the full tenant when
 /// acting cross-tenant).
@@ -1194,7 +1338,11 @@ pub async fn list_compliance_profiles(grant: AuthGrant) -> Result<Json<Vec<Compl
     Ok(Json(
         registered_profiles()
             .iter()
-            .map(|p| ComplianceProfileJson { id: p.id().to_string(), name: p.name().to_string() })
+            .map(|p| ComplianceProfileJson {
+                id: p.id().to_string(),
+                name: p.name().to_string(),
+                description: p.description().to_string(),
+            })
             .collect(),
     ))
 }
@@ -1220,6 +1368,7 @@ pub async fn compliance_settings(
                 ComplianceSettingJson {
                     profile_id: p.id().to_string(),
                     profile_name: p.name().to_string(),
+                    description: p.description().to_string(),
                     enabled: row.map(|r| r.enabled).unwrap_or(false),
                     enforce_level: row.map(|r| r.enforce_level.clone()).unwrap_or_else(|| "off".to_string()),
                 }
@@ -1252,6 +1401,129 @@ pub async fn set_compliance_setting(
         .await
         .map_err(db_err)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Reverse component search — "which manifests contain component X (at
+/// version Y)?" — an indexed lookup against `sbom_components`, not a scan
+/// over every SBOM's raw bytes. `Action::Read`, same as anyone who can
+/// already browse the archive. Requires at least one of `name`/`purl`.
+pub async fn search_components(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(query): Query<SearchComponentsQuery>,
+) -> Result<Json<Vec<ComponentSearchResultJson>>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, query.tenant_id)?;
+    let scope = if cross_tenant { "/" } else { &grant.namespace_scope };
+
+    if query.name.as_deref().unwrap_or("").is_empty() && query.purl.as_deref().unwrap_or("").is_empty() {
+        return Err(ApiError::BadRequest("provide at least one of name or purl".to_string()));
+    }
+
+    let domain = if cross_tenant {
+        state
+            .db
+            .get_tenant(tenant_id)
+            .await
+            .map_err(db_err)?
+            .map(|t| t.domain)
+            .unwrap_or_default()
+    } else {
+        grant.domain.clone()
+    };
+
+    let limit = query.limit.clamp(1, 200);
+    let offset = query.offset.max(0);
+    let name_filter = query.name.as_deref().filter(|s| !s.is_empty());
+    let version_filter = query.version.as_deref().filter(|s| !s.is_empty());
+    let namespace_filter = query.namespace.as_deref().filter(|s| !s.is_empty());
+    let purl_filter = query.purl.as_deref().filter(|s| !s.is_empty());
+
+    let rows = state
+        .db
+        .search_sbom_components(
+            tenant_id,
+            scope,
+            namespace_filter,
+            name_filter,
+            version_filter,
+            purl_filter,
+            limit,
+            offset,
+        )
+        .await
+        .map_err(db_err)?;
+
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| ComponentSearchResultJson {
+                name: r.name,
+                version: r.version,
+                purl: r.purl,
+                cpe: r.cpe,
+                is_primary: r.is_primary,
+                manifest_hash: r.manifest_hash,
+                domain: domain.clone(),
+                namespace: r.namespace,
+                release_version: r.release_version,
+                revoked: r.revoked,
+                document_type: r.document_type,
+            })
+            .collect(),
+    ))
+}
+
+/// One-time backfill for manifests uploaded before component search
+/// shipped (extraction only happens at upload time going forward — this
+/// endpoint is how existing archive content catches up). Administrative,
+/// not routine, hence `Action::ManageSettings` rather than `Read`.
+pub async fn reindex_components(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+) -> Result<Json<ReindexResponse>, ApiError> {
+    require(&grant, Action::ManageSettings, &grant.namespace_scope)?;
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    let scope = if cross_tenant { "/" } else { &grant.namespace_scope };
+
+    let pending = state
+        .db
+        .list_manifests_missing_from_component_index(tenant_id, scope)
+        .await
+        .map_err(db_err)?;
+
+    let mut manifests_indexed = 0;
+    let mut components_indexed = 0;
+    for record in pending {
+        let bytes = match state.storage.get(&record.sbom_s3_key).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(manifest_hash = %record.manifest_hash, error = %e, "reindex: storage read failed, skipping");
+                continue;
+            }
+        };
+        match index_manifest_components(&state, tenant_id, &record.manifest_hash, &record.sbom_format, &bytes).await {
+            Ok(count) => {
+                manifests_indexed += 1;
+                components_indexed += count;
+            }
+            Err(e) => {
+                tracing::warn!(manifest_hash = %record.manifest_hash, error = %e, "reindex: indexing failed, skipping");
+            }
+        }
+    }
+
+    let _ = record_audit(
+        &state,
+        &grant,
+        "reindex_components",
+        &format!("manifests_indexed={manifests_indexed} components_indexed={components_indexed}"),
+        true,
+        None,
+    )
+    .await;
+
+    Ok(Json(ReindexResponse { manifests_indexed, components_indexed }))
 }
 
 /// Marks a manifest revoked — a status flag, not a delete: the manifest

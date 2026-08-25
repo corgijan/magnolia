@@ -109,11 +109,13 @@ export interface Manifest {
 export interface ComplianceProfileInfo {
   id: string;
   name: string;
+  description: string;
 }
 
 export interface ComplianceSetting {
   profile_id: string;
   profile_name: string;
+  description: string;
   enabled: boolean;
   enforce_level: 'off' | 'minimum' | 'full';
 }
@@ -126,6 +128,25 @@ export interface ComplianceReport {
   minimum_issues: string[];
   fully_compliant: boolean;
   missing_fields: string[];
+}
+
+export interface ComponentSearchResult {
+  name: string;
+  version: string | null;
+  purl: string | null;
+  cpe: string | null;
+  is_primary: boolean;
+  manifest_hash: string;
+  domain: string;
+  namespace: string;
+  release_version: string;
+  revoked: boolean;
+  document_type: string | null;
+}
+
+export interface ReindexResult {
+  manifests_indexed: number;
+  components_indexed: number;
 }
 
 export interface CurrentManifest {
@@ -337,6 +358,51 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ profile_id: profileId, enabled, enforce_level: enforceLevel }),
     }),
+
+  // Not routed through request() — that always parses the response as
+  // JSON, but this endpoint returns a tar file. Mirrors request()'s own
+  // auth-header/error-handling logic instead.
+  pullSnapshot: async (
+    opts: { namespace?: string; version?: string },
+    tenantId?: string
+  ): Promise<Blob> => {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const key = getApiKey();
+    if (key) headers['Authorization'] = `Bearer ${key}`;
+    const res = await fetch(`/api/v1/snapshot${tenantQs(tenantId)}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ namespace: opts.namespace || undefined, version: opts.version || undefined }),
+    });
+    if (!res.ok) {
+      let message = `${res.status} ${res.statusText}`;
+      try {
+        const body = (await res.json()) as { error?: string };
+        if (body.error) message = body.error;
+      } catch {
+        // non-JSON error body
+      }
+      throw new ApiHttpError(res.status, message);
+    }
+    return res.blob();
+  },
+
+  searchComponents: (
+    opts: { name?: string; version?: string; namespace?: string; purl?: string; limit?: number; offset?: number },
+    tenantId?: string
+  ): Promise<ComponentSearchResult[]> => {
+    const extra: Record<string, string | number> = {};
+    if (opts.name) extra.name = opts.name;
+    if (opts.version) extra.version = opts.version;
+    if (opts.namespace) extra.namespace = opts.namespace;
+    if (opts.purl) extra.purl = opts.purl;
+    if (opts.limit) extra.limit = opts.limit;
+    if (opts.offset) extra.offset = opts.offset;
+    return request(`/api/v1/search/components${tenantQs(tenantId, extra)}`);
+  },
+
+  reindexComponents: (tenantId?: string): Promise<ReindexResult> =>
+    request(`/api/v1/search/reindex${tenantQs(tenantId)}`, { method: 'POST' }),
 
   listKeys: (tenantId?: string): Promise<ApiKeyInfo[]> =>
     request(`/api/v1/keys${tenantQs(tenantId)}`),

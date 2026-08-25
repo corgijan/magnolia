@@ -1,5 +1,6 @@
 mod errors;
 mod handlers;
+mod snapshot;
 mod state;
 mod auth;
 
@@ -60,6 +61,15 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/compliance/settings",
             get(handlers::compliance_settings).post(handlers::set_compliance_setting),
+        )
+        .route("/api/v1/snapshot", post(handlers::snapshot))
+        .route(
+            "/api/v1/search/components",
+            get(handlers::search_components),
+        )
+        .route(
+            "/api/v1/search/reindex",
+            post(handlers::reindex_components),
         )
         .route(
             "/api/v1/keys",

@@ -5,6 +5,7 @@ mod schema_validation;
 mod dsse;
 mod keys;
 mod compliance;
+mod component_index;
 
 pub use merkle::{
     ConsistencyProof, InclusionProof, MerkleNode, MerkleTree, PeakProof, ProofStep,
@@ -15,10 +16,12 @@ pub use schema_validation::validate_sbom_schema;
 pub use compliance::{
     profile_by_id, registered_profiles, ComplianceProfile, ComplianceReport,
 };
+pub use component_index::{extract_components, ExtractedComponent};
 pub use dsse::{
     build_envelope, pae, DocumentPredicate, DocumentStatement, DsseEnvelope, DsseSignature,
-    ManifestPredicate, ManifestStatement, Statement, Subject, DOCUMENT_PREDICATE_TYPE,
-    DSSE_PAYLOAD_TYPE, IN_TOTO_STATEMENT_TYPE, MANIFEST_PREDICATE_TYPE,
+    ManifestPredicate, ManifestStatement, SnapshotPredicate, SnapshotStatement, Statement,
+    Subject, DOCUMENT_PREDICATE_TYPE, DSSE_PAYLOAD_TYPE, IN_TOTO_STATEMENT_TYPE,
+    MANIFEST_PREDICATE_TYPE, SNAPSHOT_PREDICATE_TYPE,
 };
 pub use keys::{ed25519_public_key_base64, ed25519_public_key_pem};
 

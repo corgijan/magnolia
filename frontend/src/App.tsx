@@ -7,12 +7,14 @@ import {
   ConsistencyProof,
   BackendConfig,
   ComplianceSetting,
+  ComponentSearchResult,
   CreateKeyResponse,
   CreateTenantResponse,
   CurrentManifest,
   InclusionProof,
   Leaf,
   Manifest,
+  ReindexResult,
   setApiKey,
   Tenant,
   TreeHead,
@@ -27,7 +29,7 @@ import {
 } from './merkle';
 import './App.css';
 
-type Tab = 'dashboard' | 'upload' | 'leaves' | 'proofs' | 'keys' | 'tenants' | 'audit' | 'settings';
+type Tab = 'dashboard' | 'upload' | 'leaves' | 'proofs' | 'search' | 'keys' | 'tenants' | 'audit' | 'settings';
 
 // Mirrors the backend RBAC matrix (crates/auth/src/rbac.rs) so the UI only
 // ever shows tabs/actions the current key is actually allowed to use.
@@ -72,6 +74,7 @@ const TABS: { id: Tab; label: string; requires: RbacAction; group: TabGroup }[] 
   { id: 'dashboard', label: 'Info', requires: 'read', group: 'workspace' },
   { id: 'upload', label: 'Upload', requires: 'upload', group: 'workspace' },
   { id: 'proofs', label: 'Proofs', requires: 'read', group: 'workspace' },
+  { id: 'search', label: 'Component Search', requires: 'read', group: 'workspace' },
   { id: 'settings', label: 'Settings', requires: 'manage_settings', group: 'workspace' },
   { id: 'keys', label: 'API Keys', requires: 'manage_keys', group: 'admin' },
   { id: 'tenants', label: 'Tenants', requires: 'manage_tenants', group: 'admin' },
@@ -776,7 +779,10 @@ function SbomTree({ roots }: { roots: SbomTreeNode[] }) {
 }
 
 function downloadBytes(filename: string, bytes: Uint8Array, mimeType = 'application/json') {
-  const blob = new Blob([bytes as BlobPart], { type: mimeType });
+  downloadBlob(filename, new Blob([bytes as BlobPart], { type: mimeType }));
+}
+
+function downloadBlob(filename: string, blob: Blob) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -1308,54 +1314,119 @@ function SbomDetailPanel({
           ) : (
             <SbomArtifact key={manifest.manifest_hash} manifest={manifest} />
           )}
-          <div className="kv-row">
-            <span className="kv-label">status</span>
-            <Badge ok={!manifest.revoked}>{manifest.revoked ? 'revoked' : 'active'}</Badge>
-            {!manifest.revoked && (
-              <button className="btn" disabled={revoking} onClick={revoke}>
-                {revoking ? 'Revoking…' : 'Revoke'}
-              </button>
-            )}
-          </div>
-          {revokeError && <ErrorBox message={revokeError} />}
-          {manifest.revoked && (
-            <>
-              <div className="kv-row">
-                <span className="kv-label">revoked_by</span>
-                <span title={manifest.revoked_by ?? ''}>
-                  {manifest.revoked_by ? shortPrincipal(manifest.revoked_by) : '—'}
-                </span>
-              </div>
-              <div className="kv-row">
-                <span className="kv-label">revoked_at</span>
-                <span>{manifest.revoked_at ? new Date(manifest.revoked_at).toLocaleString() : '—'}</span>
-              </div>
-            </>
-          )}
-          {manifest.compliance.length > 0 && (
-            <div className="compliance-block">
-              <h3>Compliance</h3>
-              {manifest.compliance.map((c) => {
-                const hasIssues = c.minimum_issues.length > 0 || c.missing_fields.length > 0;
-                return (
-                  <div key={c.profile_id} className="compliance-profile">
-                    <div className="kv-row">
-                      <span className="kv-label">{c.profile_name}</span>
-                      <Badge ok={c.meets_minimum}>{c.meets_minimum ? 'meets minimum' : 'below minimum'}</Badge>
-                      <Badge ok={c.fully_compliant}>
-                        {c.fully_compliant ? 'fully compliant' : 'not fully compliant'}
-                      </Badge>
-                      {hasIssues && (
-                        <button className="btn" onClick={() => setComplianceReportFor(c.profile_id)}>
-                          View non-compliance report
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
+          <table className="table sbom-details-table">
+            <tbody>
+              <tr>
+                <td>status</td>
+                <td>
+                  <span className="cell-actions">
+                    <Badge ok={!manifest.revoked}>{manifest.revoked ? 'revoked' : 'active'}</Badge>
+                    {!manifest.revoked && (
+                      <button className="btn" disabled={revoking} onClick={revoke}>
+                        {revoking ? 'Revoking…' : 'Revoke'}
+                      </button>
+                    )}
+                  </span>
+                </td>
+              </tr>
+              {revokeError && (
+                <tr>
+                  <td colSpan={2}><ErrorBox message={revokeError} /></td>
+                </tr>
+              )}
+              {manifest.revoked && (
+                <>
+                  <tr>
+                    <td>revoked_by</td>
+                    <td title={manifest.revoked_by ?? ''}>
+                      {manifest.revoked_by ? shortPrincipal(manifest.revoked_by) : '—'}
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>revoked_at</td>
+                    <td>{manifest.revoked_at ? new Date(manifest.revoked_at).toLocaleString() : '—'}</td>
+                  </tr>
+                </>
+              )}
+              {manifest.compliance.length > 0 && (
+                <>
+                  <tr>
+                    <td colSpan={2}><strong>Compliance</strong></td>
+                  </tr>
+                  {manifest.compliance.map((c) => {
+                    const hasIssues = c.minimum_issues.length > 0 || c.missing_fields.length > 0;
+                    return (
+                      <tr key={c.profile_id}>
+                        <td>{c.profile_name}</td>
+                        <td>
+                          <span className="cell-actions">
+                            <Badge ok={c.meets_minimum}>{c.meets_minimum ? 'meets minimum' : 'below minimum'}</Badge>
+                            <Badge ok={c.fully_compliant}>
+                              {c.fully_compliant ? 'fully compliant' : 'not fully compliant'}
+                            </Badge>
+                            {hasIssues && (
+                              <button className="btn" onClick={() => setComplianceReportFor(c.profile_id)}>
+                                View non-compliance report
+                              </button>
+                            )}
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </>
+              )}
+              <tr>
+                <td>version</td>
+                <td>{manifest.version}</td>
+              </tr>
+              <tr>
+                <td>namespace</td>
+                <td>{manifest.domain}{manifest.namespace}</td>
+              </tr>
+              <tr>
+                <td>sbom_hash</td>
+                <td><Hash value={manifest.sbom_hash} chars={24} /></td>
+              </tr>
+              <tr>
+                <td>previous_manifest_hash</td>
+                <td>{manifest.previous_manifest_hash ? <Hash value={manifest.previous_manifest_hash} chars={24} /> : 'none (first upload)'}</td>
+              </tr>
+              {manifest.dsse_envelope ? (
+                <>
+                  <tr>
+                    <td>dsse signature</td>
+                    <td><Hash value={manifest.dsse_envelope.signatures[0]?.sig ?? ''} chars={24} /></td>
+                  </tr>
+                  <tr>
+                    <td>attestation</td>
+                    <td>
+                      <span className="cell-actions">
+                        <DownloadButton filename={`${manifest.manifest_hash}.dsse.json`} data={manifest.dsse_envelope} />
+                        <span className="muted">verify with cosign/openssl against this SBOM's hash</span>
+                      </span>
+                    </td>
+                  </tr>
+                </>
+              ) : (
+                <tr>
+                  <td>signature</td>
+                  <td>
+                    {manifest.signature ? <Hash value={manifest.signature} chars={24} /> : 'none'}
+                    {' '}<em>(signed under legacy scheme, not third-party verifiable)</em>
+                  </td>
+                </tr>
+              )}
+              <tr>
+                <td>created_by</td>
+                <td>{manifest.created_by}</td>
+              </tr>
+              <tr>
+                <td>created_at</td>
+                <td>{new Date(manifest.created_at).toLocaleString()}</td>
+              </tr>
+            </tbody>
+          </table>
           {complianceReportFor && (() => {
             const c = manifest.compliance.find((p) => p.profile_id === complianceReportFor);
             if (!c) return null;
@@ -1384,51 +1455,6 @@ function SbomDetailPanel({
               </Modal>
             );
           })()}
-          <div className="kv-row">
-            <span className="kv-label">version</span>
-            <span>{manifest.version}</span>
-          </div>
-          <div className="kv-row">
-            <span className="kv-label">namespace</span>
-            <span>{manifest.domain}{manifest.namespace}</span>
-          </div>
-          <div className="kv-row">
-            <span className="kv-label">sbom_hash</span>
-            <Hash value={manifest.sbom_hash} chars={24} />
-          </div>
-          <div className="kv-row">
-            <span className="kv-label">previous_manifest_hash</span>
-            <span>{manifest.previous_manifest_hash ? <Hash value={manifest.previous_manifest_hash} chars={24} /> : 'none (first upload)'}</span>
-          </div>
-          {manifest.dsse_envelope ? (
-            <>
-              <div className="kv-row">
-                <span className="kv-label">dsse signature</span>
-                <Hash value={manifest.dsse_envelope.signatures[0]?.sig ?? ''} chars={24} />
-              </div>
-              <div className="kv-row">
-                <span className="kv-label">attestation</span>
-                <DownloadButton filename={`${manifest.manifest_hash}.dsse.json`} data={manifest.dsse_envelope} />
-                <span className="muted"> — verify with cosign/openssl against this SBOM's hash</span>
-              </div>
-            </>
-          ) : (
-            <div className="kv-row">
-              <span className="kv-label">signature</span>
-              <span>
-                {manifest.signature ? <Hash value={manifest.signature} chars={24} /> : 'none'}
-                {' '}<em>(signed under legacy scheme, not third-party verifiable)</em>
-              </span>
-            </div>
-          )}
-          <div className="kv-row">
-            <span className="kv-label">created_by</span>
-            <span>{manifest.created_by}</span>
-          </div>
-          <div className="kv-row">
-            <span className="kv-label">created_at</span>
-            <span>{new Date(manifest.created_at).toLocaleString()}</span>
-          </div>
         </div>
       )}
     </div>
@@ -1473,6 +1499,15 @@ function buildNamespaceTree(leaves: Leaf[], domain: string): NamespaceTreeNode {
   return root;
 }
 
+// True if the given manifest hash lives anywhere in this node's subtree —
+// used to auto-expand exactly the folders on the path down to a selected
+// item, rather than either leaving the tree fully collapsed (selection
+// invisible) or force-expanding everything (loses the point of a tree).
+function nodeContainsHash(node: NamespaceTreeNode, hash: string): boolean {
+  if (node.leaves.some((l) => l.manifest_hash === hash)) return true;
+  return node.children.some((c) => nodeContainsHash(c, hash));
+}
+
 // Splits one namespace's leaves into per-file groups — SBOM uploads (no
 // document_type) are one file, and each distinct document_type is its own
 // file, so a namespace holding both an SBOM and a risk-assessment doc
@@ -1511,14 +1546,16 @@ function SbomLeafRow({
   leaf,
   depth,
   onViewSbom,
+  selected = false,
 }: {
   leaf: Leaf;
   depth: number;
   onViewSbom: (hash: string) => void;
+  selected?: boolean;
 }) {
   return (
     <div
-      className={`sbom-tree-row${leaf.manifest_hash ? ' clickable' : ''}`}
+      className={`sbom-tree-row${leaf.manifest_hash ? ' clickable' : ''}${selected ? ' selected' : ''}`}
       style={{ paddingLeft: depth * 18 }}
       onClick={() => leaf.manifest_hash && onViewSbom(leaf.manifest_hash)}
       title={leaf.manifest_hash ? (leaf.document_type ? 'View document' : 'View SBOM') : 'No manifest available'}
@@ -1547,16 +1584,18 @@ function SbomFileGroupRow({
   leaves,
   depth,
   onViewGroup,
+  selected = false,
 }: {
   leaves: Leaf[];
   depth: number;
   onViewGroup: (leaves: Leaf[]) => void;
+  selected?: boolean;
 }) {
   const documentType = leaves[0]?.document_type;
   const revokedCount = leaves.filter((l) => l.revoked).length;
   return (
     <div
-      className="sbom-tree-row clickable"
+      className={`sbom-tree-row clickable${selected ? ' selected' : ''}`}
       style={{ paddingLeft: depth * 18 }}
       onClick={() => onViewGroup(leaves)}
       title="Select a version to view"
@@ -1579,6 +1618,7 @@ function NamespaceFolderRow({
   onViewSbom,
   onViewGroup,
   forceOpen = false,
+  selectedHash,
 }: {
   node: NamespaceTreeNode;
   depth: number;
@@ -1588,13 +1628,19 @@ function NamespaceFolderRow({
    * every folder so filtered matches are visible without manually clicking
    * through each collapsed level, overriding the local toggle below. */
   forceOpen?: boolean;
+  /** The manifest currently shown in the right pane, if any. Any folder on
+   * the path down to it auto-expands (and can't be collapsed back while it
+   * stays selected) so a jump-in from search/table/elsewhere always lands
+   * with the tree already open to the right spot, not fully collapsed. */
+  selectedHash?: string;
 }) {
   // depth 0 is the org/domain root — expand it by default so the first
   // real namespace level (depth 1) is visible immediately, but leave that
   // first level (and everything under it) collapsed by default rather
   // than auto-expanding the whole tree.
   const [open, setOpen] = useState(depth < 1);
-  const isOpen = forceOpen || open;
+  const containsSelection = selectedHash ? nodeContainsHash(node, selectedHash) : false;
+  const isOpen = forceOpen || open || containsSelection;
   const hasContent = node.children.length > 0 || node.leaves.length > 0;
   return (
     <div>
@@ -1616,13 +1662,20 @@ function NamespaceFolderRow({
         <>
           {groupLeavesByFile(node.leaves).map((group) =>
             group.length === 1 ? (
-              <SbomLeafRow key={group[0].seq_id} leaf={group[0]} depth={depth + 1} onViewSbom={onViewSbom} />
+              <SbomLeafRow
+                key={group[0].seq_id}
+                leaf={group[0]}
+                depth={depth + 1}
+                onViewSbom={onViewSbom}
+                selected={!!selectedHash && group[0].manifest_hash === selectedHash}
+              />
             ) : (
               <SbomFileGroupRow
                 key={group[0].document_type ?? '__sbom__'}
                 leaves={group}
                 depth={depth + 1}
                 onViewGroup={onViewGroup}
+                selected={!!selectedHash && group.some((l) => l.manifest_hash === selectedHash)}
               />
             )
           )}
@@ -1634,6 +1687,7 @@ function NamespaceFolderRow({
               onViewSbom={onViewSbom}
               onViewGroup={onViewGroup}
               forceOpen={forceOpen}
+              selectedHash={selectedHash}
             />
           ))}
         </>
@@ -1647,11 +1701,13 @@ function NamespaceTree({
   onViewSbom,
   onViewGroup,
   forceOpen = false,
+  selectedHash,
 }: {
   leaves: Leaf[];
   onViewSbom: (hash: string) => void;
   onViewGroup: (leaves: Leaf[]) => void;
   forceOpen?: boolean;
+  selectedHash?: string;
 }) {
   // All leaves in one call belong to one tenant, so they share one domain —
   // shown as the tree's root folder, e.g. "myorg.example" > "products" >
@@ -1669,6 +1725,7 @@ function NamespaceTree({
         onViewSbom={onViewSbom}
         onViewGroup={onViewGroup}
         forceOpen={forceOpen}
+        selectedHash={selectedHash}
       />
     </div>
   );
@@ -1804,6 +1861,7 @@ function Leaves({ initialSelectedHash }: { initialSelectedHash?: string }) {
               setSelectedHash(g.find((l) => l.manifest_hash)?.manifest_hash ?? undefined);
             }}
             forceOpen={searchTerm.trim().length > 0}
+            selectedHash={selectedHash}
           />
         )}
         {tableLeaves && tableLeaves.length > 0 && view === 'table' && (
@@ -2100,6 +2158,181 @@ function Proofs({ treeHead }: { treeHead: TreeHead | null }) {
     <div className="stack">
       <InclusionCard treeHead={treeHead} />
       <ConsistencyCard treeHead={treeHead} />
+    </div>
+  );
+}
+
+// ---------- Component search ----------
+
+function ComponentSearch({ onViewManifest }: { onViewManifest: (hash: string) => void }) {
+  const tenantId = useTenantOverride();
+  const [name, setName] = useState('');
+  const [version, setVersion] = useState('');
+  const [namespace, setNamespace] = useState('');
+  const [purl, setPurl] = useState('');
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [showRevoked, setShowRevoked] = useState(false);
+  const [results, setResults] = useState<ComponentSearchResult[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [reindexBusy, setReindexBusy] = useState(false);
+  const [reindexResult, setReindexResult] = useState<ReindexResult | null>(null);
+
+  const search = async () => {
+    const trimmedPurl = purl.trim();
+    const trimmedName = name.trim();
+    const trimmedNamespace = namespace.trim();
+    if (!trimmedPurl && !trimmedName) {
+      setError('Enter a component name (optionally with a version) or a purl to search.');
+      return;
+    }
+    setBusy(true);
+    setError('');
+    try {
+      // purl and name+version are two mutually exclusive modes, not ANDed
+      // together: an exact purl fully identifies a component already, so
+      // it's searched alone — name/version (even if still filled in) are
+      // ignored while purl is set, rather than narrowing results in a way
+      // that's easy to misread as "AND". Namespace narrows either mode.
+      const res = await api.searchComponents(
+        {
+          ...(trimmedPurl ? { purl: trimmedPurl } : { name: trimmedName, version: version.trim() || undefined }),
+          namespace: trimmedNamespace || undefined,
+        },
+        tenantId
+      );
+      setResults(res);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setResults(null);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const reindex = async () => {
+    setReindexBusy(true);
+    setError('');
+    setReindexResult(null);
+    try {
+      const res = await api.reindexComponents(tenantId);
+      setReindexResult(res);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setReindexBusy(false);
+    }
+  };
+
+  const onEnter = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') search();
+  };
+
+  const visibleResults = results ? (showRevoked ? results : results.filter((r) => !r.revoked)) : [];
+
+  return (
+    <div className="card">
+      <div className="card-header">
+        <h2>Component search</h2>
+        <button className="btn" disabled={reindexBusy} onClick={reindex}>
+          {reindexBusy ? 'Reindexing…' : 'Reindex existing archive'}
+        </button>
+      </div>
+      <p className="muted">
+        Reverse search — find every namespace/version that contains a given component, across the
+        whole archive. Only manifests uploaded (or reindexed) after this feature shipped are
+        searchable; use "Reindex existing archive" once to backfill older uploads.
+      </p>
+      {reindexResult && (
+        <div className="muted">
+          Indexed {reindexResult.components_indexed} component(s) across {reindexResult.manifests_indexed}{' '}
+          manifest(s).
+        </div>
+      )}
+      <div className="form-row">
+        <label className="field" style={{ flex: '0 1 220px', minWidth: 160 }}>
+          <span>Component name</span>
+          <input value={name} onChange={(e) => setName(e.target.value)} onKeyDown={onEnter} placeholder="lodash" />
+        </label>
+        <label className="field" style={{ flex: '0 1 140px', minWidth: 110 }}>
+          <span>Version (optional)</span>
+          <input
+            value={version}
+            onChange={(e) => setVersion(e.target.value)}
+            onKeyDown={onEnter}
+            placeholder="4.17.15"
+          />
+        </label>
+        <label className="field" style={{ flex: '0 1 200px', minWidth: 140 }}>
+          <span>Namespace (optional)</span>
+          <input
+            value={namespace}
+            onChange={(e) => setNamespace(e.target.value)}
+            onKeyDown={onEnter}
+            placeholder="/product/v1"
+          />
+        </label>
+        <button className="btn primary" style={{ marginBottom: 0 }} disabled={busy} onClick={search}>
+          {busy ? 'Searching…' : 'Search'}
+        </button>
+      </div>
+      <button className="btn" onClick={() => setShowAdvanced((v) => !v)}>
+        Advanced search {showAdvanced ? '▾' : '▸'}
+      </button>
+      {showAdvanced && (
+        <div className="form-row" style={{ marginTop: 12 }}>
+          <label className="field" style={{ flex: '0 1 280px', minWidth: 200 }}>
+            <span>purl (exact — searched alone, ignoring name/version above)</span>
+            <input
+              value={purl}
+              onChange={(e) => setPurl(e.target.value)}
+              onKeyDown={onEnter}
+              placeholder="pkg:npm/lodash@4.17.15"
+            />
+          </label>
+        </div>
+      )}
+      {error && <ErrorBox message={error} />}
+      {results !== null && results.length > 0 && (
+        <label className="checkbox-field" style={{ marginTop: 12 }}>
+          <input type="checkbox" checked={showRevoked} onChange={(e) => setShowRevoked(e.target.checked)} />
+          Show revoked ({results.filter((r) => r.revoked).length})
+        </label>
+      )}
+      {results !== null && visibleResults.length === 0 && <div className="muted">No matches.</div>}
+      {results !== null && visibleResults.length > 0 && (
+        <table className="table">
+          <thead>
+            <tr>
+              <th>namespace</th>
+              <th>release</th>
+              <th>component</th>
+              <th>version</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {visibleResults.map((r, i) => (
+              <tr
+                key={`${r.manifest_hash}-${r.name}-${i}`}
+                className="row-clickable"
+                onClick={() => onViewManifest(r.manifest_hash)}
+              >
+                <td>
+                  {r.domain}
+                  {r.namespace}
+                </td>
+                <td>{r.release_version}</td>
+                <td>
+                  {r.name} {r.is_primary && <Badge ok={true}>primary</Badge>}
+                </td>
+                <td>{r.version ?? '—'}</td>
+                <td>{r.revoked && <Badge ok={false}>revoked</Badge>}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
     </div>
   );
 }
@@ -2497,6 +2730,11 @@ function Settings() {
   const [complianceSettings, setComplianceSettings] = useState<ComplianceSetting[] | null>(null);
   const [busyProfile, setBusyProfile] = useState<string | null>(null);
   const [showNamespaceModal, setShowNamespaceModal] = useState(false);
+  const [showSnapshotExtended, setShowSnapshotExtended] = useState(false);
+  const [snapshotNamespace, setSnapshotNamespace] = useState('');
+  const [snapshotVersion, setSnapshotVersion] = useState('');
+  const [snapshotBusy, setSnapshotBusy] = useState(false);
+  const [snapshotError, setSnapshotError] = useState('');
 
   const toggleCurrentlyRunningView = (enabled: boolean) => {
     writeCurrentlyRunningViewEnabled(enabled);
@@ -2565,6 +2803,22 @@ function Settings() {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusyNamespace(null);
+    }
+  };
+
+  const pullSnapshot = async () => {
+    setSnapshotBusy(true);
+    setSnapshotError('');
+    try {
+      const blob = await api.pullSnapshot(
+        { namespace: snapshotNamespace.trim(), version: snapshotVersion.trim() },
+        tenantId
+      );
+      downloadBlob(`magnolia-audit-${Date.now()}.tar`, blob);
+    } catch (e) {
+      setSnapshotError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSnapshotBusy(false);
     }
   };
 
@@ -2662,7 +2916,10 @@ function Settings() {
             <tbody>
               {complianceSettings.map((s) => (
                 <tr key={s.profile_id}>
-                  <td>{s.profile_name}</td>
+                  <td>
+                    {s.profile_name}
+                    {s.description && <div className="muted" style={{ fontSize: '0.85em', marginTop: 2 }}>{s.description}</div>}
+                  </td>
                   <td>
                     <label className="checkbox-field">
                       <input
@@ -2695,6 +2952,53 @@ function Settings() {
               ))}
             </tbody>
           </table>
+        )}
+      </div>
+
+      <div className="card">
+        <div className="card-header">
+          <h2>Audit export</h2>
+        </div>
+        <p className="muted">
+          Download every SBOM and document you can see as a signed, independently-verifiable tar
+          archive — deliberately not limited to "currently running," so nothing can be missing
+          because of that view's own filtering (hidden namespaces, revoked items, latest-only).
+          Includes revoked items and hidden namespaces on purpose.
+        </p>
+        {snapshotError && <ErrorBox message={snapshotError} />}
+        <button className="btn primary" disabled={snapshotBusy} onClick={pullSnapshot}>
+          {snapshotBusy
+            ? 'Building archive…'
+            : snapshotNamespace.trim() || snapshotVersion.trim()
+            ? 'Download filtered archive'
+            : 'Download audit archive'}
+        </button>
+        <button
+          className="btn"
+          style={{ marginLeft: 8 }}
+          onClick={() => setShowSnapshotExtended((v) => !v)}
+        >
+          Extended options {showSnapshotExtended ? '▾' : '▸'}
+        </button>
+        {showSnapshotExtended && (
+          <div className="form-row" style={{ marginTop: 12 }}>
+            <label className="field">
+              <span>Namespace (optional)</span>
+              <input
+                value={snapshotNamespace}
+                onChange={(e) => setSnapshotNamespace(e.target.value)}
+                placeholder="/product1"
+              />
+            </label>
+            <label className="field">
+              <span>Version (optional)</span>
+              <input
+                value={snapshotVersion}
+                onChange={(e) => setSnapshotVersion(e.target.value)}
+                placeholder="1.2.3"
+              />
+            </label>
+          </div>
         )}
       </div>
     </div>
@@ -3016,6 +3320,14 @@ export default function App() {
               <Leaves initialSelectedHash={pendingSbomHash} />
             )}
             {tab === 'proofs' && roleCan(whoami.role, 'read') && <Proofs treeHead={treeHead} />}
+            {tab === 'search' && roleCan(whoami.role, 'read') && (
+              <ComponentSearch
+                onViewManifest={(hash) => {
+                  setPendingSbomHash(hash);
+                  setTab('leaves');
+                }}
+              />
+            )}
             {tab === 'keys' && roleCan(whoami.role, 'manage_keys') && <Keys />}
             {tab === 'tenants' && roleCan(whoami.role, 'manage_tenants') && (
               <Tenants isPlatform={whoami.is_platform_tenant} tenants={tenants} refreshTenants={refreshTenants} />

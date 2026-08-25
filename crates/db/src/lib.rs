@@ -3,7 +3,8 @@ mod errors;
 
 pub use models::{
     ApiKeyRecord, AuditLogRecord, ComplianceSettingRecord, ManifestRecord, MerkleLeafRecord,
-    MerkleNodeRecord, SignedTreeHeadRecord, TenantRecord,
+    MerkleNodeRecord, NewSbomComponent, SbomComponentSearchRow, SignedTreeHeadRecord,
+    TenantRecord,
 };
 pub use errors::DbError;
 
@@ -550,6 +551,43 @@ impl Database {
         .map_err(|e| DbError::QueryError(e.to_string()))
     }
 
+    /// Every manifest/document matching scope — deliberately uncurated,
+    /// for the audit archive export. Unlike `latest_manifests_by_namespace`
+    /// this has no `revoked = FALSE`, no `document_type IS NULL`, and no
+    /// `namespace_current_hidden` exclusion: an audit export must not be
+    /// able to silently miss something because of "currently running"
+    /// curation logic (or bugs in it). `namespace_filter`/`version_filter`
+    /// are optional further narrowing on top of the caller's own RBAC
+    /// `namespace_scope`, which always applies.
+    pub async fn list_manifests_for_export(
+        &self,
+        tenant_id: Uuid,
+        namespace_scope: &str,
+        namespace_filter: Option<&str>,
+        version_filter: Option<&str>,
+    ) -> Result<Vec<ManifestRecord>, DbError> {
+        sqlx::query_as::<_, ManifestRecord>(
+            r#"
+            SELECT manifest_hash, leaf_seq_id, tenant_id, version, sbom_hash, sbom_format,
+                   sbom_s3_key, namespace, previous_manifest_hash, signature, dsse_envelope, document_type, created_by, created_at,
+                   revoked, revoked_at, revoked_by
+            FROM manifests
+            WHERE tenant_id = $1
+              AND ($2 = '/' OR namespace = $2 OR starts_with(namespace, $2 || '/'))
+              AND ($3::text IS NULL OR namespace = $3 OR starts_with(namespace, $3 || '/'))
+              AND ($4::text IS NULL OR version = $4)
+            ORDER BY namespace, created_at DESC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(namespace_scope)
+        .bind(namespace_filter)
+        .bind(version_filter)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbError::QueryError(e.to_string()))
+    }
+
     /// Namespaces opted out of the "current" view for a tenant, scoped the
     /// same way as `latest_manifests_by_namespace` so a narrowly-scoped key
     /// only sees toggles within its own reach.
@@ -685,6 +723,124 @@ impl Database {
         .await
         .map_err(map_query_error)?;
         Ok(())
+    }
+
+    // ---- Component reverse-search index ----
+
+    /// Batched — a single INSERT for the whole component list of one SBOM,
+    /// not one row at a time, so indexing cost stays a single round trip
+    /// regardless of component count.
+    pub async fn insert_sbom_components(
+        &self,
+        tenant_id: Uuid,
+        manifest_hash: &str,
+        components: &[NewSbomComponent],
+    ) -> Result<(), DbError> {
+        if components.is_empty() {
+            return Ok(());
+        }
+        let mut sql = String::from(
+            "INSERT INTO sbom_components (manifest_hash, tenant_id, name, version, purl, cpe, is_primary) VALUES ",
+        );
+        let mut placeholders = Vec::with_capacity(components.len());
+        for i in 0..components.len() {
+            let base = i * 5;
+            placeholders.push(format!(
+                "($1, $2, ${}, ${}, ${}, ${}, ${})",
+                base + 3,
+                base + 4,
+                base + 5,
+                base + 6,
+                base + 7
+            ));
+        }
+        sql.push_str(&placeholders.join(", "));
+
+        let mut q = sqlx::query(&sql).bind(manifest_hash).bind(tenant_id);
+        for c in components {
+            q = q
+                .bind(&c.name)
+                .bind(&c.version)
+                .bind(&c.purl)
+                .bind(&c.cpe)
+                .bind(c.is_primary);
+        }
+        q.execute(&self.pool).await.map_err(map_query_error)?;
+        Ok(())
+    }
+
+    /// Component-name prefix (case-insensitive) and/or exact-purl reverse
+    /// search, scoped to `namespace_scope` the same way every other
+    /// tenant-scoped listing already is. At least one of `name_prefix`/
+    /// `purl` should be provided by the caller — this method doesn't
+    /// enforce that itself, an unfiltered call just returns everything in
+    /// scope (bounded by `limit`).
+    pub async fn search_sbom_components(
+        &self,
+        tenant_id: Uuid,
+        namespace_scope: &str,
+        namespace_filter: Option<&str>,
+        name_contains: Option<&str>,
+        component_version: Option<&str>,
+        purl: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<SbomComponentSearchRow>, DbError> {
+        sqlx::query_as::<_, SbomComponentSearchRow>(
+            r#"
+            SELECT sc.name, sc.version, sc.purl, sc.cpe, sc.is_primary,
+                   m.manifest_hash, m.namespace, m.version AS release_version, m.revoked, m.document_type
+            FROM sbom_components sc
+            JOIN manifests m ON m.manifest_hash = sc.manifest_hash
+            WHERE sc.tenant_id = $1
+              AND ($2 = '/' OR m.namespace = $2 OR starts_with(m.namespace, $2 || '/'))
+              AND ($3::text IS NULL OR m.namespace = $3 OR starts_with(m.namespace, $3 || '/'))
+              AND ($4::text IS NULL OR lower(sc.name) LIKE '%' || lower($4) || '%')
+              AND ($5::text IS NULL OR sc.version = $5)
+              AND ($6::text IS NULL OR sc.purl = $6)
+            ORDER BY m.namespace, m.created_at DESC
+            LIMIT $7 OFFSET $8
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(namespace_scope)
+        .bind(namespace_filter)
+        .bind(name_contains)
+        .bind(component_version)
+        .bind(purl)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// Manifests with SBOM content (not generic documents) that have no
+    /// rows in `sbom_components` yet — used by the one-time reindex
+    /// endpoint to backfill manifests uploaded before this feature shipped.
+    pub async fn list_manifests_missing_from_component_index(
+        &self,
+        tenant_id: Uuid,
+        namespace_scope: &str,
+    ) -> Result<Vec<ManifestRecord>, DbError> {
+        sqlx::query_as::<_, ManifestRecord>(
+            r#"
+            SELECT manifest_hash, leaf_seq_id, tenant_id, version, sbom_hash, sbom_format,
+                   sbom_s3_key, namespace, previous_manifest_hash, signature, dsse_envelope, document_type, created_by, created_at,
+                   revoked, revoked_at, revoked_by
+            FROM manifests
+            WHERE tenant_id = $1
+              AND document_type IS NULL
+              AND ($2 = '/' OR namespace = $2 OR starts_with(namespace, $2 || '/'))
+              AND NOT EXISTS (SELECT 1 FROM sbom_components sc WHERE sc.manifest_hash = manifests.manifest_hash)
+            ORDER BY created_at
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(namespace_scope)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
     }
 
     /// Marks a manifest revoked, scoped to `tenant_id` so it can only be

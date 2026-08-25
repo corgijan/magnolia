@@ -457,6 +457,27 @@ code.hash {
   gap: 10px;
 }
 
+.sbom-details-table td {
+  vertical-align: top;
+}
+
+.sbom-details-table td:first-child {
+  color: var(--muted);
+  white-space: nowrap;
+  width: 1%;
+}
+
+.sbom-details-table td:last-child {
+  white-space: normal;
+}
+
+.sbom-details-table .cell-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 .sbom-json {
   margin-top: 12px;
   max-height: 60vh;
@@ -558,12 +579,23 @@ code.hash {
   background: var(--panel-2);
 }
 
+/* The item currently shown in the right pane — lets a jump-in from search,
+   the table view, or "currently running" show where that item actually
+   lives in the tree, not just an expanded-but-otherwise-blank-looking tree. */
+.sbom-tree-row.selected {
+  background: rgba(79, 140, 255, 0.18);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.sbom-tree-row.selected.clickable:hover {
+  background: rgba(79, 140, 255, 0.26);
+}
+
 /* First real namespace level in the Explorer tree (depth 1, directly under
    the org/domain root) — tinted so the top-level groupings stand out from
    the plain rows nested underneath them. */
 .sbom-tree-row-top {
   background: rgba(79, 140, 255, 0.08);
-  border-left: 2px solid var(--accent);
 }
 
 .sbom-tree-row-top.clickable:hover {

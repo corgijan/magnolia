@@ -23,6 +23,11 @@ pub struct ComplianceReport {
 pub trait ComplianceProfile: Send + Sync {
     fn id(&self) -> &'static str;
     fn name(&self) -> &'static str;
+    /// One-line summary of what this profile actually automates, surfaced
+    /// in the frontend next to the profile's name so a tenant admin knows
+    /// its scope *before* enabling it — not every requirement a source
+    /// document names is mechanically checkable from a single SBOM file.
+    fn description(&self) -> &'static str;
     /// `format` is the lowercased upload-format string already used
     /// elsewhere in the API (`"cyclonedx"` / `"spdx"` / `"document"`).
     /// `sbom_bytes` is assumed to already be schema-valid JSON for
@@ -37,7 +42,7 @@ static PROFILES: OnceLock<Vec<Box<dyn ComplianceProfile>>> = OnceLock::new();
 /// All registered profiles, compiled once. Add a new profile by pushing it
 /// into this `vec!` — nothing else in this module or its callers changes.
 pub fn registered_profiles() -> &'static [Box<dyn ComplianceProfile>] {
-    PROFILES.get_or_init(|| vec![Box::new(Tr03183Profile)])
+    PROFILES.get_or_init(|| vec![Box::new(Tr03183Profile), Box::new(NtiaProfile)])
 }
 
 pub fn profile_by_id(id: &str) -> Option<&'static dyn ComplianceProfile> {
@@ -58,6 +63,10 @@ impl ComplianceProfile for Tr03183Profile {
 
     fn name(&self) -> &'static str {
         TR_NAME
+    }
+
+    fn description(&self) -> &'static str {
+        "Checks CycloneDX SBOMs against BSI TR-03183-2 Annex 8.2's data-field requirements (SPDX support pending SPDX 3.x parsing)."
     }
 
     fn check(&self, format: &str, sbom_bytes: &[u8]) -> ComplianceReport {
@@ -268,6 +277,248 @@ fn check_spdx(sbom_bytes: &[u8]) -> ComplianceReport {
     }
 }
 
+// ---------------- NTIA "Minimum Elements for an SBOM" profile ----------------
+//
+// Maps directly onto the source document's own two-tier structure:
+// "minimum" = the 7 required Data Fields (§IV) plus the Automation Support
+// element (satisfied by applicability itself — this is only ever called
+// with format cyclonedx/spdx); "full" = minimum + the subset of §V's
+// "Recommended Data Fields" that are cleanly checkable from standard
+// SPDX/CycloneDX fields (Hash of the Component, License Information).
+// Practices and Processes (§IV: Frequency, Depth, Known Unknowns,
+// Distribution, Access Control, Accommodation of Mistakes) are
+// organizational requirements, not data-verifiable from one SBOM file, and
+// are deliberately not attempted here — see description() below, surfaced
+// in the frontend so this scope gap isn't silently implied.
+
+pub struct NtiaProfile;
+
+const NTIA_ID: &str = "ntia-minimum-elements";
+const NTIA_NAME: &str = "NTIA Minimum Elements for an SBOM";
+
+impl ComplianceProfile for NtiaProfile {
+    fn id(&self) -> &'static str {
+        NTIA_ID
+    }
+
+    fn name(&self) -> &'static str {
+        NTIA_NAME
+    }
+
+    fn description(&self) -> &'static str {
+        "Checks NTIA's Data Fields and Automation Support elements (EO 14028). Practices and Processes \
+         (frequency, depth, known-unknowns marking, distribution/access control, accommodation of \
+         mistakes) are organizational requirements this tool cannot verify from SBOM content alone."
+    }
+
+    fn check(&self, format: &str, sbom_bytes: &[u8]) -> ComplianceReport {
+        match format {
+            "cyclonedx" => check_ntia_cyclonedx(sbom_bytes),
+            "spdx" => check_ntia_spdx(sbom_bytes),
+            _ => ComplianceReport {
+                profile_id: NTIA_ID.to_string(),
+                profile_name: NTIA_NAME.to_string(),
+                applicable: false,
+                meets_minimum: false,
+                minimum_issues: Vec::new(),
+                fully_compliant: false,
+                missing_fields: Vec::new(),
+            },
+        }
+    }
+}
+
+/// NTIA's "supplier" is deliberately broad (manufacturer/vendor/developer/
+/// integrator/maintainer/provider — see the source document's glossary), so
+/// CycloneDX's `supplier.name` and `manufacturer.name` are treated as
+/// interchangeable: the schema's own doc comment on `metadata.authors` notes
+/// manual processes tend to populate `authors` where automated tooling
+/// populates `manufacturer`, and the same manual/automated split applies to
+/// per-component `supplier` vs `manufacturer`.
+fn ntia_supplier_name(entity: &Value) -> bool {
+    non_empty_str(&entity["supplier"]["name"]) || non_empty_str(&entity["manufacturer"]["name"])
+}
+
+fn ntia_check_component_cyclonedx(component: &Value, path: &str, missing: &mut Vec<String>, full: &mut Vec<String>) {
+    if !ntia_supplier_name(component) {
+        missing.push(format!("{path}.supplier.name or {path}.manufacturer.name is required (Supplier Name)"));
+    }
+    if !non_empty_str(&component["name"]) {
+        missing.push(format!("{path}.name is required (Component Name)"));
+    }
+    if !non_empty_str(&component["version"]) {
+        missing.push(format!("{path}.version is required (Version of the Component)"));
+    }
+    if !non_empty_str(&component["purl"]) && !non_empty_str(&component["cpe"]) {
+        missing.push(format!("{path}.purl or {path}.cpe is required (Other Unique Identifiers)"));
+    }
+    if component["hashes"].as_array().map(|h| h.is_empty()).unwrap_or(true) {
+        full.push(format!("{path}.hashes[] is empty (recommended: Hash of the Component)"));
+    }
+    if component["licenses"].as_array().map(|l| l.is_empty()).unwrap_or(true) {
+        full.push(format!("{path}.licenses[] is empty (recommended: License Information)"));
+    }
+}
+
+fn check_ntia_cyclonedx(sbom_bytes: &[u8]) -> ComplianceReport {
+    let mut minimum_issues = Vec::new();
+
+    let doc: Value = match serde_json::from_slice(sbom_bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            minimum_issues.push("sbom_file is not valid JSON".to_string());
+            return ComplianceReport {
+                profile_id: NTIA_ID.to_string(),
+                profile_name: NTIA_NAME.to_string(),
+                applicable: true,
+                meets_minimum: false,
+                minimum_issues,
+                fully_compliant: false,
+                missing_fields: Vec::new(),
+            };
+        }
+    };
+
+    // SBOM-level minimum fields: Author of SBOM Data, Timestamp.
+    let has_author =
+        doc["metadata"]["authors"].as_array().map(|a| a.iter().any(|au| non_empty_str(&au["name"]))).unwrap_or(false)
+            || non_empty_str(&doc["metadata"]["manufacturer"]["name"]);
+    if !has_author {
+        minimum_issues.push(
+            "metadata.authors[].name or metadata.manufacturer.name is required (Author of SBOM Data)".to_string(),
+        );
+    }
+    if !non_empty_str(&doc["metadata"]["timestamp"]) {
+        minimum_issues.push("metadata.timestamp is required (Timestamp)".to_string());
+    }
+    // SBOM-level minimum field: Dependency Relationship — some dependency
+    // graph is captured at all. Per-component graph-membership (depth,
+    // known-unknowns) is out of scope, matching the source document's own
+    // "Practices and Processes" being excluded from this profile.
+    if doc["dependencies"].as_array().map(|d| d.is_empty()).unwrap_or(true) {
+        minimum_issues
+            .push("top-level dependencies[] must be present and non-empty (Dependency Relationship)".to_string());
+    }
+
+    let mut full = Vec::new();
+    match doc["metadata"].get("component") {
+        Some(primary) => ntia_check_component_cyclonedx(primary, "metadata.component", &mut minimum_issues, &mut full),
+        None => minimum_issues.push("metadata.component (primary component) is required".to_string()),
+    }
+    if let Some(components) = doc["components"].as_array() {
+        for (i, c) in components.iter().enumerate() {
+            ntia_check_component_cyclonedx(c, &format!("components[{}]", i), &mut minimum_issues, &mut full);
+        }
+    }
+
+    let meets_minimum = minimum_issues.is_empty();
+    let fully_compliant = meets_minimum && full.is_empty();
+    ComplianceReport {
+        profile_id: NTIA_ID.to_string(),
+        profile_name: NTIA_NAME.to_string(),
+        applicable: true,
+        meets_minimum,
+        minimum_issues,
+        fully_compliant,
+        missing_fields: full,
+    }
+}
+
+/// SPDX's own convention for "value intentionally not asserted" — a naive
+/// non-empty check would trivially pass `"NOASSERTION"` while it carries
+/// zero information, the opposite of what a Supplier/License field check is
+/// meant to verify.
+fn non_noassertion_str(v: &Value) -> bool {
+    v.as_str().map(|s| !s.is_empty() && s != "NOASSERTION").unwrap_or(false)
+}
+
+fn ntia_check_package_spdx(pkg: &Value, path: &str, missing: &mut Vec<String>, full: &mut Vec<String>) {
+    if !non_noassertion_str(&pkg["supplier"]) {
+        missing.push(format!("{path}.supplier is required and must not be NOASSERTION (Supplier Name)"));
+    }
+    if !non_empty_str(&pkg["name"]) {
+        missing.push(format!("{path}.name is required (Component Name)"));
+    }
+    if !non_empty_str(&pkg["versionInfo"]) {
+        missing.push(format!("{path}.versionInfo is required (Version of the Component)"));
+    }
+    let has_identifier = pkg["externalRefs"]
+        .as_array()
+        .map(|refs| {
+            refs.iter().any(|r| {
+                matches!(r["referenceType"].as_str(), Some("purl") | Some("cpe23Type") | Some("cpe22Type"))
+                    && non_empty_str(&r["referenceLocator"])
+            })
+        })
+        .unwrap_or(false);
+    if !has_identifier {
+        missing.push(format!("{path}.externalRefs[] must include a purl or cpe entry (Other Unique Identifiers)"));
+    }
+    if pkg["checksums"].as_array().map(|c| c.is_empty()).unwrap_or(true) {
+        full.push(format!("{path}.checksums[] is empty (recommended: Hash of the Component)"));
+    }
+    if !non_noassertion_str(&pkg["licenseConcluded"]) && !non_noassertion_str(&pkg["licenseDeclared"]) {
+        full.push(format!("{path}.licenseConcluded or {path}.licenseDeclared is missing/NOASSERTION (recommended: License Information)"));
+    }
+}
+
+fn check_ntia_spdx(sbom_bytes: &[u8]) -> ComplianceReport {
+    let doc: Value = match serde_json::from_slice(sbom_bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            return ComplianceReport {
+                profile_id: NTIA_ID.to_string(),
+                profile_name: NTIA_NAME.to_string(),
+                applicable: true,
+                meets_minimum: false,
+                minimum_issues: vec!["sbom_file is not valid JSON".to_string()],
+                fully_compliant: false,
+                missing_fields: Vec::new(),
+            };
+        }
+    };
+
+    let mut minimum_issues = Vec::new();
+    // NTIA has no SPDX version floor (unlike BSI TR-03183-2's SPDX 3.0.1
+    // requirement) — Magnolia's schema validator accepts SPDX 2.2/2.3, and
+    // this profile checks field-level content directly against that shape.
+    if !doc["creationInfo"]["creators"]
+        .as_array()
+        .map(|c| c.iter().any(non_empty_str))
+        .unwrap_or(false)
+    {
+        minimum_issues.push("creationInfo.creators[] is required (Author of SBOM Data)".to_string());
+    }
+    if !non_empty_str(&doc["creationInfo"]["created"]) {
+        minimum_issues.push("creationInfo.created is required (Timestamp)".to_string());
+    }
+    if doc["relationships"].as_array().map(|r| r.is_empty()).unwrap_or(true) {
+        minimum_issues.push("relationships[] must be present and non-empty (Dependency Relationship)".to_string());
+    }
+
+    let mut full = Vec::new();
+    match doc["packages"].as_array() {
+        Some(packages) if !packages.is_empty() => {
+            for (i, p) in packages.iter().enumerate() {
+                ntia_check_package_spdx(p, &format!("packages[{}]", i), &mut minimum_issues, &mut full);
+            }
+        }
+        _ => minimum_issues.push("packages[] is required and must be non-empty".to_string()),
+    }
+
+    let meets_minimum = minimum_issues.is_empty();
+    let fully_compliant = meets_minimum && full.is_empty();
+    ComplianceReport {
+        profile_id: NTIA_ID.to_string(),
+        profile_name: NTIA_NAME.to_string(),
+        applicable: true,
+        meets_minimum,
+        minimum_issues,
+        fully_compliant,
+        missing_fields: full,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +625,127 @@ mod tests {
     #[test]
     fn generic_document_upload_is_not_applicable() {
         let report = Tr03183Profile.check("document", b"whatever bytes");
+        assert!(!report.applicable);
+    }
+
+    // ---------------- NTIA profile tests ----------------
+
+    fn complete_cyclonedx_ntia() -> Value {
+        json!({
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.6",
+            "metadata": {
+                "timestamp": "2026-08-23T00:00:00Z",
+                "authors": [{ "name": "Acme SBOM Team" }],
+                "component": {
+                    "bom-ref": "primary",
+                    "name": "acme-app",
+                    "version": "1.0.0",
+                    "supplier": { "name": "Acme Corp" },
+                    "purl": "pkg:generic/acme-app@1.0.0",
+                    "hashes": [{ "alg": "SHA-256", "content": "abc" }],
+                    "licenses": [{ "expression": "MIT" }]
+                }
+            },
+            "components": [{
+                "bom-ref": "lib-a",
+                "name": "lib-a",
+                "version": "2.3.4",
+                "supplier": { "name": "Lib Publisher" },
+                "purl": "pkg:npm/lib-a@2.3.4",
+                "hashes": [{ "alg": "SHA-256", "content": "def" }],
+                "licenses": [{ "expression": "Apache-2.0" }]
+            }],
+            "dependencies": [
+                { "ref": "primary", "dependsOn": ["lib-a"] }
+            ]
+        })
+    }
+
+    fn complete_spdx_ntia() -> Value {
+        json!({
+            "spdxVersion": "SPDX-2.3",
+            "SPDXID": "SPDXRef-DOCUMENT",
+            "name": "acme-app-sbom",
+            "dataLicense": "CC0-1.0",
+            "creationInfo": {
+                "created": "2026-08-23T00:00:00Z",
+                "creators": ["Organization: Acme Corp", "Tool: syft-1.0"]
+            },
+            "packages": [{
+                "SPDXID": "SPDXRef-Package-acme-app",
+                "name": "acme-app",
+                "versionInfo": "1.0.0",
+                "supplier": "Organization: Acme Corp",
+                "checksums": [{ "algorithm": "SHA256", "checksumValue": "abc" }],
+                "licenseConcluded": "MIT",
+                "externalRefs": [{
+                    "referenceCategory": "PACKAGE-MANAGER",
+                    "referenceType": "purl",
+                    "referenceLocator": "pkg:generic/acme-app@1.0.0"
+                }]
+            }],
+            "relationships": [{
+                "spdxElementId": "SPDXRef-DOCUMENT",
+                "relatedSpdxElement": "SPDXRef-Package-acme-app",
+                "relationshipType": "DESCRIBES"
+            }]
+        })
+    }
+
+    #[test]
+    fn fully_populated_cyclonedx_meets_ntia_minimum_and_full() {
+        let bytes = serde_json::to_vec(&complete_cyclonedx_ntia()).unwrap();
+        let report = NtiaProfile.check("cyclonedx", &bytes);
+        assert!(report.applicable);
+        assert!(report.meets_minimum, "minimum issues: {:?}", report.minimum_issues);
+        assert!(report.fully_compliant, "missing fields: {:?}", report.missing_fields);
+    }
+
+    #[test]
+    fn fully_populated_spdx_meets_ntia_minimum_and_full() {
+        let bytes = serde_json::to_vec(&complete_spdx_ntia()).unwrap();
+        let report = NtiaProfile.check("spdx", &bytes);
+        assert!(report.applicable);
+        assert!(report.meets_minimum, "minimum issues: {:?}", report.minimum_issues);
+        assert!(report.fully_compliant, "missing fields: {:?}", report.missing_fields);
+    }
+
+    #[test]
+    fn missing_cyclonedx_supplier_fails_ntia_minimum() {
+        let mut doc = complete_cyclonedx_ntia();
+        doc["components"][0].as_object_mut().unwrap().remove("supplier");
+        let bytes = serde_json::to_vec(&doc).unwrap();
+        let report = NtiaProfile.check("cyclonedx", &bytes);
+        assert!(!report.meets_minimum);
+        assert!(report.minimum_issues.iter().any(|m| m.contains("components[0]") && m.contains("Supplier")));
+    }
+
+    #[test]
+    fn missing_sbom_author_and_timestamp_fails_ntia_minimum() {
+        let mut doc = complete_cyclonedx_ntia();
+        doc["metadata"].as_object_mut().unwrap().remove("authors");
+        doc["metadata"].as_object_mut().unwrap().remove("timestamp");
+        let bytes = serde_json::to_vec(&doc).unwrap();
+        let report = NtiaProfile.check("cyclonedx", &bytes);
+        assert!(!report.meets_minimum);
+        assert!(report.minimum_issues.iter().any(|m| m.contains("Author of SBOM Data")));
+        assert!(report.minimum_issues.iter().any(|m| m.contains("Timestamp")));
+    }
+
+    #[test]
+    fn spdx_noassertion_supplier_is_treated_as_missing() {
+        let mut doc = complete_spdx_ntia();
+        doc["packages"][0]["supplier"] = json!("NOASSERTION");
+        let bytes = serde_json::to_vec(&doc).unwrap();
+        let report = NtiaProfile.check("spdx", &bytes);
+        assert!(!report.meets_minimum);
+        assert!(report.minimum_issues.iter().any(|m| m.contains("Supplier")));
+    }
+
+    #[test]
+    fn ntia_generic_document_upload_is_not_applicable() {
+        let report = NtiaProfile.check("document", b"whatever bytes");
         assert!(!report.applicable);
     }
 }

@@ -59,6 +59,34 @@ pub struct ApiKeyRecord {
     pub created_at: DateTime<Utc>,
 }
 
+/// Deliberately independent of `magnolia_core::ExtractedComponent` — this
+/// crate doesn't otherwise depend on `magnolia-core` (`insert_manifest`
+/// etc. already take plain primitives, not core domain types), so callers
+/// convert into this shape rather than `magnolia-db` picking up a new
+/// cross-crate dependency for one struct.
+#[derive(Debug, Clone)]
+pub struct NewSbomComponent {
+    pub name: String,
+    pub version: Option<String>,
+    pub purl: Option<String>,
+    pub cpe: Option<String>,
+    pub is_primary: bool,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct SbomComponentSearchRow {
+    pub name: String,
+    pub version: Option<String>,
+    pub purl: Option<String>,
+    pub cpe: Option<String>,
+    pub is_primary: bool,
+    pub manifest_hash: String,
+    pub namespace: String,
+    pub release_version: String,
+    pub revoked: bool,
+    pub document_type: Option<String>,
+}
+
 #[derive(Debug, Clone, FromRow)]
 pub struct ComplianceSettingRecord {
     pub tenant_id: uuid::Uuid,

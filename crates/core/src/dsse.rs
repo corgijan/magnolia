@@ -96,6 +96,30 @@ pub struct DocumentPredicate {
 
 pub type DocumentStatement = Statement<DocumentPredicate>;
 
+pub const SNAPSHOT_PREDICATE_TYPE: &str = "https://magnolia.dev/attestations/snapshot/v1";
+
+/// Metadata for a signed audit archive — a point-in-time export of every
+/// manifest/document matching the requested scope. Each included item
+/// appears as its own entry in `Statement::subject` (digest = its
+/// sbom_hash), so the signature structurally binds the archive to the
+/// exact set of item hashes it claims to contain.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotPredicate {
+    pub tenant_id: uuid::Uuid,
+    pub domain: String,
+    pub created_by: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub tree_size: u64,
+    pub root_hash: String,
+    /// Human-readable scope description, e.g. "all", "namespace=/product1",
+    /// "version=1.2.3" — recorded in the signed predicate so the archive's
+    /// own contents-claim is part of what's verified, not just asserted in
+    /// a filename.
+    pub scope: String,
+}
+
+pub type SnapshotStatement = Statement<SnapshotPredicate>;
+
 pub fn build_envelope(
     payload_type: &str,
     statement_bytes: &[u8],
@@ -196,6 +220,49 @@ mod tests {
         let decoded_statement: DocumentStatement = serde_json::from_slice(&decoded_payload).unwrap();
         assert_eq!(decoded_statement.predicate_type, DOCUMENT_PREDICATE_TYPE);
         assert_eq!(decoded_statement.predicate.document_type, "risk-assessment");
+    }
+
+    /// A snapshot statement carries multiple subjects (one per archived
+    /// item) rather than the single-subject shape manifest/document
+    /// statements use — confirms `Statement<P>`'s `subject: Vec<Subject>`
+    /// genuinely supports that, not just by inspection.
+    #[test]
+    fn snapshot_statement_round_trips_with_multiple_subjects() {
+        let statement = SnapshotStatement {
+            statement_type: IN_TOTO_STATEMENT_TYPE.to_string(),
+            subject: vec![
+                Subject {
+                    name: "acme.example/product/v1@1.0.0".to_string(),
+                    digest: [("sha256".to_string(), "abc123".to_string())].into_iter().collect(),
+                },
+                Subject {
+                    name: "acme.example/product/v2@2.0.0".to_string(),
+                    digest: [("sha256".to_string(), "def456".to_string())].into_iter().collect(),
+                },
+            ],
+            predicate_type: SNAPSHOT_PREDICATE_TYPE.to_string(),
+            predicate: SnapshotPredicate {
+                tenant_id: uuid::Uuid::nil(),
+                domain: "acme.example".to_string(),
+                created_by: "apikey:test".to_string(),
+                created_at: chrono::Utc::now(),
+                tree_size: 42,
+                root_hash: "rootabc".to_string(),
+                scope: "all".to_string(),
+            },
+        };
+        let statement_bytes = serde_json::to_vec(&statement).unwrap();
+        let envelope = build_envelope(DSSE_PAYLOAD_TYPE, &statement_bytes, b"fake-sig", "keyid1");
+
+        let json = serde_json::to_string(&envelope).unwrap();
+        let roundtripped: DsseEnvelope = serde_json::from_str(&json).unwrap();
+        let decoded_payload = B64.decode(&roundtripped.payload).unwrap();
+        assert_eq!(decoded_payload, statement_bytes);
+
+        let decoded_statement: SnapshotStatement = serde_json::from_slice(&decoded_payload).unwrap();
+        assert_eq!(decoded_statement.predicate_type, SNAPSHOT_PREDICATE_TYPE);
+        assert_eq!(decoded_statement.subject.len(), 2);
+        assert_eq!(decoded_statement.predicate.tree_size, 42);
     }
 
     /// Signs with raw `ed25519-dalek` (a dev-dependency, not any of
