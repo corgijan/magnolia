@@ -64,6 +64,15 @@ services:
     volumes:
       - signing_key:/data
 
+  # frontend:
+  #   build:
+  #     context: ./frontend
+  #     dockerfile: Dockerfile
+  #   depends_on:
+  #     - api
+  #   ports:
+  #     - "4000:80"
+
   # ---- Optional Dependency-Track integration (docker compose --profile dtrack up) ----
   # Not started by a plain `docker compose up` — opt-in only. See
   # DTRACK_PLAN.md for the full design and the one-time bootstrap steps.

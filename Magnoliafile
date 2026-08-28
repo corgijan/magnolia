@@ -1,5 +1,8 @@
-# Magnoliafile 
+# Magnoliafile
 tenant_url=http://127.0.0.1:3000
-namespace=/cluster/platform/test
-sbom=sbom_test.json
+# tenant_domain is REQUIRED -- the script verifies MAGNOLIA_API_KEY actually
+tenant_domain=com3m.platform.io
+namespace=/platform-test/prod
+sbom=bom.json
 format=cyclonedx
+

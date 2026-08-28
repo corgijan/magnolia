@@ -107,6 +107,49 @@ impl DtrackClient {
         Ok(raw.into_iter().map(DtrackFinding::from).collect())
     }
 
+    /// `PUT /api/v1/analysis` — records (or updates) dtrack's own analysis
+    /// for one component/vulnerability pair within a project. Used to push
+    /// Magnolia's own VEX-style triage into dtrack so dtrack's own view (and
+    /// anything else reading dtrack directly) reflects Magnolia's judgment
+    /// instead of staying permanently "not set". `analysis_state` and
+    /// `analysis_justification` are dtrack's own enum strings (e.g.
+    /// `"NOT_AFFECTED"`, `"CODE_NOT_REACHABLE"`) — see
+    /// `dtrack_sync::map_vex_to_dtrack_analysis` in `magnolia-api` for the
+    /// translation from Magnolia's VEX vocabulary. `comment`, when set, is
+    /// appended as a new analysis comment on dtrack's side (dtrack keeps a
+    /// comment trail per analysis, it does not overwrite a single field).
+    pub async fn set_analysis(
+        &self,
+        project_uuid: Uuid,
+        component_uuid: &str,
+        vulnerability_uuid: &str,
+        analysis_state: &str,
+        analysis_justification: Option<&str>,
+        comment: Option<&str>,
+    ) -> Result<(), DtrackError> {
+        let mut body = serde_json::json!({
+            "project": project_uuid,
+            "component": component_uuid,
+            "vulnerability": vulnerability_uuid,
+            "analysisState": analysis_state,
+        });
+        if let Some(j) = analysis_justification {
+            body["analysisJustification"] = serde_json::Value::String(j.to_string());
+        }
+        if let Some(c) = comment {
+            body["comment"] = serde_json::Value::String(c.to_string());
+        }
+        let resp = self
+            .http
+            .put(self.url("/api/v1/analysis"))
+            .header("X-Api-Key", &self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| DtrackError::Request(e.to_string()))?;
+        Self::check_status(resp).await.map(|_| ())
+    }
+
     async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, DtrackError> {
         if resp.status().is_success() {
             Ok(resp)

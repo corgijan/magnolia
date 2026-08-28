@@ -18,11 +18,13 @@ import {
   InclusionProof,
   Leaf,
   Manifest,
+  ManifestDiff,
   ReindexResult,
   setApiKey,
   Tenant,
   TreeHead,
   UploadResult,
+  VEX_JUSTIFICATIONS,
   VulnerabilityFinding,
   WhoAmI,
 } from './api';
@@ -1444,6 +1446,10 @@ function SbomDetailPanel({
   const [dtrackEnabled, setDtrackEnabled] = useState(false);
   const [dtrackSyncDisabled, setDtrackSyncDisabled] = useState(false);
   const [dtrackSyncIntervalSecs, setDtrackSyncIntervalSecs] = useState<number | null>(null);
+  const [diff, setDiff] = useState<ManifestDiff | null>(null);
+  const [diffBusy, setDiffBusy] = useState(false);
+  const [diffError, setDiffError] = useState('');
+  const [diffOpen, setDiffOpen] = useState(false);
 
   useEffect(() => {
     let mounted = true;
@@ -1483,6 +1489,14 @@ function SbomDetailPanel({
     load();
   }, [load]);
 
+  // Reset the diff panel when switching to a different manifest — otherwise
+  // the previous manifest's diff would stay visible/stale under the new one.
+  useEffect(() => {
+    setDiff(null);
+    setDiffError('');
+    setDiffOpen(false);
+  }, [hash]);
+
   const revoke = async () => {
     if (!manifest) return;
     if (
@@ -1502,6 +1516,25 @@ function SbomDetailPanel({
       setRevokeError(e instanceof Error ? e.message : String(e));
     } finally {
       setRevoking(false);
+    }
+  };
+
+  const loadDiff = async () => {
+    if (!manifest) return;
+    if (diffOpen) {
+      setDiffOpen(false);
+      return;
+    }
+    setDiffOpen(true);
+    if (diff) return; // already loaded once for this manifest
+    setDiffBusy(true);
+    setDiffError('');
+    try {
+      setDiff(await api.manifestDiff(manifest.manifest_hash, undefined, tenantId));
+    } catch (e) {
+      setDiffError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDiffBusy(false);
     }
   };
 
@@ -1593,6 +1626,76 @@ function SbomDetailPanel({
                   deleted (same "mark, don't delete" idiom used elsewhere),
                   they're just not surfaced on this page while sync is off;
                   re-enabling sync brings them back into view immediately. */}
+              {!manifest.document_type && (
+                <>
+                  <tr>
+                    <td colSpan={2}><strong>Component changes</strong></td>
+                  </tr>
+                  <tr>
+                    <td colSpan={2}>
+                      <span className="cell-actions">
+                        <button className="btn" onClick={loadDiff}>
+                          {diffOpen ? 'Hide' : 'Show'} diff vs previous version
+                        </button>
+                      </span>
+                      {diffOpen && (
+                        <div style={{ marginTop: 6 }}>
+                          {diffBusy && <Spinner label="Diffing…" />}
+                          {diffError && <ErrorBox message={diffError} />}
+                          {diff && (
+                            <div>
+                              <div className="muted">
+                                {diff.from_version} → {diff.to_version} ({diff.unchanged_count} unchanged)
+                              </div>
+                              {diff.added.length > 0 && (
+                                <div>
+                                  <strong>+{diff.added.length} added</strong>
+                                  <ul>
+                                    {diff.added.map((c) => (
+                                      <li key={`add-${c.purl ?? c.name}`}>
+                                        {c.name}
+                                        {c.version ? `@${c.version}` : ''}
+                                      </li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              )}
+                              {diff.removed.length > 0 && (
+                                <div>
+                                  <strong>-{diff.removed.length} removed</strong>
+                                  <ul>
+                                    {diff.removed.map((c) => (
+                                      <li key={`rem-${c.purl ?? c.name}`}>
+                                        {c.name}
+                                        {c.version ? `@${c.version}` : ''}
+                                      </li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              )}
+                              {diff.changed.length > 0 && (
+                                <div>
+                                  <strong>~{diff.changed.length} version changed</strong>
+                                  <ul>
+                                    {diff.changed.map((c) => (
+                                      <li key={`chg-${c.purl ?? c.name}`}>
+                                        {c.name}: {c.from_version ?? '?'} → {c.to_version ?? '?'}
+                                      </li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              )}
+                              {diff.added.length === 0 && diff.removed.length === 0 && diff.changed.length === 0 && (
+                                <span className="muted">No component changes since the previous version.</span>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                </>
+              )}
               {!manifest.document_type && dtrackEnabled && !dtrackSyncDisabled && (
                 <>
                   <tr>
@@ -1777,6 +1880,7 @@ function FindingTriageControls({
 }) {
   const [status, setStatus] = useState(finding.vex_status ?? '');
   const [justification, setJustification] = useState(finding.vex_justification ?? '');
+  const [comment, setComment] = useState(finding.vex_comment ?? '');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
@@ -1785,7 +1889,14 @@ function FindingTriageControls({
     setBusy(true);
     setError('');
     try {
-      await api.triageFinding(manifestHash, finding.finding_key, status, justification.trim() || undefined, tenantId);
+      await api.triageFinding(
+        manifestHash,
+        finding.finding_key,
+        status,
+        status === 'not_affected' ? justification || undefined : undefined,
+        comment.trim() || undefined,
+        tenantId
+      );
       onSaved();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -1812,14 +1923,26 @@ function FindingTriageControls({
           <option value="under_investigation">under_investigation</option>
         </select>
         {status === 'not_affected' && (
-          <textarea
-            placeholder="justification (required)"
-            value={justification}
-            onChange={(e) => setJustification(e.target.value)}
-            disabled={busy}
-          />
+          <select value={justification} onChange={(e) => setJustification(e.target.value)} disabled={busy}>
+            <option value="">justification (required)…</option>
+            {VEX_JUSTIFICATIONS.map((j) => (
+              <option key={j} value={j}>
+                {j}
+              </option>
+            ))}
+          </select>
         )}
-        <button className="btn" disabled={busy || !status} onClick={save}>
+        <textarea
+          placeholder="comment (optional)"
+          value={comment}
+          onChange={(e) => setComment(e.target.value)}
+          disabled={busy}
+        />
+        <button
+          className="btn"
+          disabled={busy || !status || (status === 'not_affected' && !justification)}
+          onClick={save}
+        >
           {busy ? 'Saving…' : 'Save'}
         </button>
       </div>
@@ -3635,6 +3758,9 @@ function Settings({
   const [dtrackSyncDisabled, setDtrackSyncDisabled] = useState<boolean | null>(null);
   const [dtrackSyncBusy, setDtrackSyncBusy] = useState(false);
   const [dtrackSyncError, setDtrackSyncError] = useState('');
+  const [semverRequired, setSemverRequired] = useState<boolean | null>(null);
+  const [semverBusy, setSemverBusy] = useState(false);
+  const [semverError, setSemverError] = useState('');
 
   useEffect(() => {
     let mounted = true;
@@ -3642,6 +3768,9 @@ function Settings({
     api.dtrackSyncSetting(tenantId)
       .then((s) => mounted && setDtrackSyncDisabled(s.disabled))
       .catch(() => mounted && setDtrackSyncDisabled(null));
+    api.semverSetting(tenantId)
+      .then((s) => mounted && setSemverRequired(s.required))
+      .catch(() => mounted && setSemverRequired(null));
     return () => {
       mounted = false;
     };
@@ -3658,6 +3787,19 @@ function Settings({
       setDtrackSyncError(e instanceof Error ? e.message : String(e));
     } finally {
       setDtrackSyncBusy(false);
+    }
+  };
+
+  const toggleSemverRequired = async (required: boolean) => {
+    setSemverBusy(true);
+    setSemverError('');
+    try {
+      await api.setSemverSetting(required, tenantId);
+      setSemverRequired(required);
+    } catch (e) {
+      setSemverError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSemverBusy(false);
     }
   };
 
@@ -3791,6 +3933,30 @@ function Settings({
           </div>
         )}
         {dtrackSyncError && <ErrorBox message={dtrackSyncError} />}
+      </div>
+
+      <div className="card">
+        <div className="card-header">
+          <h2>SBOM uploads</h2>
+        </div>
+        <div className="kv-row">
+          <label className="checkbox-field">
+            <input
+              type="checkbox"
+              checked={semverRequired ?? false}
+              disabled={semverBusy || semverRequired === null}
+              onChange={(e) => toggleSemverRequired(e.target.checked)}
+            />
+            Require SemVer-compliant version on upload
+          </label>
+          <span className="muted">
+            {' '}
+            — {semverRequired
+              ? 'uploads with a version that is not SemVer 2.0.0 compliant (e.g. 1.2.3, 1.2.3-rc.1) are rejected'
+              : 'any non-empty version string is accepted'}
+          </span>
+        </div>
+        {semverError && <ErrorBox message={semverError} />}
       </div>
 
       <div className="card">

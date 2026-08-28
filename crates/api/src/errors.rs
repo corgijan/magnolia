@@ -7,6 +7,7 @@ pub enum ApiError {
     Unauthorized,
     Forbidden(String),
     BadRequest(String),
+    PayloadTooLarge(String),
     NotFound,
     InternalError(String),
 }
@@ -17,6 +18,7 @@ impl std::fmt::Display for ApiError {
             ApiError::Unauthorized => write!(f, "Unauthorized"),
             ApiError::Forbidden(msg) => write!(f, "Forbidden: {}", msg),
             ApiError::BadRequest(msg) => write!(f, "Bad request: {}", msg),
+            ApiError::PayloadTooLarge(msg) => write!(f, "Payload too large: {}", msg),
             ApiError::NotFound => write!(f, "Not found"),
             ApiError::InternalError(msg) => write!(f, "Internal error: {}", msg),
         }
@@ -29,6 +31,7 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
             ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
+            ApiError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string()),
             ApiError::InternalError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };

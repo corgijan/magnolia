@@ -5,7 +5,8 @@ pub use models::{
     ApiKeyRecord, AuditLogRecord, ComplianceSettingRecord, DtrackFindingRecord,
     DtrackFindingWithContextRecord, DtrackProjectRecord, DtrackPushFailureRecord,
     FindingCommentRecord, ManifestRecord, MerkleLeafRecord, MerkleNodeRecord, NewDtrackFinding,
-    NewSbomComponent, SbomComponentSearchRow, SignedTreeHeadRecord, TenantRecord,
+    NewSbomComponent, SbomComponentRow, SbomComponentSearchRow, SignedTreeHeadRecord,
+    TenantRecord,
 };
 pub use errors::DbError;
 
@@ -89,7 +90,7 @@ impl Database {
 
     pub async fn get_tenant(&self, id: Uuid) -> Result<Option<TenantRecord>, DbError> {
         sqlx::query_as::<_, TenantRecord>(
-            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled FROM tenants WHERE id = $1",
+            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled, require_semver_version FROM tenants WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -102,7 +103,7 @@ impl Database {
         domain: &str,
     ) -> Result<Option<TenantRecord>, DbError> {
         sqlx::query_as::<_, TenantRecord>(
-            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled FROM tenants WHERE domain = $1",
+            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled, require_semver_version FROM tenants WHERE domain = $1",
         )
         .bind(domain)
         .fetch_optional(&self.pool)
@@ -116,7 +117,7 @@ impl Database {
     /// reachable directly (e.g. `?tenant_id=` override), just not listed.
     pub async fn list_tenants(&self) -> Result<Vec<TenantRecord>, DbError> {
         sqlx::query_as::<_, TenantRecord>(
-            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled FROM tenants WHERE hidden = FALSE ORDER BY created_at DESC",
+            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled, require_semver_version FROM tenants WHERE hidden = FALSE ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
         .await
@@ -130,6 +131,19 @@ impl Database {
     pub async fn set_tenant_dtrack_sync_disabled(&self, tenant_id: Uuid, disabled: bool) -> Result<(), DbError> {
         sqlx::query("UPDATE tenants SET dtrack_sync_disabled = $1 WHERE id = $2")
             .bind(disabled)
+            .bind(tenant_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DbError::QueryError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Per-tenant toggle requiring `upload_sbom`'s `version` field to be
+    /// SemVer 2.0.0-compliant (on by default; see the `require_semver_version` migration
+    /// comment).
+    pub async fn set_tenant_require_semver_version(&self, tenant_id: Uuid, required: bool) -> Result<(), DbError> {
+        sqlx::query("UPDATE tenants SET require_semver_version = $1 WHERE id = $2")
+            .bind(required)
             .bind(tenant_id)
             .execute(&self.pool)
             .await
@@ -530,6 +544,42 @@ impl Database {
         .map_err(|e| DbError::QueryError(e.to_string()))
     }
 
+    /// The manifest immediately before a given point in one namespace's own
+    /// upload history (ordered by `created_at`, `leaf_seq_id` as tiebreaker)
+    /// — unlike `previous_manifest_hash` on `manifests` itself, which chains
+    /// the tenant-wide append-order log, not per-namespace version history.
+    /// Used by `manifest_diff`'s default "diff against the previous
+    /// version" when no explicit `against` is given. Includes revoked
+    /// manifests — they're still real history of what was there before.
+    pub async fn get_previous_manifest_in_namespace(
+        &self,
+        tenant_id: Uuid,
+        namespace: &str,
+        before_created_at: chrono::DateTime<chrono::Utc>,
+        before_leaf_seq_id: i64,
+    ) -> Result<Option<ManifestRecord>, DbError> {
+        sqlx::query_as::<_, ManifestRecord>(
+            r#"
+            SELECT manifest_hash, leaf_seq_id, tenant_id, version, sbom_hash, sbom_format,
+                   sbom_s3_key, namespace, previous_manifest_hash, signature, dsse_envelope, document_type, created_by, created_at,
+                   revoked, revoked_at, revoked_by
+            FROM manifests
+            WHERE tenant_id = $1
+              AND namespace = $2
+              AND (created_at, leaf_seq_id) < ($3, $4)
+            ORDER BY created_at DESC, leaf_seq_id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(namespace)
+        .bind(before_created_at)
+        .bind(before_leaf_seq_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DbError::QueryError(e.to_string()))
+    }
+
     /// Most recent non-revoked manifest per namespace, within a tenant and
     /// namespace scope. Unlike `latest_manifest` (tenant-wide single row,
     /// used to chain `previous_manifest_hash` on upload), this groups by
@@ -782,6 +832,22 @@ impl Database {
         }
         q.execute(&self.pool).await.map_err(map_query_error)?;
         Ok(())
+    }
+
+    /// One manifest's full indexed component list, unfiltered — used by
+    /// `manifest_diff` to compare exactly two manifests, unlike
+    /// `search_sbom_components` below which searches across the archive.
+    pub async fn list_sbom_components_for_manifest(
+        &self,
+        manifest_hash: &str,
+    ) -> Result<Vec<SbomComponentRow>, DbError> {
+        sqlx::query_as::<_, SbomComponentRow>(
+            "SELECT name, version, purl, cpe, is_primary FROM sbom_components WHERE manifest_hash = $1",
+        )
+        .bind(manifest_hash)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
     }
 
     /// Component-name prefix (case-insensitive) and/or exact-purl reverse
@@ -1057,8 +1123,8 @@ impl Database {
     /// dtrack. Findings no longer present (remediated, reanalyzed away) are
     /// deleted; findings still present are upserted rather than
     /// delete-then-inserted, so an analyst's `vex_status`/`vex_justification`/
-    /// `triaged_by`/`triaged_at` on a still-present finding survives a
-    /// routine sync pass instead of being silently wiped.
+    /// `vex_comment`/`triaged_by`/`triaged_at` on a still-present finding
+    /// survives a routine sync pass instead of being silently wiped.
     pub async fn replace_dtrack_findings(
         &self,
         manifest_hash: &str,
@@ -1079,8 +1145,9 @@ impl Database {
                 r#"
                 INSERT INTO dtrack_findings
                     (manifest_hash, finding_key, component_name, component_version,
-                     vulnerability_id, severity, description, analysis_state, synced_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+                     vulnerability_id, severity, description, analysis_state, synced_at,
+                     component_uuid, vulnerability_uuid)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), $9, $10)
                 ON CONFLICT (manifest_hash, finding_key)
                 DO UPDATE SET component_name = EXCLUDED.component_name,
                                component_version = EXCLUDED.component_version,
@@ -1088,7 +1155,9 @@ impl Database {
                                severity = EXCLUDED.severity,
                                description = EXCLUDED.description,
                                analysis_state = EXCLUDED.analysis_state,
-                               synced_at = EXCLUDED.synced_at
+                               synced_at = EXCLUDED.synced_at,
+                               component_uuid = EXCLUDED.component_uuid,
+                               vulnerability_uuid = EXCLUDED.vulnerability_uuid
                 "#,
             )
             .bind(manifest_hash)
@@ -1099,6 +1168,8 @@ impl Database {
             .bind(&f.severity)
             .bind(&f.description)
             .bind(&f.analysis_state)
+            .bind(&f.component_uuid)
+            .bind(&f.vulnerability_uuid)
             .execute(&mut *tx)
             .await
             .map_err(map_query_error)?;
@@ -1113,7 +1184,8 @@ impl Database {
             r#"
             SELECT manifest_hash, finding_key, component_name, component_version,
                    vulnerability_id, severity, description, analysis_state, synced_at,
-                   vex_status, vex_justification, triaged_by, triaged_at
+                   vex_status, vex_justification, vex_comment, triaged_by, triaged_at,
+                   component_uuid, vulnerability_uuid
             FROM dtrack_findings
             WHERE manifest_hash = $1
             ORDER BY severity, vulnerability_id
@@ -1173,7 +1245,7 @@ impl Database {
             r#"
             SELECT df.manifest_hash, df.finding_key, df.component_name, df.component_version,
                    df.vulnerability_id, df.severity, df.description, df.analysis_state, df.synced_at,
-                   df.vex_status, df.vex_justification, df.triaged_by, df.triaged_at,
+                   df.vex_status, df.vex_justification, df.vex_comment, df.triaged_by, df.triaged_at,
                    m.namespace, m.version AS release_version, m.revoked,
                    (SELECT count(*) FROM finding_comments fc
                     WHERE fc.manifest_hash = df.manifest_hash AND fc.finding_key = df.finding_key) AS comment_count
@@ -1308,20 +1380,23 @@ impl Database {
         finding_key: &str,
         vex_status: &str,
         justification: Option<&str>,
+        comment: Option<&str>,
         triaged_by: &str,
     ) -> Result<Option<DtrackFindingRecord>, DbError> {
         sqlx::query_as::<_, DtrackFindingRecord>(
             r#"
             UPDATE dtrack_findings
-            SET vex_status = $1, vex_justification = $2, triaged_by = $3, triaged_at = now()
-            WHERE manifest_hash = $4 AND finding_key = $5
+            SET vex_status = $1, vex_justification = $2, vex_comment = $3, triaged_by = $4, triaged_at = now()
+            WHERE manifest_hash = $5 AND finding_key = $6
             RETURNING manifest_hash, finding_key, component_name, component_version,
                       vulnerability_id, severity, description, analysis_state, synced_at,
-                      vex_status, vex_justification, triaged_by, triaged_at
+                      vex_status, vex_justification, vex_comment, triaged_by, triaged_at,
+                      component_uuid, vulnerability_uuid
             "#,
         )
         .bind(vex_status)
         .bind(justification)
+        .bind(comment)
         .bind(triaged_by)
         .bind(manifest_hash)
         .bind(finding_key)

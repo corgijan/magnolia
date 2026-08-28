@@ -13,6 +13,12 @@ pub struct DtrackFinding {
     /// Stable per-finding identity, used as half of `dtrack_findings`'
     /// primary key — see `From<RawFinding>` below for how it's derived.
     pub finding_key: String,
+    /// dtrack's own UUIDs for the component and vulnerability this finding
+    /// is about — needed to address `PUT /api/v1/analysis` (which identifies
+    /// a finding by project+component+vulnerability UUID, not by
+    /// `finding_key`) when pushing Magnolia's own triage back to dtrack.
+    pub component_uuid: String,
+    pub vulnerability_uuid: String,
 }
 
 /// Raw shape of one entry in dtrack's `GET /api/v1/finding/project/{uuid}`
@@ -70,6 +76,8 @@ impl From<RawFinding> for DtrackFinding {
             description: raw.vulnerability.description,
             analysis_state: raw.analysis.and_then(|a| a.state),
             finding_key,
+            component_uuid: raw.component.uuid,
+            vulnerability_uuid: raw.vulnerability.uuid,
         }
     }
 }

@@ -10,6 +10,7 @@ pub use errors::ApiError;
 pub use state::AppState;
 pub use auth::AuthGrant;
 
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, post};
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
@@ -22,10 +23,16 @@ pub fn create_router(state: AppState) -> Router {
 
     Router::new()
         .route("/health", get(handlers::health))
+        .route("/install.sh", get(handlers::install_script))
         .route("/api/v1/whoami", get(handlers::whoami))
         .route("/api/v1/config", get(handlers::config))
         .route("/api/v1/signing-key", get(handlers::signing_key))
-        .route("/api/v1/upload", post(handlers::upload_sbom))
+        .route(
+            "/api/v1/upload",
+            post(handlers::upload_sbom).layer(DefaultBodyLimit::max(
+                handlers::MAX_SBOM_BYTES + 64 * 1024,
+            )),
+        )
         .route(
             "/api/v1/tree-head/latest",
             get(handlers::tree_head_latest),
@@ -44,6 +51,8 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/v1/leaves", get(handlers::leaves))
         .route("/api/v1/manifest/:manifest_hash", get(handlers::manifest))
+        .route("/api/v1/manifest/:manifest_hash/vex", get(handlers::manifest_vex))
+        .route("/api/v1/manifest/:manifest_hash/diff", get(handlers::manifest_diff))
         .route(
             "/api/v1/manifest/:manifest_hash/revoke",
             post(handlers::revoke_manifest),
@@ -69,12 +78,18 @@ pub fn create_router(state: AppState) -> Router {
             get(handlers::dtrack_sync_setting).post(handlers::set_dtrack_sync_setting),
         )
         .route(
+            "/api/v1/settings/semver-version",
+            get(handlers::semver_setting).post(handlers::set_semver_setting),
+        )
+        .route(
             "/api/v1/compliance/profiles",
             get(handlers::list_compliance_profiles),
         )
         .route(
             "/api/v1/tools/compliance-check",
-            post(handlers::check_compliance),
+            post(handlers::check_compliance).layer(DefaultBodyLimit::max(
+                handlers::MAX_SBOM_BYTES + 64 * 1024,
+            )),
         )
         .route(
             "/api/v1/compliance/settings",

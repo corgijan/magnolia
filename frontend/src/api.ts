@@ -129,9 +129,23 @@ export interface VulnerabilityFinding {
   analysis_state: string | null;
   vex_status: 'affected' | 'not_affected' | 'fixed' | 'under_investigation' | null;
   vex_justification: string | null;
+  // Free-text context alongside the triage, independent of vex_justification
+  // (which is now a fixed VEX vocabulary, see VEX_JUSTIFICATIONS below).
+  vex_comment: string | null;
   triaged_by: string | null;
   triaged_at: string | null;
 }
+
+// The fixed OpenVEX justification vocabulary (https://github.com/openvex/spec)
+// — mirrors the backend's VEX_JUSTIFICATIONS constant. Only valid, and only
+// required, alongside vex_status "not_affected".
+export const VEX_JUSTIFICATIONS = [
+  'component_not_present',
+  'vulnerable_code_not_present',
+  'vulnerable_code_not_in_execute_path',
+  'vulnerable_code_cannot_be_controlled_by_adversary',
+  'inline_mitigations_already_exist',
+] as const;
 
 // A finding plus enough manifest context to place it in the archive — the
 // shape returned by the cross-manifest GET /api/v1/findings, distinct from
@@ -143,6 +157,30 @@ export interface FindingWithContext extends VulnerabilityFinding {
   release_version: string;
   revoked: boolean;
   comment_count: number;
+}
+
+export interface ComponentSummary {
+  name: string;
+  version: string | null;
+  purl: string | null;
+}
+
+export interface ComponentVersionChange {
+  name: string;
+  purl: string | null;
+  from_version: string | null;
+  to_version: string | null;
+}
+
+export interface ManifestDiff {
+  from_manifest_hash: string;
+  from_version: string;
+  to_manifest_hash: string;
+  to_version: string;
+  added: ComponentSummary[];
+  removed: ComponentSummary[];
+  changed: ComponentVersionChange[];
+  unchanged_count: number;
 }
 
 export interface FindingComment {
@@ -267,6 +305,12 @@ export interface BackendConfig {
 // from BackendConfig.dtrack_enabled, which is deployment-wide/read-only.
 export interface DtrackSyncSetting {
   disabled: boolean;
+}
+
+// This tenant's opt-in requiring uploaded SBOMs' `version` field to be
+// SemVer 2.0.0-compliant.
+export interface SemverSetting {
+  required: boolean;
 }
 
 export interface AuditEntry {
@@ -406,13 +450,22 @@ export const api = {
     findingKey: string,
     vexStatus: string,
     justification: string | undefined,
+    comment: string | undefined,
     tenantId?: string
   ): Promise<VulnerabilityFinding> =>
     request(`/api/v1/manifest/${manifestHash}/findings/${findingKey}/triage${tenantQs(tenantId)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ vex_status: vexStatus, justification }),
+      body: JSON.stringify({ vex_status: vexStatus, justification, comment }),
     }),
+
+  manifestVex: (manifestHash: string, tenantId?: string): Promise<Record<string, unknown>> =>
+    request(`/api/v1/manifest/${manifestHash}/vex${tenantQs(tenantId)}`),
+
+  manifestDiff: (manifestHash: string, against: string | undefined, tenantId?: string): Promise<ManifestDiff> =>
+    request(
+      `/api/v1/manifest/${manifestHash}/diff${tenantQs(tenantId, against ? { against } : {})}`
+    ),
 
   listFindings: (
     opts: {
@@ -484,6 +537,16 @@ export const api = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ disabled }),
+    }),
+
+  semverSetting: (tenantId?: string): Promise<SemverSetting> =>
+    request(`/api/v1/settings/semver-version${tenantQs(tenantId)}`),
+
+  setSemverSetting: (required: boolean, tenantId?: string): Promise<void> =>
+    request(`/api/v1/settings/semver-version${tenantQs(tenantId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ required }),
     }),
 
   complianceProfiles: (): Promise<ComplianceProfileInfo[]> =>

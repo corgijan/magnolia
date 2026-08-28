@@ -38,6 +38,7 @@ pub struct TenantRecord {
     pub is_platform: bool,
     pub hidden: bool,
     pub dtrack_sync_disabled: bool,
+    pub require_semver_version: bool,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -86,6 +87,19 @@ pub struct SbomComponentSearchRow {
     pub release_version: String,
     pub revoked: bool,
     pub document_type: Option<String>,
+}
+
+/// One manifest's indexed component, without the manifest-context columns
+/// `SbomComponentSearchRow` carries — used by `manifest_diff` to fetch
+/// exactly two manifests' component lists for comparison, not to search
+/// across the whole archive.
+#[derive(Debug, Clone, FromRow)]
+pub struct SbomComponentRow {
+    pub name: String,
+    pub version: Option<String>,
+    pub purl: Option<String>,
+    pub cpe: Option<String>,
+    pub is_primary: bool,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -156,6 +170,10 @@ pub struct NewDtrackFinding {
     pub severity: String,
     pub description: Option<String>,
     pub analysis_state: Option<String>,
+    /// dtrack's own component/vulnerability UUIDs — see the
+    /// `dtrack_finding_uuids` migration comment.
+    pub component_uuid: String,
+    pub vulnerability_uuid: String,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -171,8 +189,14 @@ pub struct DtrackFindingRecord {
     pub synced_at: DateTime<Utc>,
     pub vex_status: Option<String>,
     pub vex_justification: Option<String>,
+    pub vex_comment: Option<String>,
     pub triaged_by: Option<String>,
     pub triaged_at: Option<DateTime<Utc>>,
+    /// `None` for findings cached before the `dtrack_finding_uuids`
+    /// migration, until their next sync refresh — a triage push to dtrack
+    /// skips a finding without these rather than erroring.
+    pub component_uuid: Option<String>,
+    pub vulnerability_uuid: Option<String>,
 }
 
 /// A finding plus enough manifest context (namespace/version/revoked) to
@@ -192,6 +216,7 @@ pub struct DtrackFindingWithContextRecord {
     pub synced_at: DateTime<Utc>,
     pub vex_status: Option<String>,
     pub vex_justification: Option<String>,
+    pub vex_comment: Option<String>,
     pub triaged_by: Option<String>,
     pub triaged_at: Option<DateTime<Utc>>,
     pub namespace: String,

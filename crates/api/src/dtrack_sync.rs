@@ -12,10 +12,13 @@ use uuid::Uuid;
 /// propagated, since one bad SBOM or a transient dtrack outage must not
 /// kill the loop or affect Magnolia's own request handling (same
 /// "secondary concern can't block/fail the primary flow" idiom already
-/// used for `record_audit` in `upload_sbom`). No synchronous dtrack call is
-/// ever made from inside an HTTP handler — this loop is the only
-/// always-running caller of `DtrackClient`; `sync_now` below is the other,
-/// on-demand one, triggered by the "force sync" button.
+/// used for `record_audit` in `upload_sbom`). Push/refresh against dtrack
+/// otherwise only ever happen here or in the on-demand `sync_now` (the
+/// "force sync" button) — `push_triage_to_dtrack` below is a deliberate,
+/// narrow exception: it's called synchronously from `triage_finding`, since
+/// a human triage action is rare (not a hot path) and the whole point is
+/// dtrack reflecting it immediately rather than waiting for the next
+/// periodic pass.
 pub async fn run_sync_loop(
     db: Arc<Database>,
     storage: Arc<dyn ObjectStore>,
@@ -163,6 +166,8 @@ async fn refresh_phase(db: &Database, client: &DtrackClient, tenant_id: Option<U
                 severity: f.severity,
                 description: f.description,
                 analysis_state: f.analysis_state,
+                component_uuid: f.component_uuid,
+                vulnerability_uuid: f.vulnerability_uuid,
             })
             .collect();
 
@@ -176,4 +181,80 @@ async fn refresh_phase(db: &Database, client: &DtrackClient, tenant_id: Option<U
         refreshed += 1;
     }
     refreshed
+}
+
+/// Pushes Magnolia's own VEX-style triage for one finding into dtrack's own
+/// analysis record (`PUT /api/v1/analysis`), so dtrack's own view — and
+/// anything else reading dtrack directly — reflects Magnolia's judgment
+/// instead of staying permanently "not set". Called from `triage_finding`
+/// on every save. Best-effort and fully swallowed: by the time this runs,
+/// Magnolia's own `dtrack_findings` row has already been committed, so a
+/// dtrack outage or a stale/missing project mapping must not fail the
+/// caller's triage write — only ever logged.
+pub async fn push_triage_to_dtrack(
+    db: &Database,
+    client: &DtrackClient,
+    manifest_hash: &str,
+    component_uuid: &str,
+    vulnerability_uuid: &str,
+    vex_status: &str,
+    justification: Option<&str>,
+    comment: Option<&str>,
+) {
+    let project = match db.get_dtrack_project(manifest_hash).await {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            tracing::info!(manifest_hash = %manifest_hash, "dtrack triage push: no dtrack project for this manifest yet; skipping");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(manifest_hash = %manifest_hash, error = %e, "dtrack triage push: failed to look up dtrack project");
+            return;
+        }
+    };
+
+    let (analysis_state, analysis_justification) = map_vex_to_dtrack_analysis(vex_status, justification);
+
+    if let Err(e) = client
+        .set_analysis(
+            project.dtrack_project_uuid,
+            component_uuid,
+            vulnerability_uuid,
+            analysis_state,
+            analysis_justification,
+            comment,
+        )
+        .await
+    {
+        tracing::warn!(manifest_hash = %manifest_hash, error = %e, "dtrack triage push: set_analysis failed");
+    }
+}
+
+/// Maps Magnolia's VEX vocabulary onto dtrack's own `AnalysisState`/
+/// `AnalysisJustification` enums, which follow CycloneDX's impact-analysis
+/// vocabulary — NOT OpenVEX's (see `handlers::VEX_JUSTIFICATIONS`). There is
+/// no official one-to-one mapping between the two specs, so this is a
+/// best-effort approximation: a couple of OpenVEX justification codes
+/// collapse onto the same dtrack code, since dtrack/CycloneDX draws that
+/// particular line differently than OpenVEX does.
+fn map_vex_to_dtrack_analysis(vex_status: &str, justification: Option<&str>) -> (&'static str, Option<&'static str>) {
+    let analysis_state = match vex_status {
+        "affected" => "EXPLOITABLE",
+        "not_affected" => "NOT_AFFECTED",
+        "fixed" => "RESOLVED",
+        // "under_investigation", and any future/unrecognized status.
+        _ => "IN_TRIAGE",
+    };
+    let analysis_justification = (vex_status == "not_affected")
+        .then(|| justification)
+        .flatten()
+        .and_then(|j| match j {
+            "component_not_present" => Some("CODE_NOT_PRESENT"),
+            "vulnerable_code_not_present" => Some("CODE_NOT_PRESENT"),
+            "vulnerable_code_not_in_execute_path" => Some("CODE_NOT_REACHABLE"),
+            "vulnerable_code_cannot_be_controlled_by_adversary" => Some("REQUIRES_CONFIGURATION"),
+            "inline_mitigations_already_exist" => Some("PROTECTED_BY_MITIGATING_CONTROL"),
+            _ => None,
+        });
+    (analysis_state, analysis_justification)
 }

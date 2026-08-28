@@ -14,7 +14,7 @@ use magnolia_core::{
     MerkleTree, SbomFormat, SignedTreeHead, Statement, Subject, DOCUMENT_PREDICATE_TYPE,
     DSSE_PAYLOAD_TYPE, IN_TOTO_STATEMENT_TYPE, MANIFEST_PREDICATE_TYPE,
 };
-use magnolia_db::DtrackFindingRecord;
+use magnolia_db::{DtrackFindingRecord, SbomComponentRow};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -22,7 +22,7 @@ use crate::auth::{require, AuthGrant};
 use crate::errors::ApiError;
 use crate::state::AppState;
 
-const MAX_SBOM_BYTES: usize = 10 * 1024 * 1024;
+pub const MAX_SBOM_BYTES: usize = 10 * 1024 * 1024;
 
 // ---------- DTOs ----------
 
@@ -172,6 +172,7 @@ pub struct DtrackFindingJson {
     pub analysis_state: Option<String>,
     pub vex_status: Option<String>,
     pub vex_justification: Option<String>,
+    pub vex_comment: Option<String>,
     pub triaged_by: Option<String>,
     pub triaged_at: Option<DateTime<Utc>>,
 }
@@ -188,6 +189,7 @@ impl From<DtrackFindingRecord> for DtrackFindingJson {
             analysis_state: r.analysis_state,
             vex_status: r.vex_status,
             vex_justification: r.vex_justification,
+            vex_comment: r.vex_comment,
             triaged_by: r.triaged_by,
             triaged_at: r.triaged_at,
         }
@@ -206,6 +208,7 @@ pub struct FindingWithContextJson {
     pub analysis_state: Option<String>,
     pub vex_status: Option<String>,
     pub vex_justification: Option<String>,
+    pub vex_comment: Option<String>,
     pub triaged_by: Option<String>,
     pub triaged_at: Option<DateTime<Utc>>,
     pub domain: String,
@@ -311,6 +314,7 @@ pub async fn list_findings(
                 analysis_state: r.analysis_state,
                 vex_status: r.vex_status,
                 vex_justification: r.vex_justification,
+                vex_comment: r.vex_comment,
                 triaged_by: r.triaged_by,
                 triaged_at: r.triaged_at,
                 domain: domain.clone(),
@@ -695,6 +699,22 @@ pub async fn health() -> StatusCode {
     StatusCode::OK
 }
 
+/// Served at `/install.sh` so `curl -fsSL <tenant_url>/install.sh | bash -s
+/// -- --tenant-domain=...` works -- see scripts/magnolia-upload.sh's own
+/// header comment for the script's usage. `include_str!` embeds the file at
+/// compile time (not read from disk per-request), so this is always
+/// byte-for-byte the same script checked into the repo -- no separate copy
+/// to keep in sync, and no runtime dependency on `scripts/` existing next
+/// to the deployed binary.
+const MAGNOLIA_UPLOAD_SCRIPT: &str = include_str!("../../../scripts/magnolia-upload.sh");
+
+pub async fn install_script() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
+        MAGNOLIA_UPLOAD_SCRIPT,
+    )
+}
+
 #[derive(serde::Serialize)]
 pub struct WhoAmIJson {
     pub key_id: Uuid,
@@ -806,6 +826,58 @@ pub async fn set_dtrack_sync_setting(
 }
 
 #[derive(serde::Serialize)]
+pub struct SemverSettingJson {
+    pub required: bool,
+}
+
+/// This tenant's requirement that `upload_sbom`'s `version` field be
+/// SemVer 2.0.0-compliant -- on by default. Same read/write split as `dtrack_sync_setting`:
+/// any valid key can view it, only `Action::ManageSettings` can change it.
+pub async fn semver_setting(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+) -> Result<Json<SemverSettingJson>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    let tenant = state.db.get_tenant(tenant_id).await.map_err(db_err)?.ok_or(ApiError::NotFound)?;
+    Ok(Json(SemverSettingJson { required: tenant.require_semver_version }))
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetSemverSettingRequest {
+    pub required: bool,
+}
+
+/// Toggles this tenant's SemVer enforcement for future uploads —
+/// `Action::ManageSettings`, same tenant-wide-setting gate as
+/// `set_dtrack_sync_setting`. Does not retroactively touch manifests already
+/// uploaded with a non-SemVer version.
+pub async fn set_semver_setting(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+    Json(body): Json<SetSemverSettingRequest>,
+) -> Result<StatusCode, ApiError> {
+    require(&grant, Action::ManageSettings, &grant.namespace_scope)?;
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+
+    state.db.set_tenant_require_semver_version(tenant_id, body.required).await.map_err(db_err)?;
+
+    let _ = record_audit(
+        &state,
+        &grant,
+        "semver_setting",
+        &tenant_id.to_string(),
+        true,
+        Some(format!("required={}", body.required)),
+    )
+    .await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Serialize)]
 pub struct SigningKeyJson {
     pub algorithm: String,
     pub keyid: String,
@@ -835,6 +907,21 @@ pub async fn signing_key(
     }))
 }
 
+/// Turns a raw `multer`/axum multipart error into a descriptive `ApiError`,
+/// preserving the underlying reason (e.g. "stream size exceeded" when a
+/// field trips `DefaultBodyLimit`) instead of a generic message, and mapping
+/// to 413 rather than 400 when that's what actually happened -- so clients
+/// get "payload too large" instead of a misleading "invalid sbom_file
+/// field" that looks like a malformed-request bug.
+fn multipart_err(context: &str, e: axum::extract::multipart::MultipartError) -> ApiError {
+    let detail = format!("{context}: {}", e.body_text());
+    if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        ApiError::PayloadTooLarge(detail)
+    } else {
+        ApiError::BadRequest(detail)
+    }
+}
+
 pub async fn upload_sbom(
     State(state): State<AppState>,
     grant: AuthGrant,
@@ -844,13 +931,13 @@ pub async fn upload_sbom(
     let field = multipart
         .next_field()
         .await
-        .map_err(|_| ApiError::BadRequest("invalid multipart body".to_string()))?
+        .map_err(|e| multipart_err("invalid multipart body", e))?
         .ok_or_else(|| ApiError::BadRequest("missing sbom_file field".to_string()))?;
     let _file_name = field.file_name().map(|s| s.to_string());
     let sbom_bytes = field
         .bytes()
         .await
-        .map_err(|_| ApiError::BadRequest("invalid sbom_file field".to_string()))?
+        .map_err(|e| multipart_err("invalid sbom_file field", e))?
         .to_vec();
 
     let mut format = "cyclonedx".to_string();
@@ -860,29 +947,29 @@ pub async fn upload_sbom(
     while let Some(next) = multipart
         .next_field()
         .await
-        .map_err(|_| ApiError::BadRequest("invalid multipart body".to_string()))?
+        .map_err(|e| multipart_err("invalid multipart body", e))?
     {
         match next.name() {
             Some("format") => format = next
                 .text()
                 .await
-                .map_err(|_| ApiError::BadRequest("invalid format field".to_string()))?
+                .map_err(|e| multipart_err("invalid format field", e))?
                 .to_lowercase(),
             Some("namespace") => namespace = next
                 .text()
                 .await
-                .map_err(|_| ApiError::BadRequest("invalid namespace field".to_string()))?
+                .map_err(|e| multipart_err("invalid namespace field", e))?
                 .to_string(),
             Some("version") => version = next
                 .text()
                 .await
-                .map_err(|_| ApiError::BadRequest("invalid version field".to_string()))?
+                .map_err(|e| multipart_err("invalid version field", e))?
                 .trim()
                 .to_string(),
             Some("document_type") => document_type = next
                 .text()
                 .await
-                .map_err(|_| ApiError::BadRequest("invalid document_type field".to_string()))?
+                .map_err(|e| multipart_err("invalid document_type field", e))?
                 .trim()
                 .to_string(),
             _ => {}
@@ -943,18 +1030,21 @@ pub async fn upload_sbom(
         enforce_compliance(&state, tenant_id, &format, &sbom_bytes).await?;
     }
 
-    let target_tenant = if cross_tenant {
-        Some(
-            state
-                .db
-                .get_tenant(tenant_id)
-                .await
-                .map_err(db_err)?
-                .ok_or_else(|| ApiError::BadRequest("unknown tenant_id".to_string()))?,
-        )
-    } else {
-        None
-    };
+    let tenant_record = state
+        .db
+        .get_tenant(tenant_id)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| ApiError::BadRequest("unknown tenant_id".to_string()))?;
+
+    if tenant_record.require_semver_version && semver::Version::parse(&version).is_err() {
+        return Err(ApiError::BadRequest(format!(
+            "version must be SemVer 2.0.0 compliant (e.g. 1.2.3, 1.2.3-rc.1): {}",
+            version
+        )));
+    }
+
+    let target_tenant = if cross_tenant { Some(tenant_record) } else { None };
 
     // The platform tenant exists to hold the bootstrap/admin key that
     // manages every other tenant — it's not a product tenant, and letting
@@ -1449,6 +1539,271 @@ pub async fn manifest(
     }))
 }
 
+#[derive(serde::Serialize)]
+pub struct VexVulnerabilityJson {
+    pub name: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct VexProductJson {
+    #[serde(rename = "@id")]
+    pub id: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct VexStatementJson {
+    pub vulnerability: VexVulnerabilityJson,
+    pub timestamp: DateTime<Utc>,
+    pub products: Vec<VexProductJson>,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub justification: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_notes: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct VexDocumentJson {
+    #[serde(rename = "@context")]
+    pub context: String,
+    #[serde(rename = "@id")]
+    pub id: String,
+    pub author: String,
+    pub timestamp: DateTime<Utc>,
+    pub version: u32,
+    pub statements: Vec<VexStatementJson>,
+}
+
+/// Exports Magnolia's own VEX triage for one manifest as an OpenVEX document
+/// (https://github.com/openvex/spec) — one statement per cached dtrack
+/// finding. Same auth/tenant-ownership gate as `manifest()`: `Action::Read`,
+/// 404 (not 403) for another tenant's/namespace's manifest.
+///
+/// Untriaged findings (`vex_status IS NULL`) are exported as
+/// `under_investigation` — OpenVEX's own convention for "not yet reviewed" —
+/// rather than omitted, so a consumer diffing this document against dtrack's
+/// raw finding list sees every finding accounted for. `justification` is
+/// only ever emitted for `not_affected`, matching OpenVEX's own constraint
+/// (see `VEX_JUSTIFICATIONS`); `status_notes` carries the free-text
+/// `vex_comment` regardless of status. There's no persisted document
+/// revision history — this is regenerated fresh from `dtrack_findings` on
+/// every request, so `version` is always `1`.
+pub async fn manifest_vex(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Path(manifest_hash): Path<String>,
+    Query(q): Query<TenantOverrideQuery>,
+) -> Result<Json<VexDocumentJson>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+
+    let record = state.db.get_manifest(&manifest_hash).await.map_err(db_err)?.ok_or(ApiError::NotFound)?;
+    if record.tenant_id != tenant_id
+        || (!cross_tenant && !magnolia_auth::namespace_in_scope(&record.namespace, &grant.namespace_scope))
+    {
+        return Err(ApiError::NotFound);
+    }
+
+    let domain = if cross_tenant {
+        state.db.get_tenant(tenant_id).await.map_err(db_err)?.map(|t| t.domain).unwrap_or_default()
+    } else {
+        grant.domain.clone()
+    };
+
+    let findings = state.db.list_dtrack_findings(&record.manifest_hash).await.map_err(db_err)?;
+
+    let statements = findings
+        .into_iter()
+        .map(|f| {
+            let status = f.vex_status.unwrap_or_else(|| "under_investigation".to_string());
+            let justification = if status == "not_affected" { f.vex_justification } else { None };
+            let product_id = match f.component_version {
+                Some(v) if !v.is_empty() => format!("{}@{}", f.component_name, v),
+                _ => f.component_name,
+            };
+            VexStatementJson {
+                vulnerability: VexVulnerabilityJson { name: f.vulnerability_id },
+                timestamp: f.triaged_at.unwrap_or(f.synced_at),
+                products: vec![VexProductJson { id: product_id }],
+                status,
+                justification,
+                status_notes: f.vex_comment,
+            }
+        })
+        .collect();
+
+    Ok(Json(VexDocumentJson {
+        context: "https://openvex.dev/ns/v0.2.0".to_string(),
+        id: format!("urn:magnolia:vex:{}", record.manifest_hash),
+        author: format!("Magnolia ({domain})"),
+        timestamp: Utc::now(),
+        version: 1,
+        statements,
+    }))
+}
+
+#[derive(serde::Deserialize)]
+pub struct ManifestDiffQuery {
+    pub tenant_id: Option<Uuid>,
+    /// Manifest hash to diff against. Defaults to the immediately-previous
+    /// manifest in the same namespace (by upload order) when omitted.
+    pub against: Option<String>,
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct ComponentSummaryJson {
+    pub name: String,
+    pub version: Option<String>,
+    pub purl: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ComponentVersionChangeJson {
+    pub name: String,
+    pub purl: Option<String>,
+    pub from_version: Option<String>,
+    pub to_version: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ManifestDiffJson {
+    pub from_manifest_hash: String,
+    pub from_version: String,
+    pub to_manifest_hash: String,
+    pub to_version: String,
+    pub added: Vec<ComponentSummaryJson>,
+    pub removed: Vec<ComponentSummaryJson>,
+    pub changed: Vec<ComponentVersionChangeJson>,
+    pub unchanged_count: usize,
+}
+
+/// Component identity for matching across two manifests' component lists:
+/// `purl` with its trailing `@version` segment stripped when present (a
+/// purl's version is always separated by a literal `@`, with any real `@`
+/// inside the name/namespace itself percent-encoded per the purl spec, so a
+/// plain split is safe), else the lowercased component name. Two components
+/// sharing an identity but a different `version` are a `changed` entry;
+/// present on only one side is `added`/`removed`.
+fn component_identity(name: &str, purl: Option<&str>) -> String {
+    match purl {
+        Some(p) if !p.is_empty() => p.split('@').next().unwrap_or(p).to_string(),
+        _ => name.to_lowercase(),
+    }
+}
+
+/// Diffs one manifest's indexed component list against another's. Reuses
+/// the `sbom_components` reverse-search index built at upload time (see
+/// `insert_sbom_components`) rather than re-parsing either SBOM's raw
+/// bytes. `Action::Read`, same tenant/namespace-ownership gate as
+/// `manifest()` — checked independently for both manifests, since `against`
+/// could in principle name one in a different namespace (allowed; same
+/// scope rule as everywhere else, just an unusual comparison to ask for).
+/// Neither manifest may be a `document_type` upload — those have no
+/// components to compare.
+pub async fn manifest_diff(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Path(manifest_hash): Path<String>,
+    Query(q): Query<ManifestDiffQuery>,
+) -> Result<Json<ManifestDiffJson>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+
+    let to_record = state.db.get_manifest(&manifest_hash).await.map_err(db_err)?.ok_or(ApiError::NotFound)?;
+    if to_record.tenant_id != tenant_id
+        || (!cross_tenant && !magnolia_auth::namespace_in_scope(&to_record.namespace, &grant.namespace_scope))
+    {
+        return Err(ApiError::NotFound);
+    }
+    if to_record.document_type.is_some() {
+        return Err(ApiError::BadRequest(
+            "cannot diff a document upload -- no SBOM components to compare".to_string(),
+        ));
+    }
+
+    let from_record = match &q.against {
+        Some(hash) => {
+            let r = state.db.get_manifest(hash).await.map_err(db_err)?.ok_or(ApiError::NotFound)?;
+            if r.tenant_id != tenant_id
+                || (!cross_tenant && !magnolia_auth::namespace_in_scope(&r.namespace, &grant.namespace_scope))
+            {
+                return Err(ApiError::NotFound);
+            }
+            if r.document_type.is_some() {
+                return Err(ApiError::BadRequest(
+                    "cannot diff against a document upload -- no SBOM components to compare".to_string(),
+                ));
+            }
+            r
+        }
+        None => state
+            .db
+            .get_previous_manifest_in_namespace(
+                tenant_id,
+                &to_record.namespace,
+                to_record.created_at,
+                to_record.leaf_seq_id,
+            )
+            .await
+            .map_err(db_err)?
+            .ok_or_else(|| {
+                ApiError::BadRequest("no previous manifest in this namespace to diff against".to_string())
+            })?,
+    };
+
+    let from_components = state.db.list_sbom_components_for_manifest(&from_record.manifest_hash).await.map_err(db_err)?;
+    let to_components = state.db.list_sbom_components_for_manifest(&to_record.manifest_hash).await.map_err(db_err)?;
+
+    let from_map: std::collections::HashMap<String, SbomComponentRow> = from_components
+        .into_iter()
+        .map(|c| (component_identity(&c.name, c.purl.as_deref()), c))
+        .collect();
+    let to_map: std::collections::HashMap<String, SbomComponentRow> = to_components
+        .into_iter()
+        .map(|c| (component_identity(&c.name, c.purl.as_deref()), c))
+        .collect();
+
+    let mut added = Vec::new();
+    let mut changed = Vec::new();
+    let mut unchanged_count = 0;
+    for (id, to_c) in &to_map {
+        match from_map.get(id) {
+            None => added.push(ComponentSummaryJson {
+                name: to_c.name.clone(),
+                version: to_c.version.clone(),
+                purl: to_c.purl.clone(),
+            }),
+            Some(from_c) if from_c.version != to_c.version => changed.push(ComponentVersionChangeJson {
+                name: to_c.name.clone(),
+                purl: to_c.purl.clone(),
+                from_version: from_c.version.clone(),
+                to_version: to_c.version.clone(),
+            }),
+            Some(_) => unchanged_count += 1,
+        }
+    }
+    let mut removed: Vec<ComponentSummaryJson> = from_map
+        .iter()
+        .filter(|(id, _)| !to_map.contains_key(*id))
+        .map(|(_, c)| ComponentSummaryJson { name: c.name.clone(), version: c.version.clone(), purl: c.purl.clone() })
+        .collect();
+
+    added.sort_by(|a, b| a.name.cmp(&b.name));
+    removed.sort_by(|a, b| a.name.cmp(&b.name));
+    changed.sort_by(|a, b| a.name.cmp(&b.name));
+
+    Ok(Json(ManifestDiffJson {
+        from_manifest_hash: from_record.manifest_hash,
+        from_version: from_record.version,
+        to_manifest_hash: to_record.manifest_hash,
+        to_version: to_record.version,
+        added,
+        removed,
+        changed,
+        unchanged_count,
+    }))
+}
+
 /// The most recent non-revoked manifest per namespace — "what's currently
 /// deployed" for each deployable, not just the single latest upload
 /// tenant-wide. Recency (`created_at`), not `version` magnitude, decides
@@ -1655,25 +2010,25 @@ pub async fn check_compliance(
     let field = multipart
         .next_field()
         .await
-        .map_err(|_| ApiError::BadRequest("invalid multipart body".to_string()))?
+        .map_err(|e| multipart_err("invalid multipart body", e))?
         .ok_or_else(|| ApiError::BadRequest("missing sbom_file field".to_string()))?;
     let sbom_bytes = field
         .bytes()
         .await
-        .map_err(|_| ApiError::BadRequest("invalid sbom_file field".to_string()))?
+        .map_err(|e| multipart_err("invalid sbom_file field", e))?
         .to_vec();
 
     let mut format = "cyclonedx".to_string();
     while let Some(next) = multipart
         .next_field()
         .await
-        .map_err(|_| ApiError::BadRequest("invalid multipart body".to_string()))?
+        .map_err(|e| multipart_err("invalid multipart body", e))?
     {
         if next.name() == Some("format") {
             format = next
                 .text()
                 .await
-                .map_err(|_| ApiError::BadRequest("invalid format field".to_string()))?
+                .map_err(|e| multipart_err("invalid format field", e))?
                 .to_lowercase();
         }
     }
@@ -1971,10 +2326,29 @@ pub async fn revoke_manifest(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The fixed OpenVEX justification vocabulary (https://github.com/openvex/spec) —
+/// only meaningful (and only accepted) alongside `vex_status: "not_affected"`,
+/// since a justification is specifically an explanation of *why* something
+/// isn't affected. Kept as a closed set rather than free text so a VEX
+/// consumer (see `manifest_vex`'s export) can machine-match it instead of
+/// parsing prose.
+const VEX_JUSTIFICATIONS: &[&str] = &[
+    "component_not_present",
+    "vulnerable_code_not_present",
+    "vulnerable_code_not_in_execute_path",
+    "vulnerable_code_cannot_be_controlled_by_adversary",
+    "inline_mitigations_already_exist",
+];
+
 #[derive(serde::Deserialize)]
 pub struct TriageFindingRequest {
     pub vex_status: String,
     pub justification: Option<String>,
+    /// Always-optional free-text context a fixed `justification` code can't
+    /// capture (e.g. "confirmed with vendor advisory, see JIRA-1234") —
+    /// unlike `justification`, allowed alongside any `vex_status`. Maps to
+    /// OpenVEX's own `status_notes` on export.
+    pub comment: Option<String>,
 }
 
 /// Sets Magnolia's own VEX-style triage on one cached dtrack finding — this
@@ -1982,8 +2356,8 @@ pub struct TriageFindingRequest {
 /// dtrack's own `analysis_state` (see the `dtrack_findings` migration
 /// comment). Follows `revoke_manifest`'s exact pattern: `Action::Annotate`,
 /// tenant/namespace isolation before touching the row, audit-logged via the
-/// existing `record_audit` (the justification rides in its `reason` field —
-/// no schema change needed there).
+/// existing `record_audit` (justification/comment ride in its `reason`
+/// field — no schema change needed there).
 pub async fn triage_finding(
     State(state): State<AppState>,
     grant: AuthGrant,
@@ -2004,9 +2378,16 @@ pub async fn triage_finding(
     if !["affected", "not_affected", "fixed", "under_investigation"].contains(&body.vex_status.as_str()) {
         return Err(ApiError::BadRequest("invalid vex_status".to_string()));
     }
-    if body.vex_status == "not_affected" && body.justification.as_deref().unwrap_or("").is_empty() {
+    if body.vex_status == "not_affected" {
+        if !body.justification.as_deref().map(|j| VEX_JUSTIFICATIONS.contains(&j)).unwrap_or(false) {
+            return Err(ApiError::BadRequest(format!(
+                "justification is required when vex_status is not_affected and must be one of: {}",
+                VEX_JUSTIFICATIONS.join(", ")
+            )));
+        }
+    } else if body.justification.is_some() {
         return Err(ApiError::BadRequest(
-            "justification is required when vex_status is not_affected".to_string(),
+            "justification is only valid when vex_status is not_affected".to_string(),
         ));
     }
 
@@ -2017,21 +2398,68 @@ pub async fn triage_finding(
             &finding_key,
             &body.vex_status,
             body.justification.as_deref(),
+            body.comment.as_deref(),
             &grant.principal(),
         )
         .await
         .map_err(db_err)?
         .ok_or(ApiError::NotFound)?;
 
+    let reason = match (&body.justification, &body.comment) {
+        (Some(j), Some(c)) => Some(format!("justification={j}; comment={c}")),
+        (Some(j), None) => Some(format!("justification={j}")),
+        (None, Some(c)) => Some(format!("comment={c}")),
+        (None, None) => None,
+    };
     let _ = record_audit(
         &state,
         &grant,
         "finding_triage",
         &format!("{manifest_hash}:{finding_key}"),
         true,
-        body.justification,
+        reason,
     )
     .await;
+
+    // Best-effort: push this triage into dtrack's own analysis record too
+    // (see `dtrack_sync::push_triage_to_dtrack`), so dtrack's own view
+    // reflects Magnolia's judgment instead of staying permanently "not
+    // set". Skipped, not failed, when dtrack isn't configured, this tenant
+    // has opted out of dtrack sync, or this finding has no cached
+    // component/vulnerability UUID yet (pre-migration row, or dtrack
+    // hasn't refreshed it since).
+    if let Some(dtrack) = &state.dtrack {
+        let sync_disabled = state
+            .db
+            .get_tenant(tenant_id)
+            .await
+            .map(|t| t.map(|t| t.dtrack_sync_disabled).unwrap_or(true))
+            .unwrap_or(true);
+        if !sync_disabled {
+            match (&updated.component_uuid, &updated.vulnerability_uuid) {
+                (Some(cuuid), Some(vuuid)) => {
+                    crate::dtrack_sync::push_triage_to_dtrack(
+                        &state.db,
+                        dtrack,
+                        &manifest_hash,
+                        cuuid,
+                        vuuid,
+                        &body.vex_status,
+                        body.justification.as_deref(),
+                        body.comment.as_deref(),
+                    )
+                    .await;
+                }
+                _ => {
+                    tracing::info!(
+                        manifest_hash = %manifest_hash,
+                        finding_key = %finding_key,
+                        "dtrack triage push: finding has no cached component/vulnerability uuid yet; skipping"
+                    );
+                }
+            }
+        }
+    }
 
     Ok(Json(updated.into()))
 }
