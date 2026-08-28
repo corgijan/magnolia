@@ -41,6 +41,7 @@ pub struct TenantRecord {
     pub require_semver_version: bool,
     pub reputation_disabled: bool,
     pub require_namespace_registration: bool,
+    pub malicious_check_disabled: bool,
 }
 
 /// One registered namespace — the output of `list_registered_namespaces`,
@@ -165,6 +166,17 @@ pub struct ReputationStatus {
     /// `component_reputation` rows with a `fetch_error` — checked, but the
     /// attempt itself failed (network, unexpected response shape).
     pub failed: i64,
+}
+
+/// Deployment-wide counts for the Settings UI's malicious-check background
+/// job status — same shape as `ReputationStatus`, minus `failed`: a failed
+/// upload-time or rescan attempt leaves `malicious_checked_at` untouched
+/// (see that column's migration comment) so it just stays counted under
+/// `pending` until it succeeds, rather than needing its own bucket.
+#[derive(Debug, Clone, FromRow)]
+pub struct MaliciousCheckStatus {
+    pub pending: i64,
+    pub checked: i64,
 }
 
 /// One component's cached deps.dev/OpenSSF Scorecard result — the output of

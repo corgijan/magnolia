@@ -2,6 +2,7 @@ mod dtrack_sync;
 mod errors;
 mod handlers;
 mod malicious_check;
+mod malicious_sync;
 mod reputation_bucket;
 mod reputation_sync;
 mod snapshot;
@@ -10,6 +11,7 @@ mod auth;
 
 pub use dtrack_sync::{run_sync_loop, sync_now};
 pub use errors::ApiError;
+pub use malicious_sync::run_malicious_sync_loop;
 pub use reputation_sync::run_reputation_sync_loop;
 pub use state::AppState;
 pub use auth::AuthGrant;
@@ -91,6 +93,10 @@ pub fn create_router(state: AppState) -> Router {
             get(handlers::reputation_tenant_setting).post(handlers::set_reputation_tenant_setting),
         )
         .route(
+            "/api/v1/settings/malicious-check",
+            get(handlers::malicious_check_tenant_setting).post(handlers::set_malicious_check_tenant_setting),
+        )
+        .route(
             "/api/v1/settings/namespace-registration",
             get(handlers::namespace_registration_setting).post(handlers::set_namespace_registration_setting),
         )
@@ -126,6 +132,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/reputation/sync", post(handlers::force_reputation_sync))
         .route("/api/v1/reputation/status", get(handlers::reputation_status))
         .route("/api/v1/reputation/components", get(handlers::reputation_components))
+        .route("/api/v1/malicious/sync", post(handlers::force_malicious_sync))
+        .route("/api/v1/malicious/status", get(handlers::malicious_check_status))
         .route(
             "/api/v1/keys",
             get(handlers::list_keys).post(handlers::create_key),

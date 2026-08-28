@@ -205,10 +205,24 @@ should read as "not checked yet," same language already used for
   best-effort/logged-not-failed treatment.
 - `manifest()` reads `malicious_component_findings` for its
   `malicious_components` field — no live OSV call in the read path.
-- Not implemented: a backfill/rescan path for manifests uploaded before this
-  shipped (unlike `reindex_components` for the component index itself) — this
-  only covers new uploads for now. Worth adding as a follow-up if backfilling
-  the existing archive matters.
+- **Rescan/backfill — added later**: `manifests.malicious_checked_at`
+  (nullable, `NULL` for the whole pre-existing archive) plus
+  `crates/api/src/malicious_sync.rs`, a periodic background job mirroring
+  `reputation_sync.rs`'s shape (deployment-global backlog, `BATCH_SIZE`
+  manifests per tick, default hourly via `MALICIOUS_SYNC_INTERVAL_SECS`,
+  gated on the same `osv` client the upload-time check uses — no separate
+  enable/disable). Unlike reputation's 30-day TTL, manifests go stale after
+  just `STALE_AFTER_DAYS = 1` day, since the whole point is catching a
+  package that gets flagged `MAL-` sometime *after* it was already
+  uploaded — waiting a month would defeat that. `check_and_store_malicious_components`
+  now returns `bool` (did the check actually complete) so both the upload-time
+  call site and the sync job only advance `malicious_checked_at` on success —
+  a failed attempt is retried on the very next pass instead of waiting out
+  the full TTL, same retry-on-failure design used for `reputation_sync`'s
+  own TTL. `POST /api/v1/malicious/sync` (the "Force malicious sync" button)
+  and `GET /api/v1/malicious/status` mirror the reputation ones, minus a
+  "failed" bucket — a failed attempt just stays counted under "pending"
+  since there's nowhere else for it to go.
 
 ### Implementation notes (package reputation scoring)
 
@@ -227,6 +241,18 @@ should read as "not checked yet," same language already used for
   (derived from `purl` at index time, alongside the existing malicious-check
   hook in `index_manifest_components`), plus the `component_reputation` table
   from the original plan.
+- **Backfill gap — fixed after initial ship**: the `ecosystem`/`registry_name`
+  migration had no backfill `UPDATE`, and `index_manifest_components` only
+  ever computes them for a *new* upload — so any component indexed before
+  that migration ran was permanently invisible to
+  `list_components_needing_reputation` (`WHERE ecosystem IS NOT NULL`) and
+  would never get reputation-scored. Fixed by a `backfill_ecosystem_phase`
+  that now runs at the start of every `reputation_sync::sync_pass` (up to
+  `BACKFILL_BATCH_SIZE = 1000` rows/tick — pure local purl parsing, no I/O,
+  so a much larger batch than the 20-component deps.dev-calling phase is
+  fine), plus a sentinel: `ecosystem = ''` now means "checked, no deps.dev
+  mapping for this purl type" so those rows aren't endlessly re-attempted,
+  distinct from `ecosystem IS NULL` ("never attempted" — the actual backlog).
 - `crates/api/src/reputation_sync.rs`: periodic background loop (mirrors
   `dtrack_sync.rs`'s shape), default hourly (`REPUTATION_SYNC_INTERVAL_SECS`,
   reputation moves slowly, unlike vulnerability data), processing up to 20

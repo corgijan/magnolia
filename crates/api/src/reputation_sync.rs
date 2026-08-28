@@ -10,6 +10,12 @@ use magnolia_depsdev::DepsDevClient;
 /// way `dtrack_sync::push_phase`'s `LIMIT 50` bounds its own per-tick work.
 const BATCH_SIZE: i64 = 20;
 
+/// How many `sbom_components` rows to backfill `ecosystem`/`registry_name`
+/// for per tick — pure local computation (parses a purl, no I/O), so this
+/// can be much larger than `BATCH_SIZE` (which bounds outbound deps.dev
+/// calls) without costing anything but CPU.
+const BACKFILL_BATCH_SIZE: i64 = 1000;
+
 /// A cached result older than this is treated as stale and re-checked —
 /// reputation moves slowly (a Scorecard result doesn't change day to day),
 /// so this is a much longer TTL than dtrack's vulnerability refresh cadence.
@@ -46,6 +52,10 @@ pub async fn run_reputation_sync_loop(db: Arc<Database>, client: Arc<DepsDevClie
 /// and "no related project at all" all count as processed; a fetch failure
 /// does not).
 pub async fn sync_pass(db: &Database, client: &DepsDevClient) -> usize {
+    // Runs first so a component backfilled this tick is already eligible
+    // for the fetch phase below in the same pass, not just the next one.
+    backfill_ecosystem_phase(db).await;
+
     let pending = match db.list_components_needing_reputation(stale_before_cutoff(), BATCH_SIZE).await {
         Ok(p) => p,
         Err(e) => {
@@ -109,4 +119,42 @@ pub async fn sync_pass(db: &Database, client: &DepsDevClient) -> usize {
         processed += 1;
     }
     processed
+}
+
+/// Fills in `ecosystem`/`registry_name` for any `sbom_components` row that
+/// was never run through `purl_to_depsdev_package` — the main case is a row
+/// inserted before those columns existed at all (their own migration has no
+/// backfill `UPDATE`), which `index_manifest_components` only ever computes
+/// for a *new* upload. Without this phase, such a row is permanently
+/// invisible to `list_components_needing_reputation` (which requires
+/// `ecosystem IS NOT NULL`) and would never get reputation-scored no matter
+/// how many sync passes run. See `list_sbom_components_missing_ecosystem`'s
+/// doc comment for how a row that's genuinely unmappable (stored as
+/// `ecosystem = ""`) avoids being re-attempted here forever. Best-effort,
+/// same swallow-and-log idiom as the rest of this loop.
+async fn backfill_ecosystem_phase(db: &Database) -> usize {
+    let rows = match db.list_sbom_components_missing_ecosystem(BACKFILL_BATCH_SIZE).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "reputation sync: failed to list components missing ecosystem");
+            return 0;
+        }
+    };
+
+    let mut backfilled = 0;
+    for (id, purl) in rows {
+        let (ecosystem, registry_name) = match magnolia_core::purl_to_depsdev_package(&purl) {
+            Some((eco, name)) => (eco, Some(name)),
+            None => ("", None), // attempted, no deps.dev mapping for this purl type
+        };
+        if let Err(e) = db.set_sbom_component_ecosystem(id, Some(ecosystem), registry_name.as_deref()).await {
+            tracing::warn!(id, error = %e, "reputation sync: failed to backfill ecosystem");
+            continue;
+        }
+        backfilled += 1;
+    }
+    if backfilled > 0 {
+        tracing::info!(backfilled, "reputation sync: backfilled ecosystem/registry_name for pre-existing components");
+    }
+    backfilled
 }

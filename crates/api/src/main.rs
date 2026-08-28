@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use magnolia_api::{create_router, run_reputation_sync_loop, run_sync_loop, AppState};
+use magnolia_api::{create_router, run_malicious_sync_loop, run_reputation_sync_loop, run_sync_loop, AppState};
 use magnolia_audit::AuditLogger;
 use magnolia_core::MerkleTree;
 use magnolia_db::Database;
@@ -117,6 +117,10 @@ async fn main() {
     // On by default -- OSV's public API needs no setup/API key, unlike
     // standing up a dtrack instance, so this is an opt-out rather than a
     // presence-gated pair of env vars.
+    let malicious_sync_interval_secs = std::env::var("MALICIOUS_SYNC_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(3600);
     let osv = if std::env::var("DISABLE_MALICIOUS_PACKAGE_CHECK").is_ok() {
         tracing::info!("DISABLE_MALICIOUS_PACKAGE_CHECK set — malicious-package check disabled");
         None
@@ -144,6 +148,13 @@ async fn main() {
             Arc::clone(&db),
             client,
             std::time::Duration::from_secs(reputation_sync_interval_secs),
+        ));
+    }
+    if let Some(client) = osv.clone() {
+        tokio::spawn(run_malicious_sync_loop(
+            Arc::clone(&db),
+            client,
+            std::time::Duration::from_secs(malicious_sync_interval_secs),
         ));
     }
     let state = AppState {

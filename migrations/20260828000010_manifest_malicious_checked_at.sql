@@ -1,0 +1,11 @@
+-- Tracks when a manifest's components were last run through the OSV
+-- malicious-package batch check -- lets a periodic background job rescan
+-- existing manifests (catching a package that gets flagged MAL- *after* it
+-- was already uploaded), the same way `component_reputation.checked_at`
+-- drives the reputation sync job. NULL means "never checked" -- true for
+-- every manifest uploaded before this column existed, so the rescan job's
+-- backlog naturally starts with the whole pre-existing archive. Set at
+-- upload time too (see `upload_sbom`'s call into
+-- `check_and_store_malicious_components`), so a freshly-uploaded manifest
+-- isn't immediately re-picked-up by the rescan job.
+ALTER TABLE manifests ADD COLUMN malicious_checked_at TIMESTAMPTZ;

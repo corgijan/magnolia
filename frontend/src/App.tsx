@@ -17,6 +17,8 @@ import {
   FindingWithContext,
   InclusionProof,
   Leaf,
+  MaliciousCheckStatus,
+  MaliciousSyncResult,
   Manifest,
   ManifestDiff,
   ManifestVersion,
@@ -45,7 +47,6 @@ import {
 import './App.css';
 
 type Tab =
-  | 'dashboard'
   | 'upload'
   | 'tools'
   | 'leaves'
@@ -97,7 +98,6 @@ type TabGroup = 'workspace' | 'admin';
 
 const TABS: { id: Tab; label: string; requires: RbacAction; group: TabGroup }[] = [
   { id: 'leaves', label: 'Dashboard', requires: 'read', group: 'workspace' },
-  { id: 'dashboard', label: 'Info', requires: 'read', group: 'workspace' },
   { id: 'upload', label: 'Upload', requires: 'upload', group: 'workspace' },
   { id: 'tools', label: 'Tools', requires: 'read', group: 'workspace' },
   { id: 'proofs', label: 'Proofs', requires: 'read', group: 'workspace' },
@@ -132,9 +132,16 @@ function ReputationScoreBadge({ score, bucket }: { score: number; bucket: Reputa
 // Small monochrome icons (currentColor) for the tree views — deliberately
 // plain line icons rather than emoji, which render inconsistently (size,
 // color, style) across platforms.
-function FolderIcon() {
+function FolderIcon({ active }: { active?: boolean }) {
   return (
-    <svg className="tree-icon tree-icon-folder" width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
+    <svg
+      className={`tree-icon tree-icon-folder${active ? ' tree-icon-folder-active' : ''}`}
+      width="14"
+      height="14"
+      viewBox="0 0 16 16"
+      aria-hidden="true"
+    >
+      {active && <title>Active namespace — visible in "Currently running"</title>}
       <path
         d="M1.75 3.75c0-.55.45-1 1-1h3.1c.24 0 .47.1.64.27l.98.98h5.78c.55 0 1 .45 1 1v6.25c0 .55-.45 1-1 1h-10.5c-.55 0-1-.45-1-1v-7.5z"
         fill="currentColor"
@@ -373,6 +380,18 @@ function Dashboard({
           <div className="kv-row">
             <span className="kv-label">Dependency-Track</span>
             <Badge ok={config.dtrack_enabled}>{config.dtrack_enabled ? 'enabled' : 'disabled'}</Badge>
+          </div>
+          <div className="kv-row">
+            <span className="kv-label">Malicious package detection</span>
+            <Badge ok={config.malicious_check_enabled}>
+              {config.malicious_check_enabled ? 'enabled' : 'disabled'}
+            </Badge>
+            <span className="muted"> — OSV, checked at upload time</span>
+          </div>
+          <div className="kv-row">
+            <span className="kv-label">Package reputation</span>
+            <Badge ok={config.reputation_enabled}>{config.reputation_enabled ? 'enabled' : 'disabled'}</Badge>
+            <span className="muted"> — OpenSSF Scorecard, via deps.dev</span>
           </div>
           <div className="kv-row">
             <span className="kv-label">DEV_MODE</span>
@@ -1469,6 +1488,7 @@ function SbomDetailPanel({
   const [diffAgainst, setDiffAgainst] = useState<string>(''); // '' means "previous version" (server default)
   const [diffVersions, setDiffVersions] = useState<ManifestVersion[] | null>(null);
   const [reputationDisabledForTenant, setReputationDisabledForTenant] = useState(false);
+  const [maliciousCheckDisabledForTenant, setMaliciousCheckDisabledForTenant] = useState(false);
   const [showComponentReputationModal, setShowComponentReputationModal] = useState(false);
 
   useEffect(() => {
@@ -1481,6 +1501,9 @@ function SbomDetailPanel({
     api.dtrackSyncSetting(tenantId).then((s) => mounted && setDtrackSyncDisabled(s.disabled)).catch(() => {});
     api.reputationTenantSetting(tenantId)
       .then((s) => mounted && setReputationDisabledForTenant(s.disabled))
+      .catch(() => {});
+    api.maliciousCheckTenantSetting(tenantId)
+      .then((s) => mounted && setMaliciousCheckDisabledForTenant(s.disabled))
       .catch(() => {});
     return () => {
       mounted = false;
@@ -1644,7 +1667,7 @@ function SbomDetailPanel({
                   <td colSpan={2}><ErrorBox message={revokeError} /></td>
                 </tr>
               )}
-              {manifest.malicious_components.length > 0 && (
+              {!maliciousCheckDisabledForTenant && manifest.malicious_components.length > 0 && (
                 <tr>
                   <td colSpan={2}>
                     <div className="error-box">
@@ -2381,6 +2404,7 @@ function NamespaceFolderRow({
   onViewGroup,
   forceOpen = false,
   selectedHash,
+  hiddenNamespaces,
 }: {
   node: NamespaceTreeNode;
   depth: number;
@@ -2395,6 +2419,12 @@ function NamespaceFolderRow({
    * stays selected) so a jump-in from search/table/elsewhere always lands
    * with the tree already open to the right spot, not fully collapsed. */
   selectedHash?: string;
+  /** Namespaces hidden from the Dashboard's "Currently running" view
+   * (Settings → Manage namespace visibility) — `node.id` (the exact path
+   * built up from root, e.g. "/products/v1") not being in this set is what
+   * "active" means for the folder icon below. Depth 0 is the domain root,
+   * not a real namespace, so it's never colored regardless of membership. */
+  hiddenNamespaces: Set<string>;
 }) {
   // depth 0 is the org/domain root — expand it by default so the first
   // real namespace level (depth 1) is visible immediately, but leave that
@@ -2404,6 +2434,7 @@ function NamespaceFolderRow({
   const containsSelection = selectedHash ? nodeContainsHash(node, selectedHash) : false;
   const isOpen = forceOpen || open || containsSelection;
   const hasContent = node.children.length > 0 || node.leaves.length > 0;
+  const isActiveNamespace = depth > 0 && !hiddenNamespaces.has(node.id);
   return (
     <div>
       <div
@@ -2412,7 +2443,7 @@ function NamespaceFolderRow({
         onClick={() => hasContent && setOpen((o) => !o)}
       >
         <span className="sbom-tree-toggle">{hasContent ? (isOpen ? '▾' : '▸') : '·'}</span>
-        <FolderIcon />
+        <FolderIcon active={isActiveNamespace} />
         <span className="sbom-tree-label">{node.name}</span>
         <span className="muted">
           {' '}
@@ -2450,6 +2481,7 @@ function NamespaceFolderRow({
               onViewGroup={onViewGroup}
               forceOpen={forceOpen}
               selectedHash={selectedHash}
+              hiddenNamespaces={hiddenNamespaces}
             />
           ))}
         </>
@@ -2464,12 +2496,15 @@ function NamespaceTree({
   onViewGroup,
   forceOpen = false,
   selectedHash,
+  hiddenNamespaces,
 }: {
   leaves: Leaf[];
   onViewSbom: (hash: string) => void;
   onViewGroup: (leaves: Leaf[]) => void;
   forceOpen?: boolean;
   selectedHash?: string;
+  /** See `NamespaceFolderRow`'s doc comment. */
+  hiddenNamespaces: Set<string>;
 }) {
   // All leaves in one call belong to one tenant, so they share one domain —
   // shown as the tree's root folder, e.g. "myorg.example" > "products" >
@@ -2488,6 +2523,7 @@ function NamespaceTree({
         onViewGroup={onViewGroup}
         forceOpen={forceOpen}
         selectedHash={selectedHash}
+        hiddenNamespaces={hiddenNamespaces}
       />
     </div>
   );
@@ -2521,6 +2557,9 @@ function Leaves({
   const tenantId = useTenantOverride();
   const [leaves, setLeaves] = useState<Leaf[] | null>(null);
   const [error, setError] = useState('');
+  // Drives the namespace tree's active/inactive folder coloring — same
+  // admin-curated set Settings → Manage namespace visibility edits.
+  const [hiddenNamespaces, setHiddenNamespaces] = useState<Set<string>>(new Set());
   // Leaves fully remounts each time you switch to this tab (App renders it
   // conditionally), so this lazy init correctly re-seeds the selection when
   // jumping here right after an upload, without needing to track/clear a
@@ -2559,6 +2598,16 @@ function Leaves({
   }, [tenantId, currentlyRunningViewEnabled]);
 
   useEffect(load, [load]);
+
+  useEffect(() => {
+    let mounted = true;
+    api.hiddenNamespaces(tenantId)
+      .then((ns) => mounted && setHiddenNamespaces(new Set(ns)))
+      .catch(() => {});
+    return () => {
+      mounted = false;
+    };
+  }, [tenantId]);
 
   // Revoked SBOMs are superseded/invalid, so they're hidden from the browse
   // views by default — "Show revoked" brings them back (visually marked).
@@ -2630,6 +2679,7 @@ function Leaves({
             }}
             forceOpen={searchTerm.trim().length > 0}
             selectedHash={selectedHash}
+            hiddenNamespaces={hiddenNamespaces}
           />
         )}
         {tableLeaves && tableLeaves.length > 0 && view === 'table' && (
@@ -2945,6 +2995,7 @@ function ComponentSearch({ onViewManifest }: { onViewManifest: (hash: string) =>
   const [namespace, setNamespace] = useState('');
   const [purl, setPurl] = useState('');
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [currentOnly, setCurrentOnly] = useState(false);
   const [showRevoked, setShowRevoked] = useState(false);
   const [results, setResults] = useState<ComponentSearchResult[] | null>(null);
   const [busy, setBusy] = useState(false);
@@ -2972,6 +3023,7 @@ function ComponentSearch({ onViewManifest }: { onViewManifest: (hash: string) =>
         {
           ...(trimmedPurl ? { purl: trimmedPurl } : { name: trimmedName, version: version.trim() || undefined }),
           namespace: trimmedNamespace || undefined,
+          currentOnly,
         },
         tenantId
       );
@@ -3045,6 +3097,23 @@ function ComponentSearch({ onViewManifest }: { onViewManifest: (hash: string) =>
             onKeyDown={onEnter}
             placeholder="/product/v1"
           />
+        </label>
+        <label
+          className="checkbox-field"
+          style={{ marginBottom: 0 }}
+          title={
+            'Uses the same namespace visibility as the "Currently running" view (Settings → ' +
+            'Manage namespace visibility). A namespace marked inactive there is excluded here ' +
+            "too, even if it contains a matching component."
+          }
+        >
+          <input type="checkbox" checked={currentOnly} onChange={(e) => setCurrentOnly(e.target.checked)} />
+          <span>
+            Currently active only
+            <span className="muted" style={{ display: 'block', fontSize: 11 }}>
+              latest non-revoked version, per active namespace
+            </span>
+          </span>
         </label>
         <button className="btn primary" style={{ marginBottom: 0 }} disabled={busy} onClick={search}>
           {busy ? 'Searching…' : 'Search'}
@@ -3883,6 +3952,9 @@ function Audit() {
 
 function Settings({
   onDtrackSyncDisabledChange,
+  treeHead,
+  onRefreshTreeHead,
+  headError,
 }: {
   /** The nav bar's Findings-tab visibility is computed from a separate copy
    * of this same flag held by the top-level App component (fetched once,
@@ -3891,8 +3963,15 @@ function Settings({
    * based on stale data until something else forced App to refetch (a
    * tenant switch, a reload). */
   onDtrackSyncDisabledChange?: (disabled: boolean) => void;
+  /** Passed straight through to the "Info" submenu's `Dashboard` — owned by
+   * the top-level App component (it's what the whole app polls for server
+   * health), not re-fetched here. */
+  treeHead: TreeHead | null;
+  onRefreshTreeHead: () => void;
+  headError: string;
 }) {
   const tenantId = useTenantOverride();
+  const [settingsGroup, setSettingsGroup] = useState<'info' | 'general' | 'checks' | 'compliance'>('info');
   const [leaves, setLeaves] = useState<Leaf[] | null>(null);
   const [hiddenNamespaces, setHiddenNamespaces] = useState<Set<string>>(new Set());
   const [error, setError] = useState('');
@@ -3930,6 +4009,15 @@ function Settings({
   const [showReputationModal, setShowReputationModal] = useState(false);
   const [reputationComponents, setReputationComponents] = useState<ReputationComponentSummary[] | null>(null);
   const [reputationComponentsError, setReputationComponentsError] = useState('');
+  const [maliciousCheckEnabled, setMaliciousCheckEnabled] = useState<boolean | null>(null);
+  const [maliciousCheckDisabled, setMaliciousCheckDisabled] = useState<boolean | null>(null);
+  const [maliciousCheckDisabledBusy, setMaliciousCheckDisabledBusy] = useState(false);
+  const [maliciousCheckDisabledError, setMaliciousCheckDisabledError] = useState('');
+  const [maliciousCheckStatus, setMaliciousCheckStatus] = useState<MaliciousCheckStatus | null>(null);
+  const [maliciousCheckStatusError, setMaliciousCheckStatusError] = useState('');
+  const [maliciousSyncBusy, setMaliciousSyncBusy] = useState(false);
+  const [maliciousSyncError, setMaliciousSyncError] = useState('');
+  const [maliciousSyncResult, setMaliciousSyncResult] = useState<MaliciousSyncResult | null>(null);
   const [namespaceRegistrationRequired, setNamespaceRegistrationRequired] = useState<boolean | null>(null);
   const [namespaceRegistrationBusy, setNamespaceRegistrationBusy] = useState(false);
   const [namespaceRegistrationError, setNamespaceRegistrationError] = useState('');
@@ -3957,6 +4045,15 @@ function Settings({
       .catch((e) => setReputationStatusError(e instanceof Error ? e.message : String(e)));
   }, []);
 
+  const loadMaliciousCheckStatus = useCallback(() => {
+    api.maliciousCheckStatus()
+      .then((s) => {
+        setMaliciousCheckStatus(s);
+        setMaliciousCheckStatusError('');
+      })
+      .catch((e) => setMaliciousCheckStatusError(e instanceof Error ? e.message : String(e)));
+  }, []);
+
   useEffect(() => {
     let mounted = true;
     api.config()
@@ -3964,11 +4061,13 @@ function Settings({
         if (!mounted) return;
         setDtrackEnabled(c.dtrack_enabled);
         setReputationEnabled(c.reputation_enabled);
+        setMaliciousCheckEnabled(c.malicious_check_enabled);
       })
       .catch(() => {
         if (!mounted) return;
         setDtrackEnabled(null);
         setReputationEnabled(null);
+        setMaliciousCheckEnabled(null);
       });
     api.dtrackSyncSetting(tenantId)
       .then((s) => mounted && setDtrackSyncDisabled(s.disabled))
@@ -3979,6 +4078,9 @@ function Settings({
     api.reputationTenantSetting(tenantId)
       .then((s) => mounted && setReputationDisabled(s.disabled))
       .catch(() => mounted && setReputationDisabled(null));
+    api.maliciousCheckTenantSetting(tenantId)
+      .then((s) => mounted && setMaliciousCheckDisabled(s.disabled))
+      .catch(() => mounted && setMaliciousCheckDisabled(null));
     api.namespaceRegistrationSetting(tenantId)
       .then((s) => mounted && setNamespaceRegistrationRequired(s.required))
       .catch(() => mounted && setNamespaceRegistrationRequired(null));
@@ -3988,6 +4090,7 @@ function Settings({
   }, [tenantId]);
 
   useEffect(loadReputationStatus, [loadReputationStatus]);
+  useEffect(loadMaliciousCheckStatus, [loadMaliciousCheckStatus]);
   useEffect(loadRegisteredNamespaces, [loadRegisteredNamespaces]);
 
   const toggleDtrackSync = async (disabled: boolean) => {
@@ -4043,6 +4146,19 @@ function Settings({
     }
   };
 
+  const toggleMaliciousCheckDisabled = async (disabled: boolean) => {
+    setMaliciousCheckDisabledBusy(true);
+    setMaliciousCheckDisabledError('');
+    try {
+      await api.setMaliciousCheckTenantSetting(disabled, tenantId);
+      setMaliciousCheckDisabled(disabled);
+    } catch (e) {
+      setMaliciousCheckDisabledError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setMaliciousCheckDisabledBusy(false);
+    }
+  };
+
   const openReputationModal = () => {
     setShowReputationModal(true);
     if (reputationComponents !== null) return; // already loaded
@@ -4090,6 +4206,20 @@ function Settings({
       setReputationSyncError(e instanceof Error ? e.message : String(e));
     } finally {
       setReputationSyncBusy(false);
+    }
+  };
+
+  const forceMaliciousSync = async () => {
+    setMaliciousSyncBusy(true);
+    setMaliciousSyncError('');
+    setMaliciousSyncResult(null);
+    try {
+      setMaliciousSyncResult(await api.forceMaliciousSync());
+      loadMaliciousCheckStatus(); // pick up whatever this pass just processed
+    } catch (e) {
+      setMaliciousSyncError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setMaliciousSyncBusy(false);
     }
   };
 
@@ -4183,6 +4313,221 @@ function Settings({
     <div className="stack">
       {error && <ErrorBox message={error} />}
 
+      <div className="subnav">
+        <button
+          className={`subnav-link ${settingsGroup === 'info' ? 'active' : ''}`}
+          onClick={() => setSettingsGroup('info')}
+        >
+          Info
+        </button>
+        <button
+          className={`subnav-link ${settingsGroup === 'general' ? 'active' : ''}`}
+          onClick={() => setSettingsGroup('general')}
+        >
+          General
+        </button>
+        <button
+          className={`subnav-link ${settingsGroup === 'checks' ? 'active' : ''}`}
+          onClick={() => setSettingsGroup('checks')}
+        >
+          Package checks
+        </button>
+        <button
+          className={`subnav-link ${settingsGroup === 'compliance' ? 'active' : ''}`}
+          onClick={() => setSettingsGroup('compliance')}
+        >
+          Compliance checks
+        </button>
+      </div>
+
+      {settingsGroup === 'info' && (
+        <Dashboard treeHead={treeHead} onRefresh={onRefreshTreeHead} headError={headError} />
+      )}
+
+      {settingsGroup === 'general' && (
+        <>
+      {/* Upload-time gating rules first — what's required/rejected on
+          upload is the most consequential thing on this page, and these two
+          cards are the only ones that affect that. */}
+      <div className="card">
+        <div className="card-header">
+          <h2>SBOM uploads</h2>
+        </div>
+        <div className="kv-row">
+          <label className="checkbox-field">
+            <input
+              type="checkbox"
+              checked={semverRequired ?? false}
+              disabled={semverBusy || semverRequired === null}
+              onChange={(e) => toggleSemverRequired(e.target.checked)}
+            />
+            Require SemVer-compliant version on upload
+          </label>
+          <span className="muted">
+            {' '}
+            — {semverRequired
+              ? 'uploads with a version that is not SemVer 2.0.0 compliant (e.g. 1.2.3, 1.2.3-rc.1) are rejected'
+              : 'any non-empty version string is accepted'}
+          </span>
+        </div>
+        {semverError && <ErrorBox message={semverError} />}
+        <div className="kv-row">
+          <label className="checkbox-field">
+            <input
+              type="checkbox"
+              checked={namespaceRegistrationRequired ?? false}
+              disabled={namespaceRegistrationBusy || namespaceRegistrationRequired === null}
+              onChange={(e) => toggleNamespaceRegistrationRequired(e.target.checked)}
+            />
+            Require namespace to be registered before upload
+          </label>
+          <span className="muted">
+            {' '}
+            — {namespaceRegistrationRequired
+              ? 'uploads to a namespace not listed below are rejected'
+              : 'any namespace is accepted, registered or not'}
+          </span>
+        </div>
+        {namespaceRegistrationError && <ErrorBox message={namespaceRegistrationError} />}
+        <div className="kv-row">
+          <span className="kv-label">Registered namespaces</span>
+          <div className="form-row settings-inline-form">
+            <label className="field settings-inline-field">
+              <span>Add namespace</span>
+              <input
+                type="text"
+                placeholder="/products/v1"
+                value={newNamespaceInput}
+                onChange={(e) => setNewNamespaceInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') handleCreateNamespace();
+                }}
+                disabled={createNamespaceBusy}
+              />
+            </label>
+            <button
+              className="btn"
+              style={{ marginBottom: 0 }}
+              disabled={createNamespaceBusy || !newNamespaceInput.trim()}
+              onClick={handleCreateNamespace}
+            >
+              {createNamespaceBusy ? 'Creating…' : 'Create namespace'}
+            </button>
+          </div>
+        </div>
+        {createNamespaceError && <ErrorBox message={createNamespaceError} />}
+        {registeredNamespacesError && <ErrorBox message={registeredNamespacesError} />}
+        {registeredNamespaces !== null && registeredNamespaces.length > 0 && (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Namespace</th>
+                <th>Created by</th>
+                <th>Created at</th>
+              </tr>
+            </thead>
+            <tbody>
+              {registeredNamespaces.map((n) => (
+                <tr key={n.namespace}>
+                  <td>
+                    <span className="cell-actions">
+                      {n.namespace}
+                      <CopyButton text={n.namespace} />
+                    </span>
+                  </td>
+                  <td className="muted">{shortPrincipal(n.created_by)}</td>
+                  <td className="muted">{new Date(n.created_at).toLocaleString()}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        {registeredNamespaces !== null && registeredNamespaces.length === 0 && (
+          <div className="muted">No namespaces registered yet.</div>
+        )}
+      </div>
+        </>
+      )}
+
+      {settingsGroup === 'compliance' && (
+        <>
+      <div className="card">
+        <div className="card-header">
+          <h2>Compliance profiles</h2>
+          <button className="btn" onClick={load}>Refresh</button>
+        </div>
+        <p className="muted">
+          Optional, off by default. When enabled, uploads are checked against the profile's rules
+          and the result is shown on each SBOM's detail view. Enforcement can additionally reject
+          uploads outright at the "minimum" or "full" bar — this affects every uploader on the
+          tenant, not just you.
+        </p>
+        {complianceSettings === null && !error && <Spinner label="Loading compliance profiles…" />}
+        {complianceSettings !== null && complianceSettings.length === 0 && (
+          <div className="muted">No compliance profiles registered.</div>
+        )}
+        {complianceSettings !== null && complianceSettings.length > 0 && (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>profile</th>
+                <th>status</th>
+                <th>enforcement</th>
+              </tr>
+            </thead>
+            <tbody>
+              {complianceSettings.map((s) => (
+                <tr key={s.profile_id}>
+                  <td>
+                    {s.profile_name}
+                    {s.description && (
+                      <div className="muted" style={{ fontSize: '0.85em', marginTop: 2, whiteSpace: 'normal' }}>
+                        {s.description}
+                      </div>
+                    )}
+                  </td>
+                  <td>
+                    <label className="checkbox-field">
+                      <input
+                        type="checkbox"
+                        checked={s.enabled}
+                        disabled={busyProfile === s.profile_id}
+                        onChange={(e) => setCompliance(s.profile_id, e.target.checked, s.enforce_level)}
+                      />
+                      {s.enabled ? 'enabled' : 'disabled'}
+                    </label>
+                  </td>
+                  <td>
+                    {s.enabled ? (
+                      <select
+                        value={s.enforce_level}
+                        disabled={busyProfile === s.profile_id}
+                        onChange={(e) =>
+                          setCompliance(s.profile_id, s.enabled, e.target.value as 'off' | 'minimum' | 'full')
+                        }
+                      >
+                        <option value="off">off (report only)</option>
+                        <option value="minimum">reject below minimum</option>
+                        <option value="full">reject below full compliance</option>
+                      </select>
+                    ) : (
+                      <span className="muted">—</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+        </>
+      )}
+
+      {settingsGroup === 'checks' && (
+        <>
+      {/* Background scanning/enrichment integrations — structurally
+          identical cards (deployment-wide flag, background job + force
+          sync, per-tenant opt-out), grouped together. */}
       <div className="card">
         <div className="card-header">
           <h2>Dependency-Track</h2>
@@ -4246,96 +4591,6 @@ function Settings({
         )}
         {dtrackForceSyncError && <ErrorBox message={dtrackForceSyncError} />}
         {dtrackSyncError && <ErrorBox message={dtrackSyncError} />}
-      </div>
-
-      <div className="card">
-        <div className="card-header">
-          <h2>SBOM uploads</h2>
-        </div>
-        <div className="kv-row">
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={semverRequired ?? false}
-              disabled={semverBusy || semverRequired === null}
-              onChange={(e) => toggleSemverRequired(e.target.checked)}
-            />
-            Require SemVer-compliant version on upload
-          </label>
-          <span className="muted">
-            {' '}
-            — {semverRequired
-              ? 'uploads with a version that is not SemVer 2.0.0 compliant (e.g. 1.2.3, 1.2.3-rc.1) are rejected'
-              : 'any non-empty version string is accepted'}
-          </span>
-        </div>
-        {semverError && <ErrorBox message={semverError} />}
-        <div className="kv-row">
-          <label className="checkbox-field">
-            <input
-              type="checkbox"
-              checked={namespaceRegistrationRequired ?? false}
-              disabled={namespaceRegistrationBusy || namespaceRegistrationRequired === null}
-              onChange={(e) => toggleNamespaceRegistrationRequired(e.target.checked)}
-            />
-            Require namespace to be registered before upload
-          </label>
-          <span className="muted">
-            {' '}
-            — {namespaceRegistrationRequired
-              ? 'uploads to a namespace not listed below are rejected'
-              : 'any namespace is accepted, registered or not'}
-          </span>
-        </div>
-        {namespaceRegistrationError && <ErrorBox message={namespaceRegistrationError} />}
-        <div className="kv-row">
-          <span className="kv-label">Registered namespaces</span>
-          <span className="cell-actions">
-            <input
-              type="text"
-              placeholder="/products/v1"
-              value={newNamespaceInput}
-              onChange={(e) => setNewNamespaceInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') handleCreateNamespace();
-              }}
-              disabled={createNamespaceBusy}
-            />
-            <button className="btn" disabled={createNamespaceBusy || !newNamespaceInput.trim()} onClick={handleCreateNamespace}>
-              {createNamespaceBusy ? 'Creating…' : 'Create namespace'}
-            </button>
-          </span>
-        </div>
-        {createNamespaceError && <ErrorBox message={createNamespaceError} />}
-        {registeredNamespacesError && <ErrorBox message={registeredNamespacesError} />}
-        {registeredNamespaces !== null && registeredNamespaces.length > 0 && (
-          <table className="table">
-            <thead>
-              <tr>
-                <th>Namespace</th>
-                <th>Created by</th>
-                <th>Created at</th>
-              </tr>
-            </thead>
-            <tbody>
-              {registeredNamespaces.map((n) => (
-                <tr key={n.namespace}>
-                  <td>
-                    <span className="cell-actions">
-                      {n.namespace}
-                      <CopyButton text={n.namespace} />
-                    </span>
-                  </td>
-                  <td className="muted">{shortPrincipal(n.created_by)}</td>
-                  <td className="muted">{new Date(n.created_at).toLocaleString()}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-        {registeredNamespaces !== null && registeredNamespaces.length === 0 && (
-          <div className="muted">No namespaces registered yet.</div>
-        )}
       </div>
 
       <div className="card">
@@ -4447,6 +4702,87 @@ function Settings({
 
       <div className="card">
         <div className="card-header">
+          <h2>Malicious package detection</h2>
+        </div>
+        <div className="kv-row">
+          <span className="kv-label">Deployment-wide</span>
+          {maliciousCheckEnabled === null ? (
+            <span className="muted">unknown</span>
+          ) : (
+            <Badge ok={maliciousCheckEnabled}>{maliciousCheckEnabled ? 'enabled' : 'disabled'}</Badge>
+          )}
+          <span className="muted"> — OSV, checked once per upload; never blocks the upload itself</span>
+        </div>
+        {maliciousCheckEnabled && (
+          <div className="kv-row">
+            <span className="kv-label">Manifests</span>
+            {maliciousCheckStatus ? (
+              <span className="cell-actions">
+                <Badge ok={maliciousCheckStatus.pending === 0}>{maliciousCheckStatus.pending} pending</Badge>
+                <Badge ok={true}>{maliciousCheckStatus.checked} checked</Badge>
+                <button className="btn" onClick={loadMaliciousCheckStatus}>Refresh</button>
+              </span>
+            ) : (
+              <span className="muted">loading…</span>
+            )}
+          </div>
+        )}
+        {maliciousCheckStatusError && <ErrorBox message={maliciousCheckStatusError} />}
+        {maliciousCheckEnabled && (
+          <div className="kv-row">
+            <span className="kv-label">Background job</span>
+            <span className="cell-actions">
+              <button className="btn" disabled={maliciousSyncBusy} onClick={forceMaliciousSync}>
+                {maliciousSyncBusy ? 'Syncing…' : 'Force malicious sync'}
+              </button>
+              <span className="muted">
+                Runs one batch of the malicious-package rescan job now instead of waiting for its
+                next scheduled tick — catches a package that gets flagged MAL- after it was already
+                uploaded; deployment-wide, not scoped to this tenant.
+              </span>
+            </span>
+          </div>
+        )}
+        {maliciousSyncResult && (
+          <div className="muted">
+            Sync pass complete — processed {maliciousSyncResult.manifests_processed} manifest
+            {maliciousSyncResult.manifests_processed === 1 ? '' : 's'}. One pass only covers a bounded batch —
+            run it again if you have more than that still pending.
+          </div>
+        )}
+        {maliciousSyncError && <ErrorBox message={maliciousSyncError} />}
+        {maliciousCheckEnabled && (
+          <div className="kv-row">
+            <span className="kv-label">This tenant</span>
+            <label className="checkbox-field">
+              <input
+                type="checkbox"
+                checked={!(maliciousCheckDisabled ?? false)}
+                disabled={maliciousCheckDisabledBusy || maliciousCheckDisabled === null}
+                onChange={(e) => toggleMaliciousCheckDisabled(!e.target.checked)}
+              />
+              {maliciousCheckDisabled ? 'disabled' : 'enabled'} for this tenant
+            </label>
+            <span className="muted">
+              {' '}
+              — {maliciousCheckDisabled
+                ? 'the "known-malicious package" panel is hidden on this tenant\'s SBOM detail views (uploads are still checked and findings still stored)'
+                : 'the panel is shown as usual'}
+            </span>
+          </div>
+        )}
+        {maliciousCheckDisabledError && <ErrorBox message={maliciousCheckDisabledError} />}
+      </div>
+        </>
+      )}
+
+      {settingsGroup === 'general' && (
+        <>
+      {/* Local/cosmetic preferences and one-off bulk actions last — neither
+          changes what's accepted or scanned, so they're the least
+          consequential settings on this page. */}
+      <div className="card">
+        <div className="card-header">
           <h2>Display preferences</h2>
         </div>
         <p className="muted">
@@ -4515,76 +4851,6 @@ function Settings({
 
       <div className="card">
         <div className="card-header">
-          <h2>Compliance profiles</h2>
-          <button className="btn" onClick={load}>Refresh</button>
-        </div>
-        <p className="muted">
-          Optional, off by default. When enabled, uploads are checked against the profile's rules
-          and the result is shown on each SBOM's detail view. Enforcement can additionally reject
-          uploads outright at the "minimum" or "full" bar — this affects every uploader on the
-          tenant, not just you.
-        </p>
-        {complianceSettings === null && !error && <Spinner label="Loading compliance profiles…" />}
-        {complianceSettings !== null && complianceSettings.length === 0 && (
-          <div className="muted">No compliance profiles registered.</div>
-        )}
-        {complianceSettings !== null && complianceSettings.length > 0 && (
-          <table className="table">
-            <thead>
-              <tr>
-                <th>profile</th>
-                <th>status</th>
-                <th>enforcement</th>
-              </tr>
-            </thead>
-            <tbody>
-              {complianceSettings.map((s) => (
-                <tr key={s.profile_id}>
-                  <td>
-                    {s.profile_name}
-                    {s.description && (
-                      <div className="muted" style={{ fontSize: '0.85em', marginTop: 2, whiteSpace: 'normal' }}>
-                        {s.description}
-                      </div>
-                    )}
-                  </td>
-                  <td>
-                    <label className="checkbox-field">
-                      <input
-                        type="checkbox"
-                        checked={s.enabled}
-                        disabled={busyProfile === s.profile_id}
-                        onChange={(e) => setCompliance(s.profile_id, e.target.checked, s.enforce_level)}
-                      />
-                      {s.enabled ? 'enabled' : 'disabled'}
-                    </label>
-                  </td>
-                  <td>
-                    {s.enabled ? (
-                      <select
-                        value={s.enforce_level}
-                        disabled={busyProfile === s.profile_id}
-                        onChange={(e) =>
-                          setCompliance(s.profile_id, s.enabled, e.target.value as 'off' | 'minimum' | 'full')
-                        }
-                      >
-                        <option value="off">off (report only)</option>
-                        <option value="minimum">reject below minimum</option>
-                        <option value="full">reject below full compliance</option>
-                      </select>
-                    ) : (
-                      <span className="muted">—</span>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </div>
-
-      <div className="card">
-        <div className="card-header">
           <h2>Audit export</h2>
         </div>
         <p className="muted">
@@ -4610,7 +4876,7 @@ function Settings({
         </button>
         {showSnapshotExtended && (
           <div className="form-row" style={{ marginTop: 12 }}>
-            <label className="field">
+            <label className="field settings-inline-field">
               <span>Namespace (optional)</span>
               <input
                 value={snapshotNamespace}
@@ -4618,7 +4884,7 @@ function Settings({
                 placeholder="/product1"
               />
             </label>
-            <label className="field">
+            <label className="field settings-inline-field">
               <span>Version (optional)</span>
               <input
                 value={snapshotVersion}
@@ -4629,6 +4895,8 @@ function Settings({
           </div>
         )}
       </div>
+        </>
+      )}
     </div>
   );
 }
@@ -4969,9 +5237,6 @@ export default function App() {
           )}
 
           <main className="content">
-            {tab === 'dashboard' && roleCan(whoami.role, 'read') && (
-              <Dashboard treeHead={treeHead} onRefresh={refreshHead} headError={headError} />
-            )}
             {tab === 'upload' && roleCan(whoami.role, 'upload') && (
               <Upload
                 onUploaded={(result) => {
@@ -5020,7 +5285,12 @@ export default function App() {
             )}
             {tab === 'audit' && roleCan(whoami.role, 'read') && <Audit />}
             {tab === 'settings' && roleCan(whoami.role, 'manage_settings') && (
-              <Settings onDtrackSyncDisabledChange={setDtrackSyncDisabled} />
+              <Settings
+                onDtrackSyncDisabledChange={setDtrackSyncDisabled}
+                treeHead={treeHead}
+                onRefreshTreeHead={refreshHead}
+                headError={headError}
+              />
             )}
           </main>
         </div>

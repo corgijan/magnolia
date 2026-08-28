@@ -13,10 +13,14 @@
   OSV's public API per upload (purl-based, components without a purl are skipped),
   filtered for `MAL-`-prefixed advisories, stored in `malicious_component_findings`
   and surfaced in `manifest()`'s response. Informational only (never blocks an
-  upload) and covers new uploads only, no backfill for the existing archive. See
-  `SUPPLY_CHAIN_SIGNALS_PLAN.md` for the corrected design (the original bulk-mirror
-  plan turned out wrong once checked against OSV's real docs) and the open items
-  (typosquat heuristics, dependency confusion, backfill) it explicitly deferred.
+  upload). A periodic background job (`malicious_sync.rs`, default hourly)
+  now also rescans the existing archive daily-per-manifest, catching a
+  package that gets flagged `MAL-` after it was already uploaded — plus a
+  "Force malicious sync" button and status counts in Settings, same shape
+  as the reputation background job's. See `SUPPLY_CHAIN_SIGNALS_PLAN.md`
+  for the corrected design (the original bulk-mirror plan turned out wrong
+  once checked against OSV's real docs) and the open items (typosquat
+  heuristics, dependency confusion) it explicitly deferred.
 - Package reputation scoring — OpenSSF Scorecard scores via deps.dev's public API
   (verified against docs.deps.dev/api/v3 first). New `magnolia-depsdev` crate +
   `crates/api/src/reputation_sync.rs` background job (hourly by default, deps.dev has

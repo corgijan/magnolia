@@ -530,6 +530,11 @@ pub struct SearchComponentsQuery {
     pub version: Option<String>,
     pub namespace: Option<String>,
     pub purl: Option<String>,
+    // Same "latest non-revoked upload per namespace, respecting namespace
+    // visibility" definition as `ListFindingsQuery.current_only` — see
+    // `search_sbom_components`'s doc comment.
+    #[serde(default)]
+    pub current_only: bool,
     #[serde(default = "default_limit")]
     pub limit: i64,
     #[serde(default)]
@@ -694,12 +699,21 @@ async fn index_manifest_components(
     let components: Vec<magnolia_db::NewSbomComponent> = extracted
         .into_iter()
         .map(|c| {
-            let (ecosystem, registry_name) = c
-                .purl
-                .as_deref()
-                .and_then(magnolia_core::purl_to_depsdev_package)
-                .map(|(eco, name)| (Some(eco.to_string()), Some(name)))
-                .unwrap_or((None, None));
+            // `Some(String::new())`/sentinel for "has a purl, ran through
+            // purl_to_depsdev_package, no deps.dev mapping for this purl
+            // type" vs. `None` for "no purl at all" — the distinction lets
+            // `reputation_sync`'s backfill phase tell a genuinely
+            // never-attempted row (`ecosystem IS NULL`) apart from one that
+            // was attempted and correctly found nothing, so it doesn't keep
+            // re-attempting the latter forever. See that phase's doc
+            // comment.
+            let (ecosystem, registry_name) = match c.purl.as_deref().filter(|p| !p.is_empty()) {
+                None => (None, None),
+                Some(purl) => match magnolia_core::purl_to_depsdev_package(purl) {
+                    Some((eco, name)) => (Some(eco.to_string()), Some(name)),
+                    None => (Some(String::new()), None),
+                },
+            };
             magnolia_db::NewSbomComponent {
                 name: c.name,
                 version: c.version,
@@ -720,10 +734,18 @@ async fn index_manifest_components(
 
     // Best-effort, never fails the indexing step itself (see
     // `check_and_store_malicious_components`'s doc comment) — `None` when
-    // `DISABLE_MALICIOUS_PACKAGE_CHECK` is set for this deployment.
+    // `DISABLE_MALICIOUS_PACKAGE_CHECK` is set for this deployment. Only
+    // marks `malicious_checked_at` on a successful check, so a failed
+    // upload-time check still gets picked up by `malicious_sync`'s next
+    // pass instead of silently waiting out the full rescan interval.
     if let Some(osv) = &state.osv {
-        crate::malicious_check::check_and_store_malicious_components(&state.db, osv, manifest_hash, &components)
+        let ok = crate::malicious_check::check_and_store_malicious_components(&state.db, osv, manifest_hash, &components)
             .await;
+        if ok {
+            if let Err(e) = state.db.touch_manifest_malicious_checked(manifest_hash).await {
+                tracing::warn!(manifest_hash = %manifest_hash, error = %e, "failed to record malicious_checked_at");
+            }
+        }
     }
 
     Ok(count)
@@ -848,6 +870,7 @@ pub struct ConfigJson {
     /// about N minutes" instead of a made-up number.
     pub dtrack_sync_interval_secs: Option<u64>,
     pub reputation_enabled: bool,
+    pub malicious_check_enabled: bool,
 }
 
 /// Server-operational info, not tenant data — safe for any authenticated
@@ -863,6 +886,7 @@ pub async fn config(State(state): State<AppState>, _grant: AuthGrant) -> Json<Co
         dtrack_enabled: state.dtrack.is_some(),
         dtrack_sync_interval_secs: state.dtrack.is_some().then_some(state.dtrack_sync_interval_secs),
         reputation_enabled: state.depsdev.is_some(),
+        malicious_check_enabled: state.osv.is_some(),
     })
 }
 
@@ -966,6 +990,60 @@ pub async fn set_reputation_tenant_setting(
         &state,
         &grant,
         "reputation_tenant_setting",
+        &tenant_id.to_string(),
+        true,
+        Some(format!("disabled={}", body.disabled)),
+    )
+    .await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Serialize)]
+pub struct MaliciousCheckTenantSettingJson {
+    pub disabled: bool,
+}
+
+/// This tenant's opt-out of the "malicious package" panel appearing on its
+/// own SBOM detail views — distinct from `ConfigJson.malicious_check_enabled`,
+/// which is deployment-wide and read-only here. Same read/write split as
+/// `reputation_tenant_setting`.
+pub async fn malicious_check_tenant_setting(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+) -> Result<Json<MaliciousCheckTenantSettingJson>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    let tenant = state.db.get_tenant(tenant_id).await.map_err(db_err)?.ok_or(ApiError::NotFound)?;
+    Ok(Json(MaliciousCheckTenantSettingJson { disabled: tenant.malicious_check_disabled }))
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetMaliciousCheckTenantSettingRequest {
+    pub disabled: bool,
+}
+
+/// Toggles this tenant's opt-out of the malicious-package panel — same
+/// display-only shape as `set_reputation_tenant_setting`: detection at
+/// upload time (`check_and_store_malicious_components`) is untouched
+/// either way, this only controls whether `manifest()`'s
+/// `malicious_components` gets shown on this tenant's SBOM detail views.
+pub async fn set_malicious_check_tenant_setting(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+    Json(body): Json<SetMaliciousCheckTenantSettingRequest>,
+) -> Result<StatusCode, ApiError> {
+    require(&grant, Action::ManageSettings, &grant.namespace_scope)?;
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+
+    state.db.set_tenant_malicious_check_disabled(tenant_id, body.disabled).await.map_err(db_err)?;
+
+    let _ = record_audit(
+        &state,
+        &grant,
+        "malicious_check_tenant_setting",
         &tenant_id.to_string(),
         true,
         Some(format!("disabled={}", body.disabled)),
@@ -2486,6 +2564,7 @@ pub async fn search_components(
             name_filter,
             version_filter,
             purl_filter,
+            query.current_only,
             limit,
             offset,
         )
@@ -2666,6 +2745,64 @@ pub async fn reputation_status(
     require(&grant, Action::Read, &grant.namespace_scope)?;
     let status = state.db.reputation_status(crate::reputation_sync::stale_before_cutoff()).await.map_err(db_err)?;
     Ok(Json(ReputationStatusJson { pending: status.pending, checked: status.checked, failed: status.failed }))
+}
+
+#[derive(serde::Serialize)]
+pub struct MaliciousSyncResponse {
+    pub manifests_processed: usize,
+}
+
+/// Runs one on-demand batch of the malicious-package rescan background job
+/// (see `malicious_sync.rs`) instead of waiting for its next scheduled tick
+/// — same relationship `force_reputation_sync` has to `reputation_sync`'s
+/// loop. Deployment-global, same reasoning as `force_reputation_sync`: which
+/// manifests are due for a rescan doesn't depend on which tenant's key
+/// triggered it. `Action::ManageSettings`, same gate as
+/// `force_reputation_sync`. 400 if malicious-package checking isn't enabled
+/// for this deployment at all (nothing to check against).
+pub async fn force_malicious_sync(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+) -> Result<Json<MaliciousSyncResponse>, ApiError> {
+    require(&grant, Action::ManageSettings, &grant.namespace_scope)?;
+
+    let client = state.osv.as_ref().ok_or_else(|| {
+        ApiError::BadRequest("malicious-package checking is disabled for this deployment".to_string())
+    })?;
+
+    let manifests_processed = crate::malicious_sync::sync_pass(&state.db, client).await;
+
+    let _ = record_audit(
+        &state,
+        &grant,
+        "malicious_force_sync",
+        &format!("manifests_processed={manifests_processed}"),
+        true,
+        None,
+    )
+    .await;
+
+    Ok(Json(MaliciousSyncResponse { manifests_processed }))
+}
+
+#[derive(serde::Serialize)]
+pub struct MaliciousCheckStatusJson {
+    pub pending: i64,
+    pub checked: i64,
+}
+
+/// Deployment-wide counts of the malicious-sync background job's progress —
+/// same shape as `reputation_status`, minus `failed` (see
+/// `MaliciousCheckStatus`'s field docs for why). `Action::Read`, same as
+/// `reputation_status` — a read, not a mutation, unlike `force_malicious_sync`.
+pub async fn malicious_check_status(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+) -> Result<Json<MaliciousCheckStatusJson>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let status =
+        state.db.malicious_check_status(crate::malicious_sync::stale_before_cutoff()).await.map_err(db_err)?;
+    Ok(Json(MaliciousCheckStatusJson { pending: status.pending, checked: status.checked }))
 }
 
 #[derive(serde::Serialize)]

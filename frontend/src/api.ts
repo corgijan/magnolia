@@ -351,6 +351,7 @@ export interface BackendConfig {
   // Present only when dtrack_enabled.
   dtrack_sync_interval_secs: number | null;
   reputation_enabled: boolean;
+  malicious_check_enabled: boolean;
 }
 
 export interface ReputationSyncResult {
@@ -361,6 +362,18 @@ export interface ReputationStatus {
   pending: number;
   checked: number;
   failed: number;
+}
+
+export interface MaliciousSyncResult {
+  manifests_processed: number;
+}
+
+// Same shape as ReputationStatus minus "failed" — a failed rescan attempt
+// just stays counted under "pending" until it succeeds (see the backend's
+// MaliciousCheckStatus field docs).
+export interface MaliciousCheckStatus {
+  pending: number;
+  checked: number;
 }
 
 // This tenant's own opt-out of the deployment-wide dtrack sync — distinct
@@ -378,6 +391,12 @@ export interface SemverSetting {
 // This tenant's opt-out of the "Package reputation" panel appearing on its
 // own SBOM detail views — has no effect on the background job itself.
 export interface ReputationTenantSetting {
+  disabled: boolean;
+}
+
+// This tenant's opt-out of the "malicious package" panel appearing on its
+// own SBOM detail views — has no effect on detection at upload time.
+export interface MaliciousCheckTenantSetting {
   disabled: boolean;
 }
 
@@ -607,6 +626,12 @@ export const api = {
 
   reputationComponents: (): Promise<ReputationComponentSummary[]> => request('/api/v1/reputation/components'),
 
+  // Deployment-global, unlike forceDtrackSync — no tenant to scope this to.
+  forceMaliciousSync: (): Promise<MaliciousSyncResult> =>
+    request('/api/v1/malicious/sync', { method: 'POST' }),
+
+  maliciousCheckStatus: (): Promise<MaliciousCheckStatus> => request('/api/v1/malicious/status'),
+
   currentManifests: (tenantId?: string): Promise<CurrentManifest[]> =>
     request(`/api/v1/manifests/current${tenantQs(tenantId)}`),
 
@@ -645,6 +670,16 @@ export const api = {
 
   setReputationTenantSetting: (disabled: boolean, tenantId?: string): Promise<void> =>
     request(`/api/v1/settings/reputation-sync${tenantQs(tenantId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ disabled }),
+    }),
+
+  maliciousCheckTenantSetting: (tenantId?: string): Promise<MaliciousCheckTenantSetting> =>
+    request(`/api/v1/settings/malicious-check${tenantQs(tenantId)}`),
+
+  setMaliciousCheckTenantSetting: (disabled: boolean, tenantId?: string): Promise<void> =>
+    request(`/api/v1/settings/malicious-check${tenantQs(tenantId)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ disabled }),
@@ -717,7 +752,15 @@ export const api = {
   },
 
   searchComponents: (
-    opts: { name?: string; version?: string; namespace?: string; purl?: string; limit?: number; offset?: number },
+    opts: {
+      name?: string;
+      version?: string;
+      namespace?: string;
+      purl?: string;
+      currentOnly?: boolean;
+      limit?: number;
+      offset?: number;
+    },
     tenantId?: string
   ): Promise<ComponentSearchResult[]> => {
     const extra: Record<string, string | number> = {};
@@ -725,6 +768,7 @@ export const api = {
     if (opts.version) extra.version = opts.version;
     if (opts.namespace) extra.namespace = opts.namespace;
     if (opts.purl) extra.purl = opts.purl;
+    if (opts.currentOnly) extra.current_only = 'true';
     if (opts.limit) extra.limit = opts.limit;
     if (opts.offset) extra.offset = opts.offset;
     return request(`/api/v1/search/components${tenantQs(tenantId, extra)}`);

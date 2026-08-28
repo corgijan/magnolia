@@ -4,25 +4,36 @@ use magnolia_db::{Database, NewMaliciousFinding, NewSbomComponent};
 use magnolia_osv::{OsvClient, PackageQuery};
 
 /// Runs OSV's `MAL-`-prefixed malicious-package check for one manifest's
-/// just-indexed components and stores any hits — called from
-/// `index_manifest_components` right after `insert_sbom_components`.
-/// Best-effort, same "secondary concern can't block the primary flow" idiom
-/// used there and for `record_audit`/`dtrack_sync`: any failure (network,
-/// unexpected response shape) is logged and swallowed, never surfaced to the
-/// uploader or reflected in the indexing count.
+/// components and stores any hits — called from `index_manifest_components`
+/// right after `insert_sbom_components` (upload time), and again later by
+/// `malicious_sync`'s periodic rescan (catching a package that gets flagged
+/// `MAL-` *after* it was already uploaded). Best-effort, same "secondary
+/// concern can't block the primary flow" idiom used there and for
+/// `record_audit`/`dtrack_sync`: any failure (network, unexpected response
+/// shape) is logged and swallowed, never surfaced to the uploader or
+/// reflected in the indexing count.
 ///
 /// Skips components with no `purl` — OSV's query needs either a purl or an
 /// (ecosystem, name, version) triple, and there's no reliable way to guess an
 /// ecosystem from a bare SBOM component name alone.
+///
+/// Returns whether the check actually completed (reached OSV and, if there
+/// were hits, stored them) — `false` only for a querybatch/storage failure.
+/// A failed summary fetch for an individual `MAL-` id doesn't count as a
+/// failure (the finding itself is still stored, just without a summary).
+/// `malicious_sync::sync_pass` uses this to decide whether to advance
+/// `manifests.malicious_checked_at` — a `false` return leaves it stale so
+/// the manifest gets retried on the next tick instead of waiting out the
+/// full rescan interval.
 pub async fn check_and_store_malicious_components(
     db: &Database,
     osv: &OsvClient,
     manifest_hash: &str,
     components: &[NewSbomComponent],
-) {
+) -> bool {
     let purled = purled_components(components);
     if purled.is_empty() {
-        return;
+        return true;
     }
 
     let queries: Vec<PackageQuery> =
@@ -32,7 +43,7 @@ pub async fn check_and_store_malicious_components(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(manifest_hash = %manifest_hash, error = %e, "malicious-package check: OSV querybatch failed; skipping");
-            return;
+            return false;
         }
     };
     if results.len() != purled.len() {
@@ -42,7 +53,7 @@ pub async fn check_and_store_malicious_components(
             got = results.len(),
             "malicious-package check: OSV response count didn't match query count; skipping"
         );
-        return;
+        return false;
     }
 
     // A summary is fetched at most once per distinct MAL- id, even when
@@ -62,11 +73,13 @@ pub async fn check_and_store_malicious_components(
 
     let findings = build_findings(&purled, &results, &summaries);
     if findings.is_empty() {
-        return;
+        return true;
     }
     if let Err(e) = db.insert_malicious_findings(manifest_hash, &findings).await {
         tracing::warn!(manifest_hash = %manifest_hash, error = %e, "malicious-package check: failed to store findings");
+        return false;
     }
+    true
 }
 
 /// Components with a usable `purl` — OSV's query needs either a purl or an

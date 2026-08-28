@@ -5,7 +5,7 @@ pub use models::{
     ApiKeyRecord, AuditLogRecord, ComplianceSettingRecord, ComponentIdentity,
     ComponentReputationRecord, DtrackFindingRecord, DtrackFindingWithContextRecord,
     DtrackProjectRecord, DtrackPushFailureRecord, FindingCommentRecord, ManifestRecord,
-    MaliciousFindingRecord, MerkleLeafRecord, MerkleNodeRecord, NewDtrackFinding,
+    MaliciousCheckStatus, MaliciousFindingRecord, MerkleLeafRecord, MerkleNodeRecord, NewDtrackFinding,
     ManifestVersionRow, NewMaliciousFinding, NewSbomComponent, RegisteredNamespaceRecord,
     ComponentReputationSummaryRow, ReputationStatus, SbomComponentRow, SbomComponentSearchRow,
     SignedTreeHeadRecord, TenantRecord,
@@ -92,7 +92,7 @@ impl Database {
 
     pub async fn get_tenant(&self, id: Uuid) -> Result<Option<TenantRecord>, DbError> {
         sqlx::query_as::<_, TenantRecord>(
-            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled, require_semver_version, reputation_disabled, require_namespace_registration FROM tenants WHERE id = $1",
+            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled, require_semver_version, reputation_disabled, require_namespace_registration, malicious_check_disabled FROM tenants WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -105,7 +105,7 @@ impl Database {
         domain: &str,
     ) -> Result<Option<TenantRecord>, DbError> {
         sqlx::query_as::<_, TenantRecord>(
-            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled, require_semver_version, reputation_disabled, require_namespace_registration FROM tenants WHERE domain = $1",
+            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled, require_semver_version, reputation_disabled, require_namespace_registration, malicious_check_disabled FROM tenants WHERE domain = $1",
         )
         .bind(domain)
         .fetch_optional(&self.pool)
@@ -119,7 +119,7 @@ impl Database {
     /// reachable directly (e.g. `?tenant_id=` override), just not listed.
     pub async fn list_tenants(&self) -> Result<Vec<TenantRecord>, DbError> {
         sqlx::query_as::<_, TenantRecord>(
-            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled, require_semver_version, reputation_disabled, require_namespace_registration FROM tenants WHERE hidden = FALSE ORDER BY created_at DESC",
+            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled, require_semver_version, reputation_disabled, require_namespace_registration, malicious_check_disabled FROM tenants WHERE hidden = FALSE ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
         .await
@@ -159,6 +159,21 @@ impl Database {
     /// has no effect on the background job itself, only on display.
     pub async fn set_tenant_reputation_disabled(&self, tenant_id: Uuid, disabled: bool) -> Result<(), DbError> {
         sqlx::query("UPDATE tenants SET reputation_disabled = $1 WHERE id = $2")
+            .bind(disabled)
+            .bind(tenant_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DbError::QueryError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Per-tenant opt-out of the "malicious package" panel appearing on
+    /// this tenant's SBOM detail views (see the `malicious_check_disabled`
+    /// migration comment) — same display-only shape as
+    /// `set_tenant_reputation_disabled`: detection at upload time is
+    /// untouched either way.
+    pub async fn set_tenant_malicious_check_disabled(&self, tenant_id: Uuid, disabled: bool) -> Result<(), DbError> {
+        sqlx::query("UPDATE tenants SET malicious_check_disabled = $1 WHERE id = $2")
             .bind(disabled)
             .bind(tenant_id)
             .execute(&self.pool)
@@ -1017,6 +1032,115 @@ impl Database {
         .map_err(map_query_error)
     }
 
+    /// Manifest hashes needing a malicious-package (re)scan — either never
+    /// checked (`malicious_checked_at IS NULL`, covering the whole archive
+    /// uploaded before this column existed) or checked before
+    /// `stale_before` — the malicious-sync background job's work queue.
+    /// Only real SBOMs are candidates (`document_type IS NULL`, matching
+    /// the "malicious package" panel's own gate) and only active ones
+    /// (revoked manifests don't need rescanning). Oldest-checked-first
+    /// (`NULLS FIRST`) so the never-checked backlog drains before anything
+    /// already-checked gets re-checked.
+    pub async fn list_manifests_needing_malicious_check(
+        &self,
+        stale_before: chrono::DateTime<chrono::Utc>,
+        limit: i64,
+    ) -> Result<Vec<String>, DbError> {
+        sqlx::query_scalar(
+            r#"
+            SELECT manifest_hash FROM manifests
+            WHERE document_type IS NULL
+              AND revoked = FALSE
+              AND (malicious_checked_at IS NULL OR malicious_checked_at < $1)
+            ORDER BY malicious_checked_at ASC NULLS FIRST
+            LIMIT $2
+            "#,
+        )
+        .bind(stale_before)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// Records that a malicious-package check (upload-time or a
+    /// `malicious_sync` rescan pass) just completed for this manifest — see
+    /// the `malicious_checked_at` migration comment.
+    pub async fn touch_manifest_malicious_checked(&self, manifest_hash: &str) -> Result<(), DbError> {
+        sqlx::query("UPDATE manifests SET malicious_checked_at = now() WHERE manifest_hash = $1")
+            .bind(manifest_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(map_query_error)?;
+        Ok(())
+    }
+
+    /// Deployment-wide counts for the Settings UI's malicious-check status
+    /// display — see `MaliciousCheckStatus`'s field docs. The `pending`
+    /// subquery mirrors `list_manifests_needing_malicious_check`'s
+    /// definition exactly (minus the `LIMIT`), so the two never disagree.
+    pub async fn malicious_check_status(
+        &self,
+        stale_before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<MaliciousCheckStatus, DbError> {
+        sqlx::query_as::<_, MaliciousCheckStatus>(
+            r#"
+            SELECT
+                (SELECT COUNT(*) FROM manifests
+                    WHERE document_type IS NULL AND revoked = FALSE
+                      AND (malicious_checked_at IS NULL OR malicious_checked_at < $1)) AS pending,
+                (SELECT COUNT(*) FROM manifests
+                    WHERE document_type IS NULL AND revoked = FALSE
+                      AND malicious_checked_at >= $1) AS checked
+            "#,
+        )
+        .bind(stale_before)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// `sbom_components` rows with a purl that were never run through
+    /// `purl_to_depsdev_package` — the main case is a row inserted before
+    /// the `ecosystem`/`registry_name` columns existed (they have no
+    /// backfill in their own migration), but also covers any row inserted
+    /// before this backfill phase shipped. `ecosystem IS NULL` unambiguously
+    /// means "never attempted": a purl that *was* checked and had no
+    /// deps.dev mapping is stored as `ecosystem = ''` (empty string, not
+    /// NULL — see `index_manifest_components`), specifically so it's never
+    /// re-selected here. `list_components_needing_reputation` and
+    /// `manifest_reputation`/`reputation_status`'s own queries are
+    /// unaffected either way, since they also require `registry_name IS NOT
+    /// NULL`, which a no-mapping purl never gets regardless of which
+    /// sentinel `ecosystem` uses.
+    pub async fn list_sbom_components_missing_ecosystem(&self, limit: i64) -> Result<Vec<(i64, String)>, DbError> {
+        sqlx::query_as::<_, (i64, String)>(
+            "SELECT id, purl FROM sbom_components WHERE purl IS NOT NULL AND purl <> '' AND ecosystem IS NULL LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// Records the result of (re)running `purl_to_depsdev_package` against
+    /// one `sbom_components` row — see `list_sbom_components_missing_ecosystem`.
+    pub async fn set_sbom_component_ecosystem(
+        &self,
+        id: i64,
+        ecosystem: Option<&str>,
+        registry_name: Option<&str>,
+    ) -> Result<(), DbError> {
+        sqlx::query("UPDATE sbom_components SET ecosystem = $1, registry_name = $2 WHERE id = $3")
+            .bind(ecosystem)
+            .bind(registry_name)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(map_query_error)?;
+        Ok(())
+    }
+
     /// Distinct (ecosystem, registry_name) pairs across the whole
     /// deployment's `sbom_components` that either have no `component_reputation`
     /// row yet, one older than `stale_before`, or one that previously failed
@@ -1192,6 +1316,14 @@ impl Database {
         name_contains: Option<&str>,
         component_version: Option<&str>,
         purl: Option<&str>,
+        // Same "latest non-revoked upload per namespace, respecting the
+        // admin-curated `namespace_current_hidden` exclusion" definition as
+        // `list_findings_for_tenant`'s `current_only` — reuses the identical
+        // DISTINCT ON subquery rather than duplicating a second definition
+        // of "currently active." A namespace marked inactive in Settings →
+        // Manage namespace visibility is excluded here too, matching what
+        // "active"/"inactive" means everywhere else in the UI.
+        current_only: bool,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<SbomComponentSearchRow>, DbError> {
@@ -1207,8 +1339,23 @@ impl Database {
               AND ($4::text IS NULL OR lower(sc.name) LIKE '%' || lower($4) || '%')
               AND ($5::text IS NULL OR sc.version = $5)
               AND ($6::text IS NULL OR sc.purl = $6)
+              AND (
+                $7::bool IS NOT TRUE
+                OR m.manifest_hash IN (
+                  SELECT DISTINCT ON (namespace) manifest_hash
+                  FROM manifests
+                  WHERE tenant_id = $1
+                    AND revoked = FALSE
+                    AND document_type IS NULL
+                    AND NOT EXISTS (
+                      SELECT 1 FROM namespace_current_hidden h
+                      WHERE h.tenant_id = manifests.tenant_id AND h.namespace = manifests.namespace
+                    )
+                  ORDER BY namespace, created_at DESC, leaf_seq_id DESC
+                )
+              )
             ORDER BY m.namespace, m.created_at DESC
-            LIMIT $7 OFFSET $8
+            LIMIT $8 OFFSET $9
             "#,
         )
         .bind(tenant_id)
@@ -1217,6 +1364,7 @@ impl Database {
         .bind(name_contains)
         .bind(component_version)
         .bind(purl)
+        .bind(current_only)
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)

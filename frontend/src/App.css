@@ -115,6 +115,38 @@ body {
   border-color: var(--border);
 }
 
+/* In-page secondary navigation (e.g. Settings' "General"/"Package checks"
+   submenu) — an underlined tab strip, deliberately distinct from the
+   sidebar's pill-style primary nav so the two levels read as different
+   things at a glance. */
+.subnav {
+  display: flex;
+  gap: 22px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 18px;
+}
+
+.subnav-link {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  padding: 10px 2px;
+  margin-bottom: -1px;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.subnav-link:hover {
+  color: var(--text);
+}
+
+.subnav-link.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
 .sidebar-footer {
   display: flex;
   flex-direction: column;
@@ -468,6 +500,24 @@ textarea {
   margin-bottom: 12px;
 }
 
+/* A `.form-row` sitting inline inside a `.kv-row` (e.g. a short "add a
+   value" input next to its button, in a Settings card) rather than as its
+   own standalone block — no bottom margin of its own, the kv-row's usual
+   spacing already covers it. */
+.settings-inline-form {
+  margin-bottom: 0;
+}
+
+/* Caps a `.field`'s width instead of the default `.form-row .field { flex:
+   1 }` stretch-to-fill — appropriate for a short value (a namespace path, a
+   version string), where a full-width text box just wastes space and reads
+   as unfinished. Shrinks on narrow layouts, never grows past its basis. */
+.settings-inline-field {
+  flex: 0 1 220px;
+  min-width: 160px;
+  margin-bottom: 0;
+}
+
 .checkbox-field {
   display: flex;
   align-items: center;
@@ -673,6 +723,13 @@ textarea {
 
 .tree-icon-folder {
   color: var(--accent);
+}
+
+/* A namespace not hidden from the Dashboard's "Currently running" view
+   (Settings → Manage namespace visibility) — overrides the default accent
+   color on that same folder icon. */
+.tree-icon-folder-active {
+  color: var(--ok);
 }
 
 .tree-icon-file {
