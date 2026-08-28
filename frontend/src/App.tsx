@@ -19,7 +19,15 @@ import {
   Leaf,
   Manifest,
   ManifestDiff,
+  ManifestVersion,
+  NamespaceRegistrationSetting,
+  RegisteredNamespace,
   ReindexResult,
+  ReputationBucket,
+  ReputationComponentSummary,
+  ReputationStatus,
+  ReputationSyncResult,
+  ReputationTenantSetting,
   setApiKey,
   Tenant,
   TreeHead,
@@ -111,6 +119,14 @@ function Hash({ value, chars = 16 }: { value: string; chars?: number }) {
 
 function Badge({ ok, children }: { ok: boolean; children: React.ReactNode }) {
   return <span className={`badge ${ok ? 'badge-ok' : 'badge-err'}`}>{children}</span>;
+}
+
+// Colors a Scorecard score by the bucket the backend already computed
+// (crates/api/src/reputation_bucket.rs) — never re-derives the red/yellow/
+// green cutoffs here, so there is exactly one place they're defined.
+function ReputationScoreBadge({ score, bucket }: { score: number; bucket: ReputationBucket }) {
+  const cls = bucket === 'red' ? 'badge-err' : bucket === 'yellow' ? 'badge-warn' : 'badge-ok';
+  return <span className={`badge ${cls}`}>{score.toFixed(1)}/10</span>;
 }
 
 // Small monochrome icons (currentColor) for the tree views — deliberately
@@ -1450,6 +1466,10 @@ function SbomDetailPanel({
   const [diffBusy, setDiffBusy] = useState(false);
   const [diffError, setDiffError] = useState('');
   const [diffOpen, setDiffOpen] = useState(false);
+  const [diffAgainst, setDiffAgainst] = useState<string>(''); // '' means "previous version" (server default)
+  const [diffVersions, setDiffVersions] = useState<ManifestVersion[] | null>(null);
+  const [reputationDisabledForTenant, setReputationDisabledForTenant] = useState(false);
+  const [showComponentReputationModal, setShowComponentReputationModal] = useState(false);
 
   useEffect(() => {
     let mounted = true;
@@ -1459,6 +1479,9 @@ function SbomDetailPanel({
       setDtrackSyncIntervalSecs(c.dtrack_sync_interval_secs);
     }).catch(() => {});
     api.dtrackSyncSetting(tenantId).then((s) => mounted && setDtrackSyncDisabled(s.disabled)).catch(() => {});
+    api.reputationTenantSetting(tenantId)
+      .then((s) => mounted && setReputationDisabledForTenant(s.disabled))
+      .catch(() => {});
     return () => {
       mounted = false;
     };
@@ -1471,6 +1494,42 @@ function SbomDetailPanel({
     () => (manifest?.document_type ? looksLikeTarArchive(hexToBytes(manifest.sbom_hex)) : false),
     [manifest?.document_type, manifest?.sbom_hex]
   );
+
+  // Aggregate counts for the "Package reputation" panel — with SBOMs
+  // routinely carrying dozens/hundreds of components, listing every one
+  // inline made the panel unreadable; this summary plus a modal for the
+  // full breakdown (see showComponentReputationModal below) mirrors how the
+  // deployment-wide reputation view is already summarized-then-drill-down.
+  const reputationSummary = useMemo(() => {
+    const rows = manifest?.component_reputation ?? [];
+    let red = 0, yellow = 0, green = 0, pending = 0, failed = 0, noScore = 0;
+    for (const r of rows) {
+      if (r.checked_at === null) pending++;
+      else if (r.fetch_error) failed++;
+      else if (r.scorecard_score === null || r.bucket === null) noScore++;
+      else if (r.bucket === 'red') red++;
+      else if (r.bucket === 'yellow') yellow++;
+      else green++;
+    }
+    // "checked" mirrors the Settings page's deployment-wide Components row
+    // (`fetch_error IS NULL`, i.e. the job successfully reached it, whether
+    // or not it found a score) — red+yellow+green+noScore.
+    return { total: rows.length, red, yellow, green, pending, failed, noScore, checked: rows.length - pending - failed };
+  }, [manifest?.component_reputation]);
+
+  // Ascending by score (worst first), same convention as the deployment-wide
+  // reputation list (`list_all_reputation`'s `ORDER BY scorecard_score ASC`)
+  // — components with no score yet (pending/failed/no-scorecard) sort last,
+  // in their original order, since there's nothing to rank them by.
+  const sortedComponentReputation = useMemo(() => {
+    const rows = manifest?.component_reputation ?? [];
+    return [...rows].sort((a, b) => {
+      if (a.scorecard_score === null && b.scorecard_score === null) return 0;
+      if (a.scorecard_score === null) return 1;
+      if (b.scorecard_score === null) return -1;
+      return a.scorecard_score - b.scorecard_score;
+    });
+  }, [manifest?.component_reputation]);
 
   const load = useCallback(async () => {
     setBusy(true);
@@ -1495,6 +1554,8 @@ function SbomDetailPanel({
     setDiff(null);
     setDiffError('');
     setDiffOpen(false);
+    setDiffAgainst('');
+    setDiffVersions(null);
   }, [hash]);
 
   const revoke = async () => {
@@ -1519,23 +1580,34 @@ function SbomDetailPanel({
     }
   };
 
-  const loadDiff = async () => {
+  const fetchDiff = async (against: string) => {
     if (!manifest) return;
-    if (diffOpen) {
-      setDiffOpen(false);
-      return;
-    }
-    setDiffOpen(true);
-    if (diff) return; // already loaded once for this manifest
     setDiffBusy(true);
     setDiffError('');
     try {
-      setDiff(await api.manifestDiff(manifest.manifest_hash, undefined, tenantId));
+      setDiff(await api.manifestDiff(manifest.manifest_hash, against || undefined, tenantId));
     } catch (e) {
       setDiffError(e instanceof Error ? e.message : String(e));
+      setDiff(null);
     } finally {
       setDiffBusy(false);
     }
+  };
+
+  const loadDiff = () => {
+    if (!manifest) return;
+    setDiffOpen(true);
+    if (diffVersions === null) {
+      api.namespaceManifestVersions(manifest.namespace, tenantId)
+        .then(setDiffVersions)
+        .catch(() => setDiffVersions([]));
+    }
+    if (!diff) fetchDiff(diffAgainst);
+  };
+
+  const changeDiffAgainst = (against: string) => {
+    setDiffAgainst(against);
+    fetchDiff(against);
   };
 
   return (
@@ -1570,6 +1642,26 @@ function SbomDetailPanel({
               {revokeError && (
                 <tr>
                   <td colSpan={2}><ErrorBox message={revokeError} /></td>
+                </tr>
+              )}
+              {manifest.malicious_components.length > 0 && (
+                <tr>
+                  <td colSpan={2}>
+                    <div className="error-box">
+                      {manifest.malicious_components.length} component
+                      {manifest.malicious_components.length === 1 ? '' : 's'} matched a known-malicious package
+                      advisory (<a href="https://osv.dev/" target="_blank" rel="noopener noreferrer">OSV</a>):
+                      <ul>
+                        {manifest.malicious_components.map((m) => (
+                          <li key={`${m.component_name}-${m.osv_id}`}>
+                            <strong>{m.component_name}{m.component_version ? `@${m.component_version}` : ''}</strong>
+                            {' '}— {m.osv_id}
+                            {m.summary ? `: ${m.summary}` : ''}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  </td>
                 </tr>
               )}
               {manifest.revoked && (
@@ -1633,65 +1725,51 @@ function SbomDetailPanel({
                   </tr>
                   <tr>
                     <td colSpan={2}>
+                      <button className="btn" onClick={loadDiff}>View component diff</button>
+                    </td>
+                  </tr>
+                </>
+              )}
+              {!manifest.document_type && !reputationDisabledForTenant && manifest.component_reputation.length > 0 && (
+                <>
+                  <tr>
+                    <td colSpan={2}>
+                      <strong>Package reputation</strong>{' '}
+                      <span className="muted">(OpenSSF Scorecard, via deps.dev)</span>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td colSpan={2}>
                       <span className="cell-actions">
-                        <button className="btn" onClick={loadDiff}>
-                          {diffOpen ? 'Hide' : 'Show'} diff vs previous version
+                        <Badge ok={reputationSummary.pending === 0}>{reputationSummary.pending} pending</Badge>
+                        <Badge ok={true}>{reputationSummary.checked} checked</Badge>
+                        <Badge ok={reputationSummary.failed === 0}>{reputationSummary.failed} failed</Badge>
+                      </span>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td colSpan={2}>
+                      <span className="cell-actions">
+                        {reputationSummary.red > 0 && (
+                          <span className="badge badge-err">{reputationSummary.red} red</span>
+                        )}
+                        {reputationSummary.yellow > 0 && (
+                          <span className="badge badge-warn">{reputationSummary.yellow} yellow</span>
+                        )}
+                        {reputationSummary.green > 0 && (
+                          <span className="badge badge-ok">{reputationSummary.green} green</span>
+                        )}
+                        {reputationSummary.noScore > 0 && (
+                          <span className="muted">{reputationSummary.noScore} no scorecard available</span>
+                        )}
+                        <button className="btn" onClick={() => setShowComponentReputationModal(true)}>
+                          View {reputationSummary.total} component score{reputationSummary.total === 1 ? '' : 's'}…
                         </button>
                       </span>
-                      {diffOpen && (
-                        <div style={{ marginTop: 6 }}>
-                          {diffBusy && <Spinner label="Diffing…" />}
-                          {diffError && <ErrorBox message={diffError} />}
-                          {diff && (
-                            <div>
-                              <div className="muted">
-                                {diff.from_version} → {diff.to_version} ({diff.unchanged_count} unchanged)
-                              </div>
-                              {diff.added.length > 0 && (
-                                <div>
-                                  <strong>+{diff.added.length} added</strong>
-                                  <ul>
-                                    {diff.added.map((c) => (
-                                      <li key={`add-${c.purl ?? c.name}`}>
-                                        {c.name}
-                                        {c.version ? `@${c.version}` : ''}
-                                      </li>
-                                    ))}
-                                  </ul>
-                                </div>
-                              )}
-                              {diff.removed.length > 0 && (
-                                <div>
-                                  <strong>-{diff.removed.length} removed</strong>
-                                  <ul>
-                                    {diff.removed.map((c) => (
-                                      <li key={`rem-${c.purl ?? c.name}`}>
-                                        {c.name}
-                                        {c.version ? `@${c.version}` : ''}
-                                      </li>
-                                    ))}
-                                  </ul>
-                                </div>
-                              )}
-                              {diff.changed.length > 0 && (
-                                <div>
-                                  <strong>~{diff.changed.length} version changed</strong>
-                                  <ul>
-                                    {diff.changed.map((c) => (
-                                      <li key={`chg-${c.purl ?? c.name}`}>
-                                        {c.name}: {c.from_version ?? '?'} → {c.to_version ?? '?'}
-                                      </li>
-                                    ))}
-                                  </ul>
-                                </div>
-                              )}
-                              {diff.added.length === 0 && diff.removed.length === 0 && diff.changed.length === 0 && (
-                                <span className="muted">No component changes since the previous version.</span>
-                              )}
-                            </div>
-                          )}
-                        </div>
-                      )}
+                      <div className="muted" style={{ marginTop: 4 }}>
+                        Only components with a recognized package identity (npm, PyPI, crates.io, Go, Maven,
+                        NuGet, RubyGems) are scored.
+                      </div>
                     </td>
                   </tr>
                 </>
@@ -1818,6 +1896,114 @@ function SbomDetailPanel({
               </Modal>
             );
           })()}
+          {diffOpen && (
+            <Modal title="Component changes" onClose={() => setDiffOpen(false)}>
+              {diffVersions && diffVersions.length > 0 && (
+                <label className="field" style={{ flex: '0 1 260px', marginBottom: 12 }}>
+                  <span className="muted">diff against</span>
+                  <select
+                    value={diffAgainst}
+                    disabled={diffBusy}
+                    onChange={(e) => changeDiffAgainst(e.target.value)}
+                  >
+                    <option value="">previous version</option>
+                    {diffVersions
+                      .filter((v) => v.manifest_hash !== manifest?.manifest_hash)
+                      .map((v) => (
+                        <option key={v.manifest_hash} value={v.manifest_hash}>
+                          {v.version} — {new Date(v.created_at).toLocaleDateString()}
+                          {v.revoked ? ' (revoked)' : ''}
+                        </option>
+                      ))}
+                  </select>
+                </label>
+              )}
+              {diffBusy && <Spinner label="Diffing…" />}
+              {diffError && <ErrorBox message={diffError} />}
+              {diff && (
+                <div>
+                  <div className="muted">
+                    {diff.from_version} → {diff.to_version} ({diff.unchanged_count} unchanged)
+                  </div>
+                  {diff.added.length > 0 && (
+                    <div>
+                      <strong>+{diff.added.length} added</strong>
+                      <ul>
+                        {diff.added.map((c) => (
+                          <li key={`add-${c.purl ?? c.name}`}>
+                            {c.name}
+                            {c.version ? `@${c.version}` : ''}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {diff.removed.length > 0 && (
+                    <div>
+                      <strong>-{diff.removed.length} removed</strong>
+                      <ul>
+                        {diff.removed.map((c) => (
+                          <li key={`rem-${c.purl ?? c.name}`}>
+                            {c.name}
+                            {c.version ? `@${c.version}` : ''}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {diff.changed.length > 0 && (
+                    <div>
+                      <strong>~{diff.changed.length} version changed</strong>
+                      <ul>
+                        {diff.changed.map((c) => (
+                          <li key={`chg-${c.purl ?? c.name}`}>
+                            {c.name}: {c.from_version ?? '?'} → {c.to_version ?? '?'}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {diff.added.length === 0 && diff.removed.length === 0 && diff.changed.length === 0 && (
+                    <span className="muted">No component changes since the previous version.</span>
+                  )}
+                </div>
+              )}
+            </Modal>
+          )}
+          {showComponentReputationModal && manifest && (
+            <Modal title="Component scores" onClose={() => setShowComponentReputationModal(false)}>
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Score</th>
+                    <th>Component</th>
+                    <th>Repository</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sortedComponentReputation.map((r) => (
+                    <tr key={r.component_name}>
+                      <td>
+                        {r.checked_at === null ? (
+                          <span className="muted" title="The background job hasn't reached this component yet">
+                            waiting for sync…
+                          </span>
+                        ) : r.fetch_error ? (
+                          <span className="muted" title={r.fetch_error}>check failed</span>
+                        ) : r.scorecard_score === null || r.bucket === null ? (
+                          <span className="muted">no scorecard available</span>
+                        ) : (
+                          <ReputationScoreBadge score={r.scorecard_score} bucket={r.bucket} />
+                        )}
+                      </td>
+                      <td>{r.component_name}{r.component_version ? `@${r.component_version}` : ''}</td>
+                      <td className="muted">{r.project_repo ?? '—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </Modal>
+          )}
         </div>
       )}
     </div>
@@ -2970,9 +3156,6 @@ function Findings({
   const [dtrackEnabled, setDtrackEnabled] = useState<boolean | null>(null);
   const [dtrackSyncDisabled, setDtrackSyncDisabled] = useState(false);
   const [dtrackSyncIntervalSecs, setDtrackSyncIntervalSecs] = useState<number | null>(null);
-  const [syncBusy, setSyncBusy] = useState(false);
-  const [syncError, setSyncError] = useState('');
-  const [syncResult, setSyncResult] = useState<DtrackSyncResult | null>(null);
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
 
   useEffect(() => {
@@ -3024,43 +3207,14 @@ function Findings({
     load();
   }, [load]);
 
-  const forceSync = async () => {
-    setSyncBusy(true);
-    setSyncError('');
-    setSyncResult(null);
-    try {
-      const result = await api.forceDtrackSync(tenantId);
-      setSyncResult(result);
-      await load(); // pick up whatever the sync pass just pushed/refreshed
-    } catch (e) {
-      setSyncError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSyncBusy(false);
-    }
-  };
-
   return (
     <div className="card">
       <div className="card-header">
         <h2>Findings</h2>
         <span className="cell-actions">
-          {dtrackEnabled && !dtrackSyncDisabled && (
-            <button className="btn" disabled={syncBusy} onClick={forceSync}>
-              {syncBusy ? 'Syncing…' : 'Force sync to dtrack'}
-            </button>
-          )}
           <button className="btn" onClick={load}>Refresh</button>
         </span>
       </div>
-      {syncResult && (
-        <div className="muted">
-          Sync pass complete — pushed {syncResult.manifests_pushed} new manifest
-          {syncResult.manifests_pushed === 1 ? '' : 's'}, refreshed {syncResult.projects_refreshed} project
-          {syncResult.projects_refreshed === 1 ? '' : 's'}. One pass only covers a bounded batch — run it again
-          if you have more than that still pending.
-        </div>
-      )}
-      {syncError && <ErrorBox message={syncError} />}
       <p className="muted">
         Every cached Dependency-Track finding across the archive, within your namespace scope. Cleared
         (not synced yet) manifests don't appear here — check a manifest's own detail view for that.
@@ -3758,23 +3912,83 @@ function Settings({
   const [dtrackSyncDisabled, setDtrackSyncDisabled] = useState<boolean | null>(null);
   const [dtrackSyncBusy, setDtrackSyncBusy] = useState(false);
   const [dtrackSyncError, setDtrackSyncError] = useState('');
+  const [dtrackForceSyncBusy, setDtrackForceSyncBusy] = useState(false);
+  const [dtrackForceSyncError, setDtrackForceSyncError] = useState('');
+  const [dtrackForceSyncResult, setDtrackForceSyncResult] = useState<DtrackSyncResult | null>(null);
   const [semverRequired, setSemverRequired] = useState<boolean | null>(null);
   const [semverBusy, setSemverBusy] = useState(false);
   const [semverError, setSemverError] = useState('');
+  const [reputationEnabled, setReputationEnabled] = useState<boolean | null>(null);
+  const [reputationSyncBusy, setReputationSyncBusy] = useState(false);
+  const [reputationSyncError, setReputationSyncError] = useState('');
+  const [reputationSyncResult, setReputationSyncResult] = useState<ReputationSyncResult | null>(null);
+  const [reputationStatus, setReputationStatus] = useState<ReputationStatus | null>(null);
+  const [reputationStatusError, setReputationStatusError] = useState('');
+  const [reputationDisabled, setReputationDisabled] = useState<boolean | null>(null);
+  const [reputationDisabledBusy, setReputationDisabledBusy] = useState(false);
+  const [reputationDisabledError, setReputationDisabledError] = useState('');
+  const [showReputationModal, setShowReputationModal] = useState(false);
+  const [reputationComponents, setReputationComponents] = useState<ReputationComponentSummary[] | null>(null);
+  const [reputationComponentsError, setReputationComponentsError] = useState('');
+  const [namespaceRegistrationRequired, setNamespaceRegistrationRequired] = useState<boolean | null>(null);
+  const [namespaceRegistrationBusy, setNamespaceRegistrationBusy] = useState(false);
+  const [namespaceRegistrationError, setNamespaceRegistrationError] = useState('');
+  const [registeredNamespaces, setRegisteredNamespaces] = useState<RegisteredNamespace[] | null>(null);
+  const [registeredNamespacesError, setRegisteredNamespacesError] = useState('');
+  const [newNamespaceInput, setNewNamespaceInput] = useState('');
+  const [createNamespaceBusy, setCreateNamespaceBusy] = useState(false);
+  const [createNamespaceError, setCreateNamespaceError] = useState('');
+
+  const loadRegisteredNamespaces = useCallback(() => {
+    api.listRegisteredNamespaces(tenantId)
+      .then((rows) => {
+        setRegisteredNamespaces(rows);
+        setRegisteredNamespacesError('');
+      })
+      .catch((e) => setRegisteredNamespacesError(e instanceof Error ? e.message : String(e)));
+  }, [tenantId]);
+
+  const loadReputationStatus = useCallback(() => {
+    api.reputationStatus()
+      .then((s) => {
+        setReputationStatus(s);
+        setReputationStatusError('');
+      })
+      .catch((e) => setReputationStatusError(e instanceof Error ? e.message : String(e)));
+  }, []);
 
   useEffect(() => {
     let mounted = true;
-    api.config().then((c) => mounted && setDtrackEnabled(c.dtrack_enabled)).catch(() => mounted && setDtrackEnabled(null));
+    api.config()
+      .then((c) => {
+        if (!mounted) return;
+        setDtrackEnabled(c.dtrack_enabled);
+        setReputationEnabled(c.reputation_enabled);
+      })
+      .catch(() => {
+        if (!mounted) return;
+        setDtrackEnabled(null);
+        setReputationEnabled(null);
+      });
     api.dtrackSyncSetting(tenantId)
       .then((s) => mounted && setDtrackSyncDisabled(s.disabled))
       .catch(() => mounted && setDtrackSyncDisabled(null));
     api.semverSetting(tenantId)
       .then((s) => mounted && setSemverRequired(s.required))
       .catch(() => mounted && setSemverRequired(null));
+    api.reputationTenantSetting(tenantId)
+      .then((s) => mounted && setReputationDisabled(s.disabled))
+      .catch(() => mounted && setReputationDisabled(null));
+    api.namespaceRegistrationSetting(tenantId)
+      .then((s) => mounted && setNamespaceRegistrationRequired(s.required))
+      .catch(() => mounted && setNamespaceRegistrationRequired(null));
     return () => {
       mounted = false;
     };
   }, [tenantId]);
+
+  useEffect(loadReputationStatus, [loadReputationStatus]);
+  useEffect(loadRegisteredNamespaces, [loadRegisteredNamespaces]);
 
   const toggleDtrackSync = async (disabled: boolean) => {
     setDtrackSyncBusy(true);
@@ -3790,6 +4004,19 @@ function Settings({
     }
   };
 
+  const forceDtrackSyncNow = async () => {
+    setDtrackForceSyncBusy(true);
+    setDtrackForceSyncError('');
+    setDtrackForceSyncResult(null);
+    try {
+      setDtrackForceSyncResult(await api.forceDtrackSync(tenantId));
+    } catch (e) {
+      setDtrackForceSyncError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDtrackForceSyncBusy(false);
+    }
+  };
+
   const toggleSemverRequired = async (required: boolean) => {
     setSemverBusy(true);
     setSemverError('');
@@ -3800,6 +4027,69 @@ function Settings({
       setSemverError(e instanceof Error ? e.message : String(e));
     } finally {
       setSemverBusy(false);
+    }
+  };
+
+  const toggleReputationDisabled = async (disabled: boolean) => {
+    setReputationDisabledBusy(true);
+    setReputationDisabledError('');
+    try {
+      await api.setReputationTenantSetting(disabled, tenantId);
+      setReputationDisabled(disabled);
+    } catch (e) {
+      setReputationDisabledError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setReputationDisabledBusy(false);
+    }
+  };
+
+  const openReputationModal = () => {
+    setShowReputationModal(true);
+    if (reputationComponents !== null) return; // already loaded
+    api.reputationComponents()
+      .then(setReputationComponents)
+      .catch((e) => setReputationComponentsError(e instanceof Error ? e.message : String(e)));
+  };
+
+  const toggleNamespaceRegistrationRequired = async (required: boolean) => {
+    setNamespaceRegistrationBusy(true);
+    setNamespaceRegistrationError('');
+    try {
+      await api.setNamespaceRegistrationSetting(required, tenantId);
+      setNamespaceRegistrationRequired(required);
+    } catch (e) {
+      setNamespaceRegistrationError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setNamespaceRegistrationBusy(false);
+    }
+  };
+
+  const handleCreateNamespace = async () => {
+    if (!newNamespaceInput.trim()) return;
+    setCreateNamespaceBusy(true);
+    setCreateNamespaceError('');
+    try {
+      await api.createNamespace(newNamespaceInput.trim(), tenantId);
+      setNewNamespaceInput('');
+      loadRegisteredNamespaces();
+    } catch (e) {
+      setCreateNamespaceError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setCreateNamespaceBusy(false);
+    }
+  };
+
+  const forceReputationSync = async () => {
+    setReputationSyncBusy(true);
+    setReputationSyncError('');
+    setReputationSyncResult(null);
+    try {
+      setReputationSyncResult(await api.forceReputationSync());
+      loadReputationStatus(); // pick up whatever this pass just processed
+    } catch (e) {
+      setReputationSyncError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setReputationSyncBusy(false);
     }
   };
 
@@ -3920,11 +4210,11 @@ function Settings({
             <label className="checkbox-field">
               <input
                 type="checkbox"
-                checked={dtrackSyncDisabled ?? false}
+                checked={dtrackSyncDisabled === null ? false : !dtrackSyncDisabled}
                 disabled={dtrackSyncBusy || dtrackSyncDisabled === null}
-                onChange={(e) => toggleDtrackSync(e.target.checked)}
+                onChange={(e) => toggleDtrackSync(!e.target.checked)}
               />
-              Disable sync for this tenant
+              Enable Dependency-Track sync for this tenant
             </label>
             <span className="muted">
               {' '}
@@ -3932,6 +4222,29 @@ function Settings({
             </span>
           </div>
         )}
+        {dtrackEnabled && !dtrackSyncDisabled && (
+          <div className="kv-row">
+            <span className="kv-label">Background job</span>
+            <span className="cell-actions">
+              <button className="btn" disabled={dtrackForceSyncBusy} onClick={forceDtrackSyncNow}>
+                {dtrackForceSyncBusy ? 'Syncing…' : 'Force sync to dtrack'}
+              </button>
+              <span className="muted">
+                Runs one push+refresh pass now instead of waiting for its next scheduled tick — this tenant
+                only.
+              </span>
+            </span>
+          </div>
+        )}
+        {dtrackForceSyncResult && (
+          <div className="muted">
+            Sync pass complete — pushed {dtrackForceSyncResult.manifests_pushed} new manifest
+            {dtrackForceSyncResult.manifests_pushed === 1 ? '' : 's'}, refreshed{' '}
+            {dtrackForceSyncResult.projects_refreshed} project{dtrackForceSyncResult.projects_refreshed === 1 ? '' : 's'}.
+            One pass only covers a bounded batch — run it again if you have more than that still pending.
+          </div>
+        )}
+        {dtrackForceSyncError && <ErrorBox message={dtrackForceSyncError} />}
         {dtrackSyncError && <ErrorBox message={dtrackSyncError} />}
       </div>
 
@@ -3957,7 +4270,180 @@ function Settings({
           </span>
         </div>
         {semverError && <ErrorBox message={semverError} />}
+        <div className="kv-row">
+          <label className="checkbox-field">
+            <input
+              type="checkbox"
+              checked={namespaceRegistrationRequired ?? false}
+              disabled={namespaceRegistrationBusy || namespaceRegistrationRequired === null}
+              onChange={(e) => toggleNamespaceRegistrationRequired(e.target.checked)}
+            />
+            Require namespace to be registered before upload
+          </label>
+          <span className="muted">
+            {' '}
+            — {namespaceRegistrationRequired
+              ? 'uploads to a namespace not listed below are rejected'
+              : 'any namespace is accepted, registered or not'}
+          </span>
+        </div>
+        {namespaceRegistrationError && <ErrorBox message={namespaceRegistrationError} />}
+        <div className="kv-row">
+          <span className="kv-label">Registered namespaces</span>
+          <span className="cell-actions">
+            <input
+              type="text"
+              placeholder="/products/v1"
+              value={newNamespaceInput}
+              onChange={(e) => setNewNamespaceInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') handleCreateNamespace();
+              }}
+              disabled={createNamespaceBusy}
+            />
+            <button className="btn" disabled={createNamespaceBusy || !newNamespaceInput.trim()} onClick={handleCreateNamespace}>
+              {createNamespaceBusy ? 'Creating…' : 'Create namespace'}
+            </button>
+          </span>
+        </div>
+        {createNamespaceError && <ErrorBox message={createNamespaceError} />}
+        {registeredNamespacesError && <ErrorBox message={registeredNamespacesError} />}
+        {registeredNamespaces !== null && registeredNamespaces.length > 0 && (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Namespace</th>
+                <th>Created by</th>
+                <th>Created at</th>
+              </tr>
+            </thead>
+            <tbody>
+              {registeredNamespaces.map((n) => (
+                <tr key={n.namespace}>
+                  <td>
+                    <span className="cell-actions">
+                      {n.namespace}
+                      <CopyButton text={n.namespace} />
+                    </span>
+                  </td>
+                  <td className="muted">{shortPrincipal(n.created_by)}</td>
+                  <td className="muted">{new Date(n.created_at).toLocaleString()}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        {registeredNamespaces !== null && registeredNamespaces.length === 0 && (
+          <div className="muted">No namespaces registered yet.</div>
+        )}
       </div>
+
+      <div className="card">
+        <div className="card-header">
+          <h2>Package reputation</h2>
+        </div>
+        <div className="kv-row">
+          <span className="kv-label">Deployment-wide</span>
+          {reputationEnabled === null ? (
+            <span className="muted">unknown</span>
+          ) : (
+            <Badge ok={reputationEnabled}>{reputationEnabled ? 'enabled' : 'disabled'}</Badge>
+          )}
+        </div>
+        {reputationEnabled && (
+          <div className="kv-row">
+            <span className="kv-label">Components</span>
+            {reputationStatus ? (
+              <span className="cell-actions">
+                <Badge ok={reputationStatus.pending === 0}>{reputationStatus.pending} pending</Badge>
+                <Badge ok={true}>{reputationStatus.checked} checked</Badge>
+                <Badge ok={reputationStatus.failed === 0}>{reputationStatus.failed} failed</Badge>
+                <button className="btn" onClick={loadReputationStatus}>Refresh</button>
+              </span>
+            ) : (
+              <span className="muted">loading…</span>
+            )}
+          </div>
+        )}
+        {reputationStatusError && <ErrorBox message={reputationStatusError} />}
+        {reputationEnabled && (
+          <div className="kv-row">
+            <span className="kv-label">Background job</span>
+            <span className="cell-actions">
+              <button className="btn" disabled={reputationSyncBusy} onClick={forceReputationSync}>
+                {reputationSyncBusy ? 'Syncing…' : 'Force reputation sync'}
+              </button>
+              <button className="btn" onClick={openReputationModal}>View all scored packages…</button>
+              <span className="muted">
+                Runs one batch of the OpenSSF Scorecard lookup job now instead of waiting for its next
+                scheduled tick — deployment-wide, not scoped to this tenant.
+              </span>
+            </span>
+          </div>
+        )}
+        {reputationSyncResult && (
+          <div className="muted">
+            Sync pass complete — processed {reputationSyncResult.components_processed} component
+            {reputationSyncResult.components_processed === 1 ? '' : 's'}. One pass only covers a bounded batch —
+            run it again if you have more than that still pending.
+          </div>
+        )}
+        {reputationSyncError && <ErrorBox message={reputationSyncError} />}
+        {reputationEnabled && (
+          <div className="kv-row">
+            <span className="kv-label">This tenant</span>
+            <label className="checkbox-field">
+              <input
+                type="checkbox"
+                checked={!(reputationDisabled ?? false)}
+                disabled={reputationDisabledBusy || reputationDisabled === null}
+                onChange={(e) => toggleReputationDisabled(!e.target.checked)}
+              />
+              {reputationDisabled ? 'disabled' : 'enabled'} for this tenant
+            </label>
+            <span className="muted">
+              {' '}
+              — {reputationDisabled
+                ? "the \"Package reputation\" panel is hidden on this tenant's SBOM detail views (the background job keeps running for everyone else)"
+                : 'the panel is shown as usual'}
+            </span>
+          </div>
+        )}
+        {reputationDisabledError && <ErrorBox message={reputationDisabledError} />}
+      </div>
+
+      {showReputationModal && (
+        <Modal title="All scored packages" onClose={() => setShowReputationModal(false)}>
+          <p className="muted">
+            Every package with a cached OpenSSF Scorecard result, deployment-wide, worst first.
+          </p>
+          {reputationComponentsError && <ErrorBox message={reputationComponentsError} />}
+          {!reputationComponentsError && reputationComponents === null && <Spinner label="Loading…" />}
+          {reputationComponents !== null && reputationComponents.length === 0 && (
+            <div className="muted">No packages scored yet.</div>
+          )}
+          {reputationComponents !== null && reputationComponents.length > 0 && (
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Score</th>
+                  <th>Package</th>
+                  <th>Repository</th>
+                </tr>
+              </thead>
+              <tbody>
+                {reputationComponents.map((c) => (
+                  <tr key={`${c.ecosystem}:${c.name}`}>
+                    <td><ReputationScoreBadge score={c.scorecard_score} bucket={c.bucket} /></td>
+                    <td>{c.ecosystem}/{c.name}</td>
+                    <td className="muted">{c.project_repo ?? '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </Modal>
+      )}
 
       <div className="card">
         <div className="card-header">
@@ -4001,7 +4487,12 @@ function Settings({
                   const isHidden = hiddenNamespaces.has(ns);
                   return (
                     <tr key={ns}>
-                      <td>{ns}</td>
+                      <td>
+                        <span className="cell-actions">
+                          {ns}
+                          <CopyButton text={ns} />
+                        </span>
+                      </td>
                       <td>
                         <label className="checkbox-field">
                           <input

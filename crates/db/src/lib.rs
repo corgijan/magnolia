@@ -2,11 +2,13 @@ mod models;
 mod errors;
 
 pub use models::{
-    ApiKeyRecord, AuditLogRecord, ComplianceSettingRecord, DtrackFindingRecord,
-    DtrackFindingWithContextRecord, DtrackProjectRecord, DtrackPushFailureRecord,
-    FindingCommentRecord, ManifestRecord, MerkleLeafRecord, MerkleNodeRecord, NewDtrackFinding,
-    NewSbomComponent, SbomComponentRow, SbomComponentSearchRow, SignedTreeHeadRecord,
-    TenantRecord,
+    ApiKeyRecord, AuditLogRecord, ComplianceSettingRecord, ComponentIdentity,
+    ComponentReputationRecord, DtrackFindingRecord, DtrackFindingWithContextRecord,
+    DtrackProjectRecord, DtrackPushFailureRecord, FindingCommentRecord, ManifestRecord,
+    MaliciousFindingRecord, MerkleLeafRecord, MerkleNodeRecord, NewDtrackFinding,
+    ManifestVersionRow, NewMaliciousFinding, NewSbomComponent, RegisteredNamespaceRecord,
+    ComponentReputationSummaryRow, ReputationStatus, SbomComponentRow, SbomComponentSearchRow,
+    SignedTreeHeadRecord, TenantRecord,
 };
 pub use errors::DbError;
 
@@ -90,7 +92,7 @@ impl Database {
 
     pub async fn get_tenant(&self, id: Uuid) -> Result<Option<TenantRecord>, DbError> {
         sqlx::query_as::<_, TenantRecord>(
-            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled, require_semver_version FROM tenants WHERE id = $1",
+            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled, require_semver_version, reputation_disabled, require_namespace_registration FROM tenants WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -103,7 +105,7 @@ impl Database {
         domain: &str,
     ) -> Result<Option<TenantRecord>, DbError> {
         sqlx::query_as::<_, TenantRecord>(
-            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled, require_semver_version FROM tenants WHERE domain = $1",
+            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled, require_semver_version, reputation_disabled, require_namespace_registration FROM tenants WHERE domain = $1",
         )
         .bind(domain)
         .fetch_optional(&self.pool)
@@ -117,7 +119,7 @@ impl Database {
     /// reachable directly (e.g. `?tenant_id=` override), just not listed.
     pub async fn list_tenants(&self) -> Result<Vec<TenantRecord>, DbError> {
         sqlx::query_as::<_, TenantRecord>(
-            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled, require_semver_version FROM tenants WHERE hidden = FALSE ORDER BY created_at DESC",
+            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled, require_semver_version, reputation_disabled, require_namespace_registration FROM tenants WHERE hidden = FALSE ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
         .await
@@ -143,6 +145,33 @@ impl Database {
     /// comment).
     pub async fn set_tenant_require_semver_version(&self, tenant_id: Uuid, required: bool) -> Result<(), DbError> {
         sqlx::query("UPDATE tenants SET require_semver_version = $1 WHERE id = $2")
+            .bind(required)
+            .bind(tenant_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DbError::QueryError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Per-tenant opt-out of the "Package reputation" panel appearing on
+    /// this tenant's SBOM detail views (see the `reputation_disabled`
+    /// migration comment) — unlike `set_tenant_dtrack_sync_disabled`, this
+    /// has no effect on the background job itself, only on display.
+    pub async fn set_tenant_reputation_disabled(&self, tenant_id: Uuid, disabled: bool) -> Result<(), DbError> {
+        sqlx::query("UPDATE tenants SET reputation_disabled = $1 WHERE id = $2")
+            .bind(disabled)
+            .bind(tenant_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DbError::QueryError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Per-tenant opt-in requiring `upload_sbom`'s target namespace to
+    /// already exist in `registered_namespaces` (see that table's migration
+    /// comment).
+    pub async fn set_tenant_require_namespace_registration(&self, tenant_id: Uuid, required: bool) -> Result<(), DbError> {
+        sqlx::query("UPDATE tenants SET require_namespace_registration = $1 WHERE id = $2")
             .bind(required)
             .bind(tenant_id)
             .execute(&self.pool)
@@ -580,6 +609,31 @@ impl Database {
         .map_err(|e| DbError::QueryError(e.to_string()))
     }
 
+    /// Every real-SBOM manifest (`document_type IS NULL`) ever uploaded to
+    /// one exact namespace, newest first — backs the diff UI's "choose which
+    /// version to diff against" picker. Exact match, not prefix, unlike most
+    /// namespace-scoped listings here: a version picker for namespace
+    /// `/a` showing manifests from `/a/b` too would be confusing, not useful.
+    pub async fn list_manifest_versions_in_namespace(
+        &self,
+        tenant_id: Uuid,
+        namespace: &str,
+    ) -> Result<Vec<ManifestVersionRow>, DbError> {
+        sqlx::query_as::<_, ManifestVersionRow>(
+            r#"
+            SELECT manifest_hash, version, created_at, revoked
+            FROM manifests
+            WHERE tenant_id = $1 AND namespace = $2 AND document_type IS NULL
+            ORDER BY created_at DESC, leaf_seq_id DESC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(namespace)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
     /// Most recent non-revoked manifest per namespace, within a tenant and
     /// namespace scope. Unlike `latest_manifest` (tenant-wide single row,
     /// used to chain `previous_manifest_hash` on upload), this groups by
@@ -715,6 +769,63 @@ impl Database {
         Ok(())
     }
 
+    // ---- Namespace registry (see `registered_namespaces`'s migration comment) ----
+
+    pub async fn list_registered_namespaces(
+        &self,
+        tenant_id: Uuid,
+        namespace_scope: &str,
+    ) -> Result<Vec<RegisteredNamespaceRecord>, DbError> {
+        sqlx::query_as::<_, RegisteredNamespaceRecord>(
+            r#"
+            SELECT namespace, created_by, created_at FROM registered_namespaces
+            WHERE tenant_id = $1
+              AND ($2 = '/' OR namespace = $2 OR starts_with(namespace, $2 || '/'))
+            ORDER BY namespace
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(namespace_scope)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// Registers one namespace. Returns `false` (not an error) if it was
+    /// already registered — idempotent, so a caller doesn't need to check
+    /// existence first to avoid a conflict.
+    pub async fn create_namespace(&self, tenant_id: Uuid, namespace: &str, created_by: &str) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO registered_namespaces (tenant_id, namespace, created_by, created_at)
+            VALUES ($1, $2, $3, now())
+            ON CONFLICT (tenant_id, namespace) DO NOTHING
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(namespace)
+        .bind(created_by)
+        .execute(&self.pool)
+        .await
+        .map_err(map_query_error)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Exact-match existence check, used by `upload_sbom` when this tenant
+    /// has `require_namespace_registration` set — deliberately not a
+    /// prefix/scope match like the listing/read methods above: a namespace
+    /// being registered doesn't implicitly register its children.
+    pub async fn namespace_is_registered(&self, tenant_id: Uuid, namespace: &str) -> Result<bool, DbError> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM registered_namespaces WHERE tenant_id = $1 AND namespace = $2)",
+        )
+        .bind(tenant_id)
+        .bind(namespace)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
     // ---- Compliance profile settings ----
 
     /// All settings rows a tenant has ever written. Profiles never touched
@@ -805,18 +916,21 @@ impl Database {
             return Ok(());
         }
         let mut sql = String::from(
-            "INSERT INTO sbom_components (manifest_hash, tenant_id, name, version, purl, cpe, is_primary) VALUES ",
+            "INSERT INTO sbom_components \
+             (manifest_hash, tenant_id, name, version, purl, cpe, is_primary, ecosystem, registry_name) VALUES ",
         );
         let mut placeholders = Vec::with_capacity(components.len());
         for i in 0..components.len() {
-            let base = i * 5;
+            let base = i * 7;
             placeholders.push(format!(
-                "($1, $2, ${}, ${}, ${}, ${}, ${})",
+                "($1, $2, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
                 base + 3,
                 base + 4,
                 base + 5,
                 base + 6,
-                base + 7
+                base + 7,
+                base + 8,
+                base + 9
             ));
         }
         sql.push_str(&placeholders.join(", "));
@@ -828,7 +942,9 @@ impl Database {
                 .bind(&c.version)
                 .bind(&c.purl)
                 .bind(&c.cpe)
-                .bind(c.is_primary);
+                .bind(c.is_primary)
+                .bind(&c.ecosystem)
+                .bind(&c.registry_name);
         }
         q.execute(&self.pool).await.map_err(map_query_error)?;
         Ok(())
@@ -843,6 +959,218 @@ impl Database {
     ) -> Result<Vec<SbomComponentRow>, DbError> {
         sqlx::query_as::<_, SbomComponentRow>(
             "SELECT name, version, purl, cpe, is_primary FROM sbom_components WHERE manifest_hash = $1",
+        )
+        .bind(manifest_hash)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// Stores this manifest's malicious-component matches from the one-shot
+    /// OSV batched query run at upload time (see `SUPPLY_CHAIN_SIGNALS_PLAN.md`).
+    /// A no-op for an empty list — most manifests will have zero hits, and
+    /// callers pass whatever they found without checking emptiness first.
+    pub async fn insert_malicious_findings(
+        &self,
+        manifest_hash: &str,
+        findings: &[NewMaliciousFinding],
+    ) -> Result<(), DbError> {
+        if findings.is_empty() {
+            return Ok(());
+        }
+        let mut sql = String::from(
+            "INSERT INTO malicious_component_findings \
+             (manifest_hash, component_name, component_version, purl, osv_id, summary) VALUES ",
+        );
+        let mut placeholders = Vec::with_capacity(findings.len());
+        for i in 0..findings.len() {
+            let base = i * 5;
+            placeholders.push(format!(
+                "($1, ${}, ${}, ${}, ${}, ${})",
+                base + 2,
+                base + 3,
+                base + 4,
+                base + 5,
+                base + 6
+            ));
+        }
+        sql.push_str(&placeholders.join(", "));
+        sql.push_str(" ON CONFLICT (manifest_hash, component_name, component_version, osv_id) DO NOTHING");
+
+        let mut q = sqlx::query(&sql).bind(manifest_hash);
+        for f in findings {
+            q = q.bind(&f.component_name).bind(&f.component_version).bind(&f.purl).bind(&f.osv_id).bind(&f.summary);
+        }
+        q.execute(&self.pool).await.map_err(map_query_error)?;
+        Ok(())
+    }
+
+    pub async fn list_malicious_findings(&self, manifest_hash: &str) -> Result<Vec<MaliciousFindingRecord>, DbError> {
+        sqlx::query_as::<_, MaliciousFindingRecord>(
+            "SELECT component_name, component_version, purl, osv_id, summary, detected_at
+             FROM malicious_component_findings WHERE manifest_hash = $1
+             ORDER BY component_name",
+        )
+        .bind(manifest_hash)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// Distinct (ecosystem, registry_name) pairs across the whole
+    /// deployment's `sbom_components` that either have no `component_reputation`
+    /// row yet, one older than `stale_before`, or one that previously failed
+    /// (`fetch_error IS NOT NULL`) — the reputation background job's work
+    /// queue. A failed row skips the `stale_before` wait entirely so a
+    /// transient deps.dev error (network blip, rate limit) gets retried on
+    /// the very next tick instead of sitting failed for up to
+    /// `STALE_AFTER_DAYS`; a persistently-failing package just keeps costing
+    /// one retry per tick; no separate backoff — the tick interval itself
+    /// (an hour by default) is the rate limit. Deployment-global (no tenant
+    /// filter): a package's score doesn't depend on which tenant uploaded
+    /// it, so this is shared across every tenant's components.
+    pub async fn list_components_needing_reputation(
+        &self,
+        stale_before: chrono::DateTime<chrono::Utc>,
+        limit: i64,
+    ) -> Result<Vec<ComponentIdentity>, DbError> {
+        sqlx::query_as::<_, ComponentIdentity>(
+            r#"
+            SELECT DISTINCT ON (sc.ecosystem, sc.registry_name)
+                   sc.ecosystem, sc.registry_name, sc.version AS sample_version
+            FROM sbom_components sc
+            LEFT JOIN component_reputation cr
+                ON cr.ecosystem = sc.ecosystem AND cr.name = sc.registry_name
+            WHERE sc.ecosystem IS NOT NULL
+              AND sc.registry_name IS NOT NULL
+              AND sc.version IS NOT NULL
+              AND (cr.ecosystem IS NULL OR cr.checked_at < $1 OR cr.fetch_error IS NOT NULL)
+            ORDER BY sc.ecosystem, sc.registry_name, sc.version DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(stale_before)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// Deployment-wide counts for the Settings UI's reputation status
+    /// display — see `ReputationStatus`'s field docs. The `pending`
+    /// subquery mirrors `list_components_needing_reputation`'s definition
+    /// exactly (minus the `LIMIT`), so the two never disagree about what
+    /// counts as "still needs checking."
+    pub async fn reputation_status(
+        &self,
+        stale_before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<ReputationStatus, DbError> {
+        sqlx::query_as::<_, ReputationStatus>(
+            r#"
+            SELECT
+                (SELECT COUNT(*) FROM (
+                    SELECT DISTINCT sc.ecosystem, sc.registry_name
+                    FROM sbom_components sc
+                    LEFT JOIN component_reputation cr
+                        ON cr.ecosystem = sc.ecosystem AND cr.name = sc.registry_name
+                    WHERE sc.ecosystem IS NOT NULL
+                      AND sc.registry_name IS NOT NULL
+                      AND (cr.ecosystem IS NULL OR cr.checked_at < $1 OR cr.fetch_error IS NOT NULL)
+                ) pending_rows) AS pending,
+                (SELECT COUNT(*) FROM component_reputation WHERE fetch_error IS NULL) AS checked,
+                (SELECT COUNT(*) FROM component_reputation WHERE fetch_error IS NOT NULL) AS failed
+            "#,
+        )
+        .bind(stale_before)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// Every package with a cached Scorecard score, deployment-wide,
+    /// ascending by score (lowest/worst first) — backs the Settings page's
+    /// aggregation modal. Excludes packages the job has checked but found no
+    /// scorecard for (`scorecard_score IS NULL`) — nothing to rank those by.
+    pub async fn list_all_reputation(&self) -> Result<Vec<ComponentReputationSummaryRow>, DbError> {
+        sqlx::query_as::<_, ComponentReputationSummaryRow>(
+            r#"
+            SELECT ecosystem, name, scorecard_score, project_repo, checked_at
+            FROM component_reputation
+            WHERE scorecard_score IS NOT NULL
+            ORDER BY scorecard_score ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// Records (or refreshes) one package's cached reputation result —
+    /// `scorecard_score`/`project_repo` are `None` on a fetch failure
+    /// (`fetch_error` set instead, matching `dtrack_push_failures`' pattern
+    /// of recording *why* something is stale rather than silently retrying
+    /// forever), and `None`/cleared on success when deps.dev genuinely has
+    /// no scorecard for the package (not an error, just no data).
+    pub async fn upsert_component_reputation(
+        &self,
+        ecosystem: &str,
+        name: &str,
+        scorecard_score: Option<f32>,
+        project_repo: Option<&str>,
+        fetch_error: Option<&str>,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            r#"
+            INSERT INTO component_reputation (ecosystem, name, scorecard_score, project_repo, checked_at, fetch_error)
+            VALUES ($1, $2, $3, $4, now(), $5)
+            ON CONFLICT (ecosystem, name)
+            DO UPDATE SET scorecard_score = EXCLUDED.scorecard_score,
+                           project_repo = EXCLUDED.project_repo,
+                           checked_at = EXCLUDED.checked_at,
+                           fetch_error = EXCLUDED.fetch_error
+            "#,
+        )
+        .bind(ecosystem)
+        .bind(name)
+        .bind(scorecard_score)
+        .bind(project_repo)
+        .bind(fetch_error)
+        .execute(&self.pool)
+        .await
+        .map_err(map_query_error)?;
+        Ok(())
+    }
+
+    /// One manifest's components joined against their cached reputation, for
+    /// `manifest()`'s response — components with no `ecosystem`/`registry_name`
+    /// (no usable purl) or no `component_reputation` row yet (job hasn't
+    /// reached them) are simply absent, not an error: the frontend reads
+    /// "not in this list" as "not checked yet," same convention as
+    /// `dtrack_synced_at: null` elsewhere.
+    /// Every component of this manifest with a derivable registry identity
+    /// (i.e. checkable at all), `LEFT JOIN`ed against its cached reputation —
+    /// unlike an inner join, this means a component the background job
+    /// hasn't reached yet still appears, with every `component_reputation`
+    /// column `NULL` (surfaced as "pending" rather than silently omitted).
+    /// Components with no purl / an untracked ecosystem are excluded
+    /// entirely — there's nothing to ever check for them.
+    pub async fn list_reputation_for_manifest(
+        &self,
+        manifest_hash: &str,
+    ) -> Result<Vec<ComponentReputationRecord>, DbError> {
+        sqlx::query_as::<_, ComponentReputationRecord>(
+            r#"
+            SELECT sc.name AS component_name, sc.version AS component_version,
+                   sc.ecosystem, sc.registry_name, cr.scorecard_score,
+                   cr.project_repo, cr.checked_at, cr.fetch_error
+            FROM sbom_components sc
+            LEFT JOIN component_reputation cr
+                ON cr.ecosystem = sc.ecosystem AND cr.name = sc.registry_name
+            WHERE sc.manifest_hash = $1
+              AND sc.ecosystem IS NOT NULL
+              AND sc.registry_name IS NOT NULL
+            ORDER BY sc.name
+            "#,
         )
         .bind(manifest_hash)
         .fetch_all(&self.pool)

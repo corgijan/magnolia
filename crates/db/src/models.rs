@@ -39,6 +39,18 @@ pub struct TenantRecord {
     pub hidden: bool,
     pub dtrack_sync_disabled: bool,
     pub require_semver_version: bool,
+    pub reputation_disabled: bool,
+    pub require_namespace_registration: bool,
+}
+
+/// One registered namespace — the output of `list_registered_namespaces`,
+/// and the input side of `create_namespace` (minus `created_at`, filled by
+/// the DB).
+#[derive(Debug, Clone, FromRow)]
+pub struct RegisteredNamespaceRecord {
+    pub namespace: String,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -73,6 +85,12 @@ pub struct NewSbomComponent {
     pub purl: Option<String>,
     pub cpe: Option<String>,
     pub is_primary: bool,
+    /// Registry identity derived from `purl` via
+    /// `magnolia_core::purl_to_depsdev_package` — `None` when there's no
+    /// purl, or its type isn't one deps.dev tracks. Stored so the
+    /// reputation background job can join on it in SQL.
+    pub ecosystem: Option<String>,
+    pub registry_name: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -89,6 +107,17 @@ pub struct SbomComponentSearchRow {
     pub document_type: Option<String>,
 }
 
+/// One manifest in one namespace's upload history — the output of
+/// `list_manifest_versions_in_namespace`, backing the diff UI's version
+/// picker.
+#[derive(Debug, Clone, FromRow)]
+pub struct ManifestVersionRow {
+    pub manifest_hash: String,
+    pub version: String,
+    pub created_at: DateTime<Utc>,
+    pub revoked: bool,
+}
+
 /// One manifest's indexed component, without the manifest-context columns
 /// `SbomComponentSearchRow` carries — used by `manifest_diff` to fetch
 /// exactly two manifests' component lists for comparison, not to search
@@ -100,6 +129,94 @@ pub struct SbomComponentRow {
     pub purl: Option<String>,
     pub cpe: Option<String>,
     pub is_primary: bool,
+}
+
+/// A distinct (ecosystem, registry_name) pair from `sbom_components` that
+/// either has no `component_reputation` row yet or has a stale one — the
+/// output of `list_components_needing_reputation`, consumed by the
+/// reputation background job.
+#[derive(Debug, Clone, FromRow)]
+pub struct ComponentIdentity {
+    pub ecosystem: String,
+    pub registry_name: String,
+    /// One concrete version of this package known to the archive — deps.dev
+    /// has no version-less "get this package's project" call, `GetVersion`
+    /// needs a specific version to resolve `relatedProjects` from. Any known
+    /// version works equally well for this purpose: a Scorecard result is a
+    /// per-project signal, not per-version (see `component_reputation`'s
+    /// migration comment), so which one is picked doesn't affect the result.
+    pub sample_version: String,
+}
+
+/// Deployment-wide reputation-check summary — the output of
+/// `reputation_status`, surfaced in the Settings UI so an operator can tell
+/// "nothing pending, nothing checked yet either" (a fresh deployment, or one
+/// where no manifest has any purl-bearing component) apart from "checked,
+/// just nothing found."
+#[derive(Debug, Clone, FromRow)]
+pub struct ReputationStatus {
+    /// Distinct (ecosystem, registry_name) pairs with no fresh
+    /// `component_reputation` row — what the background job still has left
+    /// to do, same definition `list_components_needing_reputation` uses.
+    pub pending: i64,
+    /// `component_reputation` rows with no `fetch_error` — checked
+    /// successfully, regardless of whether a scorecard was actually found.
+    pub checked: i64,
+    /// `component_reputation` rows with a `fetch_error` — checked, but the
+    /// attempt itself failed (network, unexpected response shape).
+    pub failed: i64,
+}
+
+/// One component's cached deps.dev/OpenSSF Scorecard result — the output of
+/// `upsert_component_reputation` reads and `list_reputation_for_manifest`.
+#[derive(Debug, Clone, FromRow)]
+pub struct ComponentReputationRecord {
+    pub component_name: String,
+    pub component_version: Option<String>,
+    pub ecosystem: String,
+    pub registry_name: String,
+    pub scorecard_score: Option<f32>,
+    pub project_repo: Option<String>,
+    /// `None` means the reputation background job hasn't reached this
+    /// component yet ("pending"), not an error — distinct from a fetch that
+    /// ran and found nothing (`checked_at: Some`, `scorecard_score: None`,
+    /// `fetch_error: None`) or one that failed (`fetch_error: Some`).
+    pub checked_at: Option<DateTime<Utc>>,
+    pub fetch_error: Option<String>,
+}
+
+/// One package's cached score, deployment-wide (not scoped to any one
+/// manifest) — the output of `list_all_reputation`, backing the Settings
+/// page's "all scored packages" aggregation modal.
+#[derive(Debug, Clone, FromRow)]
+pub struct ComponentReputationSummaryRow {
+    pub ecosystem: String,
+    pub name: String,
+    pub scorecard_score: f32,
+    pub project_repo: Option<String>,
+    pub checked_at: DateTime<Utc>,
+}
+
+/// One confirmed-malicious match for a manifest's component, found via a
+/// batched OSV query at upload time — the input side of
+/// `insert_malicious_findings`.
+#[derive(Debug, Clone)]
+pub struct NewMaliciousFinding {
+    pub component_name: String,
+    pub component_version: Option<String>,
+    pub purl: Option<String>,
+    pub osv_id: String,
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct MaliciousFindingRecord {
+    pub component_name: String,
+    pub component_version: Option<String>,
+    pub purl: Option<String>,
+    pub osv_id: String,
+    pub summary: Option<String>,
+    pub detected_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, FromRow)]

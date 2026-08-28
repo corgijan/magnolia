@@ -108,6 +108,81 @@ pub struct ManifestJson {
     /// never succeed on retry without different content. `None` once a
     /// later push succeeds (see `push_phase`'s `clear_dtrack_push_failure`).
     pub dtrack_push_error: Option<String>,
+    /// Components matched against OSV's `MAL-`-prefixed malicious-package
+    /// advisories, checked once at upload time (see
+    /// `malicious_check::check_and_store_malicious_components`) — empty for
+    /// almost every manifest. Informational only, same tier as
+    /// `vulnerability_findings`: never blocks an upload.
+    pub malicious_components: Vec<MaliciousComponentJson>,
+    /// Cached deps.dev/OpenSSF Scorecard results for this manifest's
+    /// components — populated in the background (see `reputation_sync.rs`),
+    /// so a freshly-uploaded manifest's components simply won't appear here
+    /// yet, same "not checked yet, not an error" convention as
+    /// `dtrack_synced_at: null`.
+    pub component_reputation: Vec<ComponentReputationJson>,
+}
+
+#[derive(serde::Serialize)]
+pub struct MaliciousComponentJson {
+    pub component_name: String,
+    pub component_version: Option<String>,
+    pub purl: Option<String>,
+    pub osv_id: String,
+    pub summary: Option<String>,
+    pub detected_at: DateTime<Utc>,
+}
+
+impl From<magnolia_db::MaliciousFindingRecord> for MaliciousComponentJson {
+    fn from(r: magnolia_db::MaliciousFindingRecord) -> Self {
+        Self {
+            component_name: r.component_name,
+            component_version: r.component_version,
+            purl: r.purl,
+            osv_id: r.osv_id,
+            summary: r.summary,
+            detected_at: r.detected_at,
+        }
+    }
+}
+
+/// One component's cached deps.dev/OpenSSF Scorecard result. Only present
+/// for components with a usable purl whose (ecosystem, registry_name) the
+/// reputation background job has actually reached — see
+/// `reputation_sync.rs`. `scorecard_score`/`project_repo` are `None` either
+/// because the check hasn't run yet (`fetch_error` also `None`) or because
+/// it ran and found genuinely nothing (also `fetch_error: None` — deps.dev
+/// simply has no scorecard for this package) or failed (`fetch_error: Some`).
+#[derive(serde::Serialize)]
+pub struct ComponentReputationJson {
+    pub component_name: String,
+    pub component_version: Option<String>,
+    pub scorecard_score: Option<f32>,
+    /// Red/yellow/green classification of `scorecard_score` (see
+    /// `reputation_bucket.rs` for the thresholds) — `None` whenever
+    /// `scorecard_score` is `None`, computed here rather than left to the
+    /// frontend so there is exactly one place the red/yellow/green cutoffs
+    /// are defined.
+    pub bucket: Option<crate::reputation_bucket::ReputationBucket>,
+    pub project_repo: Option<String>,
+    /// `None` means the reputation background job hasn't reached this
+    /// component yet — the frontend renders this as a "pending" status, not
+    /// an error or a zero score.
+    pub checked_at: Option<DateTime<Utc>>,
+    pub fetch_error: Option<String>,
+}
+
+impl From<magnolia_db::ComponentReputationRecord> for ComponentReputationJson {
+    fn from(r: magnolia_db::ComponentReputationRecord) -> Self {
+        Self {
+            component_name: r.component_name,
+            component_version: r.component_version,
+            bucket: r.scorecard_score.map(crate::reputation_bucket::bucket_for_score),
+            scorecard_score: r.scorecard_score,
+            project_repo: r.project_repo,
+            checked_at: r.checked_at,
+            fetch_error: r.fetch_error,
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -618,12 +693,22 @@ async fn index_manifest_components(
     }
     let components: Vec<magnolia_db::NewSbomComponent> = extracted
         .into_iter()
-        .map(|c| magnolia_db::NewSbomComponent {
-            name: c.name,
-            version: c.version,
-            purl: c.purl,
-            cpe: c.cpe,
-            is_primary: c.is_primary,
+        .map(|c| {
+            let (ecosystem, registry_name) = c
+                .purl
+                .as_deref()
+                .and_then(magnolia_core::purl_to_depsdev_package)
+                .map(|(eco, name)| (Some(eco.to_string()), Some(name)))
+                .unwrap_or((None, None));
+            magnolia_db::NewSbomComponent {
+                name: c.name,
+                version: c.version,
+                purl: c.purl,
+                cpe: c.cpe,
+                is_primary: c.is_primary,
+                ecosystem,
+                registry_name,
+            }
         })
         .collect();
     let count = components.len();
@@ -632,6 +717,15 @@ async fn index_manifest_components(
         .insert_sbom_components(tenant_id, manifest_hash, &components)
         .await
         .map_err(db_err)?;
+
+    // Best-effort, never fails the indexing step itself (see
+    // `check_and_store_malicious_components`'s doc comment) — `None` when
+    // `DISABLE_MALICIOUS_PACKAGE_CHECK` is set for this deployment.
+    if let Some(osv) = &state.osv {
+        crate::malicious_check::check_and_store_malicious_components(&state.db, osv, manifest_hash, &components)
+            .await;
+    }
+
     Ok(count)
 }
 
@@ -753,6 +847,7 @@ pub struct ConfigJson {
     /// Present only when `dtrack_enabled` — lets the UI say "check back in
     /// about N minutes" instead of a made-up number.
     pub dtrack_sync_interval_secs: Option<u64>,
+    pub reputation_enabled: bool,
 }
 
 /// Server-operational info, not tenant data — safe for any authenticated
@@ -767,6 +862,7 @@ pub async fn config(State(state): State<AppState>, _grant: AuthGrant) -> Json<Co
         dev_mode: state.dev_mode,
         dtrack_enabled: state.dtrack.is_some(),
         dtrack_sync_interval_secs: state.dtrack.is_some().then_some(state.dtrack_sync_interval_secs),
+        reputation_enabled: state.depsdev.is_some(),
     })
 }
 
@@ -826,6 +922,60 @@ pub async fn set_dtrack_sync_setting(
 }
 
 #[derive(serde::Serialize)]
+pub struct ReputationTenantSettingJson {
+    pub disabled: bool,
+}
+
+/// This tenant's opt-out of the "Package reputation" panel appearing on its
+/// own SBOM detail views — distinct from `ConfigJson.reputation_enabled`,
+/// which is deployment-wide and read-only here. `Action::Read`, same as
+/// `dtrack_sync_setting`.
+pub async fn reputation_tenant_setting(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+) -> Result<Json<ReputationTenantSettingJson>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    let tenant = state.db.get_tenant(tenant_id).await.map_err(db_err)?.ok_or(ApiError::NotFound)?;
+    Ok(Json(ReputationTenantSettingJson { disabled: tenant.reputation_disabled }))
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetReputationTenantSettingRequest {
+    pub disabled: bool,
+}
+
+/// Toggles this tenant's opt-out of the reputation panel — unlike
+/// `set_dtrack_sync_setting`, this has no effect on the background job
+/// itself (see the `reputation_disabled` migration comment), it only
+/// controls display. `Action::ManageSettings`, same gate as
+/// `set_dtrack_sync_setting`.
+pub async fn set_reputation_tenant_setting(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+    Json(body): Json<SetReputationTenantSettingRequest>,
+) -> Result<StatusCode, ApiError> {
+    require(&grant, Action::ManageSettings, &grant.namespace_scope)?;
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+
+    state.db.set_tenant_reputation_disabled(tenant_id, body.disabled).await.map_err(db_err)?;
+
+    let _ = record_audit(
+        &state,
+        &grant,
+        "reputation_tenant_setting",
+        &tenant_id.to_string(),
+        true,
+        Some(format!("disabled={}", body.disabled)),
+    )
+    .await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Serialize)]
 pub struct SemverSettingJson {
     pub required: bool,
 }
@@ -873,6 +1023,118 @@ pub async fn set_semver_setting(
         Some(format!("required={}", body.required)),
     )
     .await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Serialize)]
+pub struct NamespaceRegistrationSettingJson {
+    pub required: bool,
+}
+
+/// This tenant's requirement that `upload_sbom`'s target namespace already
+/// exist in `registered_namespaces`. Same read/write split as
+/// `semver_setting`.
+pub async fn namespace_registration_setting(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+) -> Result<Json<NamespaceRegistrationSettingJson>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    let tenant = state.db.get_tenant(tenant_id).await.map_err(db_err)?.ok_or(ApiError::NotFound)?;
+    Ok(Json(NamespaceRegistrationSettingJson { required: tenant.require_namespace_registration }))
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetNamespaceRegistrationSettingRequest {
+    pub required: bool,
+}
+
+/// Toggles this tenant's namespace-registration enforcement for future
+/// uploads — `Action::ManageSettings`, same gate as `set_semver_setting`.
+/// Does not retroactively touch manifests already uploaded to an
+/// unregistered namespace.
+pub async fn set_namespace_registration_setting(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+    Json(body): Json<SetNamespaceRegistrationSettingRequest>,
+) -> Result<StatusCode, ApiError> {
+    require(&grant, Action::ManageSettings, &grant.namespace_scope)?;
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+
+    state.db.set_tenant_require_namespace_registration(tenant_id, body.required).await.map_err(db_err)?;
+
+    let _ = record_audit(
+        &state,
+        &grant,
+        "namespace_registration_setting",
+        &tenant_id.to_string(),
+        true,
+        Some(format!("required={}", body.required)),
+    )
+    .await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Serialize)]
+pub struct RegisteredNamespaceJson {
+    pub namespace: String,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<magnolia_db::RegisteredNamespaceRecord> for RegisteredNamespaceJson {
+    fn from(r: magnolia_db::RegisteredNamespaceRecord) -> Self {
+        Self { namespace: r.namespace, created_by: r.created_by, created_at: r.created_at }
+    }
+}
+
+/// Every namespace explicitly registered for this tenant, within namespace
+/// scope — `Action::Read`, same as `list_hidden_namespaces`.
+pub async fn list_registered_namespaces(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+) -> Result<Json<Vec<RegisteredNamespaceJson>>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    let scope = if cross_tenant { "/" } else { &grant.namespace_scope };
+
+    let rows = state.db.list_registered_namespaces(tenant_id, scope).await.map_err(db_err)?;
+    Ok(Json(rows.into_iter().map(RegisteredNamespaceJson::from).collect()))
+}
+
+#[derive(serde::Deserialize)]
+pub struct CreateNamespaceRequest {
+    pub namespace: String,
+}
+
+/// Registers a namespace so it can be required to exist before an upload
+/// (see `require_namespace_registration`). `Action::ManageSettings` — an
+/// admin-only action, unlike browsing the archive itself, matching
+/// `set_namespace_hidden`'s gate. Idempotent: registering an
+/// already-registered namespace succeeds without error (still 204, no way
+/// to distinguish "created" from "already existed" in the response — there's
+/// nothing actionable a caller would do differently either way).
+pub async fn create_namespace(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+    Json(body): Json<CreateNamespaceRequest>,
+) -> Result<StatusCode, ApiError> {
+    require(&grant, Action::ManageSettings, &grant.namespace_scope)?;
+    let namespace = normalize_namespace(&body.namespace)?;
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    if !cross_tenant && !magnolia_auth::namespace_in_scope(&namespace, &grant.namespace_scope) {
+        return Err(ApiError::Forbidden("namespace out of scope".to_string()));
+    }
+
+    state.db.create_namespace(tenant_id, &namespace, &grant.principal()).await.map_err(db_err)?;
+
+    let _ = record_audit(&state, &grant, "namespace_create", &namespace, true, None).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1041,6 +1303,14 @@ pub async fn upload_sbom(
         return Err(ApiError::BadRequest(format!(
             "version must be SemVer 2.0.0 compliant (e.g. 1.2.3, 1.2.3-rc.1): {}",
             version
+        )));
+    }
+
+    if tenant_record.require_namespace_registration
+        && !state.db.namespace_is_registered(tenant_id, &namespace).await.map_err(db_err)?
+    {
+        return Err(ApiError::BadRequest(format!(
+            "namespace '{namespace}' has not been registered for this tenant; create it first (see Settings)"
         )));
     }
 
@@ -1512,6 +1782,24 @@ pub async fn manifest(
         .map_err(db_err)?
         .map(|f| f.error);
 
+    let malicious_components: Vec<MaliciousComponentJson> = state
+        .db
+        .list_malicious_findings(&record.manifest_hash)
+        .await
+        .map_err(db_err)?
+        .into_iter()
+        .map(MaliciousComponentJson::from)
+        .collect();
+
+    let component_reputation: Vec<ComponentReputationJson> = state
+        .db
+        .list_reputation_for_manifest(&record.manifest_hash)
+        .await
+        .map_err(db_err)?
+        .into_iter()
+        .map(ComponentReputationJson::from)
+        .collect();
+
     Ok(Json(ManifestJson {
         sbom_hex: hex::encode(&sbom_bytes),
         manifest_hash: record.manifest_hash,
@@ -1536,6 +1824,8 @@ pub async fn manifest(
         vulnerability_findings,
         dtrack_synced_at,
         dtrack_push_error,
+        malicious_components,
+        component_reputation,
     }))
 }
 
@@ -1689,6 +1979,50 @@ fn component_identity(name: &str, purl: Option<&str>) -> String {
         Some(p) if !p.is_empty() => p.split('@').next().unwrap_or(p).to_string(),
         _ => name.to_lowercase(),
     }
+}
+
+#[derive(serde::Deserialize)]
+pub struct NamespaceManifestsQuery {
+    pub namespace: String,
+    pub tenant_id: Option<Uuid>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ManifestVersionJson {
+    pub manifest_hash: String,
+    pub version: String,
+    pub created_at: DateTime<Utc>,
+    pub revoked: bool,
+}
+
+/// One namespace's full upload history (real SBOMs only, newest first) —
+/// feeds the diff UI's "choose which version to diff against" dropdown.
+/// `Action::Read`, namespace-scope-checked the same way every other
+/// namespace-scoped listing here is (`list_hidden_namespaces`,
+/// `list_registered_namespaces`).
+pub async fn namespace_manifest_versions(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<NamespaceManifestsQuery>,
+) -> Result<Json<Vec<ManifestVersionJson>>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let namespace = normalize_namespace(&q.namespace)?;
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    if !cross_tenant && !magnolia_auth::namespace_in_scope(&namespace, &grant.namespace_scope) {
+        return Err(ApiError::Forbidden("namespace out of scope".to_string()));
+    }
+
+    let rows = state.db.list_manifest_versions_in_namespace(tenant_id, &namespace).await.map_err(db_err)?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| ManifestVersionJson {
+                manifest_hash: r.manifest_hash,
+                version: r.version,
+                created_at: r.created_at,
+                revoked: r.revoked,
+            })
+            .collect(),
+    ))
 }
 
 /// Diffs one manifest's indexed component list against another's. Reuses
@@ -2270,6 +2604,103 @@ pub async fn force_dtrack_sync(
     .await;
 
     Ok(Json(DtrackSyncResponse { manifests_pushed, projects_refreshed }))
+}
+
+#[derive(serde::Serialize)]
+pub struct ReputationSyncResponse {
+    pub components_processed: usize,
+}
+
+/// Runs one on-demand batch of the reputation background job (see
+/// `reputation_sync.rs`) instead of waiting for its next scheduled tick —
+/// same relationship `force_dtrack_sync` has to the periodic dtrack loop.
+/// Deployment-global, unlike `force_dtrack_sync`: reputation isn't
+/// tenant-scoped (a package's Scorecard doesn't depend on who uploaded it),
+/// so there's no `tenant_id` to resolve here, and one call processes the
+/// deployment's whole pending backlog one batch at a time regardless of
+/// which tenant's key triggered it. `Action::ManageSettings`, same gate as
+/// `force_dtrack_sync`/`reindex_components`. 400 if reputation scoring
+/// isn't enabled for this deployment at all (nothing to sync against).
+pub async fn force_reputation_sync(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+) -> Result<Json<ReputationSyncResponse>, ApiError> {
+    require(&grant, Action::ManageSettings, &grant.namespace_scope)?;
+
+    let client = state.depsdev.as_ref().ok_or_else(|| {
+        ApiError::BadRequest("package reputation scoring is disabled for this deployment".to_string())
+    })?;
+
+    let components_processed = crate::reputation_sync::sync_pass(&state.db, client).await;
+
+    let _ = record_audit(
+        &state,
+        &grant,
+        "reputation_force_sync",
+        &format!("components_processed={components_processed}"),
+        true,
+        None,
+    )
+    .await;
+
+    Ok(Json(ReputationSyncResponse { components_processed }))
+}
+
+#[derive(serde::Serialize)]
+pub struct ReputationStatusJson {
+    pub pending: i64,
+    pub checked: i64,
+    pub failed: i64,
+}
+
+/// Deployment-wide counts of the reputation background job's progress —
+/// lets the Settings UI show "12 pending, 3 checked, 0 failed" instead of
+/// the caller having to infer status from one manifest's (possibly empty)
+/// `component_reputation` list. `Action::Read`, same as viewing any other
+/// deployment-operational info (`config`, `whoami`) — this is a read, not a
+/// mutation, unlike `force_reputation_sync`.
+pub async fn reputation_status(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+) -> Result<Json<ReputationStatusJson>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let status = state.db.reputation_status(crate::reputation_sync::stale_before_cutoff()).await.map_err(db_err)?;
+    Ok(Json(ReputationStatusJson { pending: status.pending, checked: status.checked, failed: status.failed }))
+}
+
+#[derive(serde::Serialize)]
+pub struct ReputationComponentSummaryJson {
+    pub ecosystem: String,
+    pub name: String,
+    pub scorecard_score: f32,
+    pub bucket: crate::reputation_bucket::ReputationBucket,
+    pub project_repo: Option<String>,
+    pub checked_at: DateTime<Utc>,
+}
+
+impl From<magnolia_db::ComponentReputationSummaryRow> for ReputationComponentSummaryJson {
+    fn from(r: magnolia_db::ComponentReputationSummaryRow) -> Self {
+        Self {
+            bucket: crate::reputation_bucket::bucket_for_score(r.scorecard_score),
+            ecosystem: r.ecosystem,
+            name: r.name,
+            scorecard_score: r.scorecard_score,
+            project_repo: r.project_repo,
+            checked_at: r.checked_at,
+        }
+    }
+}
+
+/// Every package with a cached Scorecard score, deployment-wide, ascending
+/// by score — backs the Settings page's aggregation modal (a `manifest()`
+/// call only ever shows one manifest's own components; this shows the whole
+/// deployment's scored backlog at once). `Action::Read`: informational,
+/// not tenant data (see `component_reputation`'s migration comment — a
+/// package's score isn't scoped to who uploaded it).
+pub async fn reputation_components(grant: AuthGrant, State(state): State<AppState>) -> Result<Json<Vec<ReputationComponentSummaryJson>>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let rows = state.db.list_all_reputation().await.map_err(db_err)?;
+    Ok(Json(rows.into_iter().map(ReputationComponentSummaryJson::from).collect()))
 }
 
 /// Marks a manifest revoked — a status flag, not a delete: the manifest

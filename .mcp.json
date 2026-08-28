@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "aidex": {
+      "type": "stdio",
+      "command": "aidex",
+      "args": [],
+      "env": {}
+    }
+  }
+}

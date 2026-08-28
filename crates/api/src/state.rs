@@ -4,7 +4,9 @@ use std::sync::Arc;
 use magnolia_audit::AuditLogger;
 use magnolia_core::MerkleTree;
 use magnolia_db::Database;
+use magnolia_depsdev::DepsDevClient;
 use magnolia_dtrack::DtrackClient;
+use magnolia_osv::OsvClient;
 use magnolia_signer::Signer;
 use magnolia_storage::ObjectStore;
 use tokio::sync::Mutex;
@@ -38,6 +40,19 @@ pub struct AppState {
     /// disabled) — surfaced via `GET /api/v1/config` so the UI can tell a
     /// user "check back in about N minutes" instead of guessing a number.
     pub dtrack_sync_interval_secs: u64,
+    /// `None` when `DISABLE_MALICIOUS_PACKAGE_CHECK` is set at startup —
+    /// unlike `dtrack`, this is *on* by default (OSV's public API needs no
+    /// setup/API key, unlike standing up a dtrack instance), so the opt-out
+    /// is a disable flag rather than a presence-gated pair of env vars.
+    /// Every osv-touching code path must treat `None` as "there is nothing
+    /// to call," never as an error — same convention as `dtrack`.
+    pub osv: Option<Arc<OsvClient>>,
+    /// `None` when `DISABLE_REPUTATION_CHECK` is set at startup — same
+    /// on-by-default/opt-out shape as `osv`. Stored on state (unlike the
+    /// background loop's own copy, spawned separately in `main.rs`) so
+    /// `force_reputation_sync` can run an on-demand pass from a request
+    /// handler.
+    pub depsdev: Option<Arc<DepsDevClient>>,
 }
 
 impl Clone for AppState {
@@ -52,6 +67,8 @@ impl Clone for AppState {
             storage_backend: self.storage_backend,
             dtrack: self.dtrack.clone(),
             dtrack_sync_interval_secs: self.dtrack_sync_interval_secs,
+            osv: self.osv.clone(),
+            depsdev: self.depsdev.clone(),
         }
     }
 }

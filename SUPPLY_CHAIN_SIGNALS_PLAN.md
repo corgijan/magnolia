@@ -27,70 +27,66 @@ pure domain logic with no I/O — belongs in `crates/core` next to
 
 ## 1. Malicious/typosquat package detection
 
-### Data source
+**Revised after verifying OSV's actual API docs (google.github.io/osv.dev) —
+the bulk-mirror design below this note was wrong.** MAL- (malicious-package)
+advisories are NOT distributed as a separate export; they live mixed into each
+ecosystem's regular vulnerability bucket (`gs://osv-vulnerabilities/<ecosystem>/all.zip`)
+alongside every real CVE. "Bulk mirror just the malicious ones" would mean
+downloading and filtering the *entire* OSV database per ecosystem — much more
+than the plan assumed, for a small subset of records.
 
-[OSV](https://osv.dev) carries confirmed-malicious package advisories with IDs
-prefixed `MAL-` (e.g. `MAL-2024-1234`), same schema as its regular
-vulnerability data, sourced from `ossf/malicious-packages`. Two ways to consume
-it:
-
-- **Bulk mirror (recommended):** `ossf/malicious-packages` publishes a zipped
-  OSV export of every entry. Download and re-parse periodically — this is a
-  background job, not a per-upload call, so a daily/weekly cadence is plenty
-  (this list doesn't change minute-to-minute the way vulnerability data does).
-- **Live query (rejected for the default path):** `api.osv.dev` supports
-  per-(ecosystem, name, version) queries and would return `MAL-` entries
-  alongside real vulns. Rejected as the primary path because it means one
-  external call per component per upload (SBOMs can have hundreds) against a
-  rate-limited free API — the bulk mirror avoids that entirely. Could still be
-  offered later as an optional "check this one package live" action.
+The actual right primitive turns out simpler: `POST /v1/querybatch` accepts up
+to (undocumented limit, chunk defensively) queries in **one request**, each by
+either `{ecosystem, name, version}` or directly by `purl` — and `sbom_components`
+already stores `purl` for most components. So: one batched HTTP call per
+manifest upload (not per component, not a mirrored table at all), filter the
+returned vuln IDs for the `MAL-` prefix, then `GET /v1/vulns/{id}` for a
+summary on just the hits. No purl→ecosystem mapping needed for this feature —
+components with a `purl` are queried directly by purl; components without one
+are skipped (can't reliably guess ecosystem from name alone, and OSV needs one).
 
 ### Schema
 
 ```sql
-CREATE TABLE known_malicious_packages (
+CREATE TABLE malicious_component_findings (
     id BIGSERIAL PRIMARY KEY,
-    ecosystem TEXT NOT NULL,      -- OSV's ecosystem string: "npm", "PyPI", "crates.io", "Go", ...
-    name TEXT NOT NULL,
-    -- NULL = every version is malicious (common: a pure typosquat/impersonation
-    -- package has no "safe" version). Non-null = a specific affected version.
-    version TEXT,
-    source_id TEXT NOT NULL,      -- upstream advisory id, e.g. "MAL-2024-1234"
+    manifest_hash TEXT NOT NULL REFERENCES manifests(manifest_hash) ON DELETE CASCADE,
+    component_name TEXT NOT NULL,
+    component_version TEXT,
+    purl TEXT,
+    osv_id TEXT NOT NULL,         -- e.g. "MAL-2024-1234"
     summary TEXT,
-    synced_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (ecosystem, name, version, source_id)
+    detected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (manifest_hash, component_name, component_version, osv_id)
 );
-CREATE INDEX known_malicious_packages_lookup_idx ON known_malicious_packages (ecosystem, lower(name));
+CREATE INDEX malicious_component_findings_manifest_idx ON malicious_component_findings (manifest_hash);
 ```
 
-Deployment-global, not per-tenant — same table serves every tenant's lookups.
+Per-manifest this time (unlike the reputation table below) — the check itself
+is a one-shot batched call made once at upload time, so there's no ongoing
+sync state to reconcile, just a stored result.
 
-### Sync job
+### Where it runs
 
-New narrow crate (`magnolia-malwatch`, mirroring the `magnolia-dtrack` pattern)
-or a module reusing `dtrack_sync.rs`'s shape: download the bulk export, parse
-each OSV record's `ecosystem`/`package.name`/`affected[].versions`/`id`/
-`summary`, and **replace** the table's contents (full mirror each pull, not an
-upsert-and-never-delete like `dtrack_findings` — a package pulled from the feed
-because it was misclassified should actually disappear locally too).
+Synchronously at upload time, alongside `enforce_compliance` in `upload_sbom`
+— best-effort: a failed/timed-out OSV call is logged and skipped, never fails
+the upload (same "secondary concern can't block the primary flow" idiom as
+`index_manifest_components`/`record_audit`). Not a background loop — there's
+no "project" to create or resync, just one batched request per new manifest.
 
 ### Surfacing
 
-A **live SQL join** at read time — `manifest()` gains a
-`malicious_components: Vec<MaliciousComponentJson>` field, computed by joining
-that manifest's `sbom_components` rows against `known_malicious_packages` on
-(ecosystem-from-purl, name, version-or-NULL-wildcard). No precomputation, no
-per-manifest cache row, no staleness window: a manifest uploaded five minutes
-before the mirror last refreshed shows accurate results the instant the mirror
-catches up, without needing to touch that manifest's row.
+`manifest()` gains a `malicious_components: Vec<MaliciousComponentJson>` field,
+read directly from the stored table — no live external call in the read path.
 
-### Open decisions (need your call before implementing)
+### Decision made (proceeding on execution, reversible)
 
-- **Block or just flag?** Vulnerabilities never block an upload (that's
-  compliance's job); a *confirmed malicious package* is arguably worse.
-  Options: (a) always informational, same tier as vuln findings; (b) a new
-  tenant setting (`block_known_malicious_packages`, same shape as
-  `require_semver_version`) that rejects the upload outright when set.
+- **Block or just flag?** Went with (a) always informational, same tier as
+  vuln findings — matches how vulnerabilities themselves never block an
+  upload, and is the safer default to ship without a round-trip. A
+  `block_known_malicious_packages`-style tenant setting (same shape as
+  `require_semver_version`) can be added later without touching the detection
+  logic itself, since it would just gate on the same stored result.
 - **Typosquat heuristics (phase 2, not phase 1):** edit-distance against a
   "top N packages per ecosystem" list to catch things the OSV feed hasn't
   cataloged yet. Real value, but heuristic and noisy (needs a curated
@@ -142,11 +138,12 @@ uploaded it.
 Same two-phase shape as `dtrack_sync.rs`'s push/refresh, but simpler since
 there's no "project" to create first: each tick, pick `N` distinct
 (ecosystem, name) pairs from `sbom_components` that are either missing from
-`component_reputation` or older than a TTL (reputation moves slowly — 30 days
-is plenty, vs. dtrack's much shorter vuln-refresh cadence), call deps.dev per
-pair, upsert the result (or `fetch_error` on failure, matching
-`dtrack_push_failures`' pattern of recording *why* something is stale rather
-than silently retrying forever).
+`component_reputation`, older than a TTL (reputation moves slowly — 30 days
+is plenty, vs. dtrack's much shorter vuln-refresh cadence), or previously
+failed (`fetch_error IS NOT NULL` — retried on every tick regardless of the
+TTL, not just once the 30 days are up, since a fetch failure is usually
+transient and the tick interval itself is already the rate limit), call
+deps.dev per pair, upsert the result (or `fetch_error` on failure).
 
 ### Surfacing
 
@@ -174,14 +171,75 @@ should read as "not checked yet," same language already used for
 
 ---
 
-## Suggested order
+## Status
 
-1. `purl_ecosystem`-style mapping helpers in `crates/core` (shared, no I/O,
-   easy to unit test against real purl examples already in
-   `component_index.rs`'s test suite).
-2. Malicious-package detection end-to-end (smaller: one bulk file, one table,
-   one join, no rate-limited per-item API calls) — validates the "mirror +
-   join" pattern cheaply before repeating it for reputation.
-3. Package reputation scoring, reusing the same job shape against deps.dev.
+1. **Malicious-package detection — implemented** (see below), after verifying
+   OSV's real API docs first and correcting this plan's original bulk-mirror
+   assumption, which turned out to require downloading each ecosystem's whole
+   vulnerability database rather than just the malicious subset.
+2. **Package reputation scoring — implemented** (see below), after verifying
+   deps.dev's real API docs (docs.deps.dev/api/v3) first. One correction
+   versus the original plan: deps.dev has no purl-based lookup (`GetPackage`/
+   `GetVersion` take `system`+`name` path parameters only), so a new
+   `purl_to_depsdev_package` mapping in `crates/core` reconstructs each
+   ecosystem's own name convention from a parsed purl — this part is NOT
+   verified against live deps.dev responses (no live traffic exercised this
+   sandbox), only against the API reference's documented shapes. Re-check
+   against real data if results come back empty for a package you know
+   deps.dev tracks.
 
-Neither is started — this is a plan only, pending the open decisions above.
+### Implementation notes (malicious-package detection)
+
+- New crate `magnolia-osv` (`crates/osv`), mirroring `magnolia-dtrack`'s shape:
+  `OsvClient::query_batch(&[PackageQuery]) -> Vec<Vec<String>>` (vuln IDs per
+  query, same order as input) and `OsvClient::get_vuln(id) -> Option<VulnDetail>`
+  (`id`, `summary`).
+- New module `crates/api/src/malicious_check.rs`: takes a manifest's indexed
+  components (post `index_manifest_components`), builds one batched query
+  (purl-based; skips components with no purl), filters results for the `MAL-`
+  prefix, fetches summaries for just the hits, stores via a new
+  `insert_malicious_findings` DB call. Chunks the batch (e.g. 200 at a time)
+  since `/v1/querybatch`'s docs don't state a max size — better to chunk
+  defensively than find out the hard way.
+- Called from `upload_sbom` right after `index_manifest_components`, same
+  best-effort/logged-not-failed treatment.
+- `manifest()` reads `malicious_component_findings` for its
+  `malicious_components` field — no live OSV call in the read path.
+- Not implemented: a backfill/rescan path for manifests uploaded before this
+  shipped (unlike `reindex_components` for the component index itself) — this
+  only covers new uploads for now. Worth adding as a follow-up if backfilling
+  the existing archive matters.
+
+### Implementation notes (package reputation scoring)
+
+- New crate `magnolia-depsdev` (`crates/depsdev`): `DepsDevClient::get_version`
+  (`GET /v3/systems/{system}/packages/{name}/versions/{version}`, returns
+  `related_projects`) and `get_project` (`GET /v3/projects/{id}`, returns
+  `scorecard.overall_score`). Both build URLs via `reqwest::Url`'s
+  `path_segments_mut` rather than string formatting, so a name containing `/`
+  (npm scoped packages, Go module paths) gets percent-encoded correctly
+  instead of being read as extra path segments.
+- `crates/core/src/purl.rs`: `purl_to_depsdev_package` — per-ecosystem name
+  reconstruction (npm `@scope/name`, Maven `group:artifact`, Go's full module
+  path, plain name for PyPI/crates.io/NuGet/RubyGems). Unit-tested against
+  hand-written purl examples, not against real deps.dev responses.
+- Schema: `sbom_components` gained `ecosystem`/`registry_name` columns
+  (derived from `purl` at index time, alongside the existing malicious-check
+  hook in `index_manifest_components`), plus the `component_reputation` table
+  from the original plan.
+- `crates/api/src/reputation_sync.rs`: periodic background loop (mirrors
+  `dtrack_sync.rs`'s shape), default hourly (`REPUTATION_SYNC_INTERVAL_SECS`,
+  reputation moves slowly, unlike vulnerability data), processing up to 20
+  pending `(ecosystem, registry_name)` pairs per tick — each costs up to two
+  sequential deps.dev calls. On by default, opt-out via
+  `DISABLE_REPUTATION_CHECK`, same shape as `DISABLE_MALICIOUS_PACKAGE_CHECK`.
+  Not stored on `AppState` — unlike `osv`, nothing calls it synchronously
+  from a request handler.
+- `manifest()` gains `component_reputation: Vec<ComponentReputationJson>`,
+  read from a plain SQL join (no live deps.dev call in the read path) —
+  surfaced in the SBOM detail view as a "Package reputation" panel, Scorecard
+  score badges color-coded at the 5/10 midpoint.
+- Decided the two open questions from this section myself, matching how the
+  malicious-package ones were resolved: folded into `manifest()` rather than
+  a separate endpoint (consistency with `malicious_components`), and no
+  enforcement/threshold setting — display only, for now.

@@ -8,6 +8,8 @@ members = [
     "crates/db",
     "crates/audit",
     "crates/dtrack",
+    "crates/osv",
+    "crates/depsdev",
 ]
 resolver = "2"
 

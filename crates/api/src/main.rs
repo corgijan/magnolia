@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use magnolia_api::{create_router, run_sync_loop, AppState};
+use magnolia_api::{create_router, run_reputation_sync_loop, run_sync_loop, AppState};
 use magnolia_audit::AuditLogger;
 use magnolia_core::MerkleTree;
 use magnolia_db::Database;
+use magnolia_depsdev::DepsDevClient;
 use magnolia_dtrack::DtrackClient;
+use magnolia_osv::OsvClient;
 use magnolia_signer::LocalFileSigner;
 use magnolia_storage::{FileStore, InMemoryStore, ObjectStore};
 use tokio::sync::Mutex;
@@ -112,7 +114,38 @@ async fn main() {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(600);
 
+    // On by default -- OSV's public API needs no setup/API key, unlike
+    // standing up a dtrack instance, so this is an opt-out rather than a
+    // presence-gated pair of env vars.
+    let osv = if std::env::var("DISABLE_MALICIOUS_PACKAGE_CHECK").is_ok() {
+        tracing::info!("DISABLE_MALICIOUS_PACKAGE_CHECK set — malicious-package check disabled");
+        None
+    } else {
+        Some(Arc::new(OsvClient::default()))
+    };
+
+    // Also on by default, same reasoning as `osv` above -- deps.dev needs no
+    // setup either.
+    let reputation_sync_interval_secs = std::env::var("REPUTATION_SYNC_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(3600);
+    let depsdev = if std::env::var("DISABLE_REPUTATION_CHECK").is_ok() {
+        tracing::info!("DISABLE_REPUTATION_CHECK set — package reputation scoring disabled");
+        None
+    } else {
+        Some(Arc::new(DepsDevClient::default()))
+    };
+
     let db = Arc::new(db);
+
+    if let Some(client) = depsdev.clone() {
+        tokio::spawn(run_reputation_sync_loop(
+            Arc::clone(&db),
+            client,
+            std::time::Duration::from_secs(reputation_sync_interval_secs),
+        ));
+    }
     let state = AppState {
         db: Arc::clone(&db),
         storage: Arc::clone(&storage),
@@ -123,6 +156,8 @@ async fn main() {
         storage_backend,
         dtrack: dtrack.clone(),
         dtrack_sync_interval_secs,
+        osv,
+        depsdev,
     };
 
     if let Some(client) = dtrack {

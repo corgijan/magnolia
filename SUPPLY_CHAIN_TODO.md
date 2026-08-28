@@ -9,6 +9,24 @@
   namespace). Reuses the `sbom_components` index built at upload time; identity for
   matching across versions is `purl` (version stripped) or component name. Surfaced
   in the SBOM detail view as a collapsible "Component changes" panel.
+- Malicious/typosquat package detection — one batched `POST /v1/querybatch` call to
+  OSV's public API per upload (purl-based, components without a purl are skipped),
+  filtered for `MAL-`-prefixed advisories, stored in `malicious_component_findings`
+  and surfaced in `manifest()`'s response. Informational only (never blocks an
+  upload) and covers new uploads only, no backfill for the existing archive. See
+  `SUPPLY_CHAIN_SIGNALS_PLAN.md` for the corrected design (the original bulk-mirror
+  plan turned out wrong once checked against OSV's real docs) and the open items
+  (typosquat heuristics, dependency confusion, backfill) it explicitly deferred.
+- Package reputation scoring — OpenSSF Scorecard scores via deps.dev's public API
+  (verified against docs.deps.dev/api/v3 first). New `magnolia-depsdev` crate +
+  `crates/api/src/reputation_sync.rs` background job (hourly by default, deps.dev has
+  no batched-query endpoint like OSV so this can't be a single call at upload time
+  the way malicious-check is), `sbom_components` gained `ecosystem`/`registry_name`
+  columns, new `component_reputation` table (deployment-global, not per-tenant).
+  Surfaced in `manifest()`'s response and the SBOM detail view. Caveat: the
+  purl→deps.dev-name mapping (`crates/core/src/purl.rs`) is unit-tested but not
+  verified against real deps.dev responses — no live traffic exercised it. See
+  `SUPPLY_CHAIN_SIGNALS_PLAN.md` for details.
 
 ## Left to do, in no particular order
 
@@ -20,11 +38,6 @@
   after upload. The right primitives already exist (DSSE envelopes, in-toto statement
   types in `magnolia-core`) — not yet wired to ingest/verify provenance attestations
   themselves.
-- **Malicious/typosquat package detection** — flagging packages that look like known
-  supply-chain attacks (dependency confusion, compromised maintainer takeover), a
-  different signal than CVE-matching or compliance checks.
-- **Package reputation scoring** — e.g. OpenSSF Scorecard-style signals (maintainer
-  count, publish recency, funding) layered onto components in `sbom_components`.
 - **Remediation workflows** — auto-opening a PR/ticket for a vulnerable dependency
   instead of only surfacing the finding for a human to act on.
 - **Notification integrations** — Slack/email/webhook on new findings or failed

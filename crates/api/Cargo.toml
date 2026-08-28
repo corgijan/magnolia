@@ -32,3 +32,5 @@ magnolia-storage = { path = "../storage" }
 magnolia-db = { path = "../db" }
 magnolia-audit = { path = "../audit" }
 magnolia-dtrack = { path = "../dtrack" }
+magnolia-osv = { path = "../osv" }
+magnolia-depsdev = { path = "../depsdev" }

@@ -1,12 +1,16 @@
 mod dtrack_sync;
 mod errors;
 mod handlers;
+mod malicious_check;
+mod reputation_bucket;
+mod reputation_sync;
 mod snapshot;
 mod state;
 mod auth;
 
 pub use dtrack_sync::{run_sync_loop, sync_now};
 pub use errors::ApiError;
+pub use reputation_sync::run_reputation_sync_loop;
 pub use state::AppState;
 pub use auth::AuthGrant;
 
@@ -53,6 +57,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/manifest/:manifest_hash", get(handlers::manifest))
         .route("/api/v1/manifest/:manifest_hash/vex", get(handlers::manifest_vex))
         .route("/api/v1/manifest/:manifest_hash/diff", get(handlers::manifest_diff))
+        .route("/api/v1/namespaces/manifests", get(handlers::namespace_manifest_versions))
         .route(
             "/api/v1/manifest/:manifest_hash/revoke",
             post(handlers::revoke_manifest),
@@ -82,6 +87,18 @@ pub fn create_router(state: AppState) -> Router {
             get(handlers::semver_setting).post(handlers::set_semver_setting),
         )
         .route(
+            "/api/v1/settings/reputation-sync",
+            get(handlers::reputation_tenant_setting).post(handlers::set_reputation_tenant_setting),
+        )
+        .route(
+            "/api/v1/settings/namespace-registration",
+            get(handlers::namespace_registration_setting).post(handlers::set_namespace_registration_setting),
+        )
+        .route(
+            "/api/v1/namespaces/registered",
+            get(handlers::list_registered_namespaces).post(handlers::create_namespace),
+        )
+        .route(
             "/api/v1/compliance/profiles",
             get(handlers::list_compliance_profiles),
         )
@@ -106,6 +123,9 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/v1/findings", get(handlers::list_findings))
         .route("/api/v1/dtrack/sync", post(handlers::force_dtrack_sync))
+        .route("/api/v1/reputation/sync", post(handlers::force_reputation_sync))
+        .route("/api/v1/reputation/status", get(handlers::reputation_status))
+        .route("/api/v1/reputation/components", get(handlers::reputation_components))
         .route(
             "/api/v1/keys",
             get(handlers::list_keys).post(handlers::create_key),

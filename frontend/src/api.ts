@@ -114,6 +114,57 @@ export interface Manifest {
   // the BOM as schema-invalid, which will never succeed on retry without
   // different content. null once a later push succeeds.
   dtrack_push_error: string | null;
+  // Components matched against OSV's confirmed-malicious-package advisories,
+  // checked once at upload time. Empty for almost every manifest.
+  malicious_components: MaliciousComponent[];
+  // Cached deps.dev/OpenSSF Scorecard results, filled in by a background
+  // job — a freshly-uploaded manifest's components simply won't appear here
+  // yet (not an error, just "not checked yet").
+  component_reputation: ComponentReputation[];
+}
+
+export interface MaliciousComponent {
+  component_name: string;
+  component_version: string | null;
+  purl: string | null;
+  osv_id: string;
+  summary: string | null;
+  detected_at: string;
+}
+
+// Red/yellow/green classification of a scorecard_score — the boundaries
+// live in the backend (crates/api/src/reputation_bucket.rs), computed once
+// there so this app never has its own copy of the thresholds to drift.
+export type ReputationBucket = 'red' | 'yellow' | 'green';
+
+export interface ComponentReputation {
+  component_name: string;
+  component_version: string | null;
+  scorecard_score: number | null;
+  bucket: ReputationBucket | null;
+  project_repo: string | null;
+  // null means the reputation background job hasn't reached this component
+  // yet — render as "pending", not an error or a zero score.
+  checked_at: string | null;
+  fetch_error: string | null;
+}
+
+// One package's cached score, deployment-wide — not scoped to any one
+// manifest. Backs the "all scored packages" aggregation modal.
+export interface ReputationComponentSummary {
+  ecosystem: string;
+  name: string;
+  scorecard_score: number;
+  bucket: ReputationBucket;
+  project_repo: string | null;
+  checked_at: string;
+}
+
+export interface ManifestVersion {
+  manifest_hash: string;
+  version: string;
+  created_at: string;
+  revoked: boolean;
 }
 
 export interface VulnerabilityFinding {
@@ -299,6 +350,17 @@ export interface BackendConfig {
   dtrack_enabled: boolean;
   // Present only when dtrack_enabled.
   dtrack_sync_interval_secs: number | null;
+  reputation_enabled: boolean;
+}
+
+export interface ReputationSyncResult {
+  components_processed: number;
+}
+
+export interface ReputationStatus {
+  pending: number;
+  checked: number;
+  failed: number;
 }
 
 // This tenant's own opt-out of the deployment-wide dtrack sync — distinct
@@ -311,6 +373,24 @@ export interface DtrackSyncSetting {
 // SemVer 2.0.0-compliant.
 export interface SemverSetting {
   required: boolean;
+}
+
+// This tenant's opt-out of the "Package reputation" panel appearing on its
+// own SBOM detail views — has no effect on the background job itself.
+export interface ReputationTenantSetting {
+  disabled: boolean;
+}
+
+// This tenant's opt-in requiring upload_sbom's target namespace to already
+// be registered (see RegisteredNamespace below).
+export interface NamespaceRegistrationSetting {
+  required: boolean;
+}
+
+export interface RegisteredNamespace {
+  namespace: string;
+  created_by: string;
+  created_at: string;
 }
 
 export interface AuditEntry {
@@ -467,6 +547,9 @@ export const api = {
       `/api/v1/manifest/${manifestHash}/diff${tenantQs(tenantId, against ? { against } : {})}`
     ),
 
+  namespaceManifestVersions: (namespace: string, tenantId?: string): Promise<ManifestVersion[]> =>
+    request(`/api/v1/namespaces/manifests${tenantQs(tenantId, { namespace })}`),
+
   listFindings: (
     opts: {
       severity?: string;
@@ -516,6 +599,14 @@ export const api = {
   forceDtrackSync: (tenantId?: string): Promise<DtrackSyncResult> =>
     request(`/api/v1/dtrack/sync${tenantQs(tenantId)}`, { method: 'POST' }),
 
+  // Deployment-global, unlike forceDtrackSync — no tenant to scope this to.
+  forceReputationSync: (): Promise<ReputationSyncResult> =>
+    request('/api/v1/reputation/sync', { method: 'POST' }),
+
+  reputationStatus: (): Promise<ReputationStatus> => request('/api/v1/reputation/status'),
+
+  reputationComponents: (): Promise<ReputationComponentSummary[]> => request('/api/v1/reputation/components'),
+
   currentManifests: (tenantId?: string): Promise<CurrentManifest[]> =>
     request(`/api/v1/manifests/current${tenantQs(tenantId)}`),
 
@@ -547,6 +638,36 @@ export const api = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ required }),
+    }),
+
+  reputationTenantSetting: (tenantId?: string): Promise<ReputationTenantSetting> =>
+    request(`/api/v1/settings/reputation-sync${tenantQs(tenantId)}`),
+
+  setReputationTenantSetting: (disabled: boolean, tenantId?: string): Promise<void> =>
+    request(`/api/v1/settings/reputation-sync${tenantQs(tenantId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ disabled }),
+    }),
+
+  namespaceRegistrationSetting: (tenantId?: string): Promise<NamespaceRegistrationSetting> =>
+    request(`/api/v1/settings/namespace-registration${tenantQs(tenantId)}`),
+
+  setNamespaceRegistrationSetting: (required: boolean, tenantId?: string): Promise<void> =>
+    request(`/api/v1/settings/namespace-registration${tenantQs(tenantId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ required }),
+    }),
+
+  listRegisteredNamespaces: (tenantId?: string): Promise<RegisteredNamespace[]> =>
+    request(`/api/v1/namespaces/registered${tenantQs(tenantId)}`),
+
+  createNamespace: (namespace: string, tenantId?: string): Promise<void> =>
+    request(`/api/v1/namespaces/registered${tenantQs(tenantId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ namespace }),
     }),
 
   complianceProfiles: (): Promise<ComplianceProfileInfo[]> =>

@@ -2,7 +2,7 @@
 tenant_url=http://127.0.0.1:3000
 # tenant_domain is REQUIRED -- the script verifies MAGNOLIA_API_KEY actually
 tenant_domain=com3m.platform.io
-namespace=/platform-test/prod
+namespace=/testnamespacreg
 sbom=bom.json
 format=cyclonedx
 
