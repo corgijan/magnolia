@@ -377,6 +377,18 @@ code.hash {
   border-color: var(--accent);
 }
 
+/* The one destructive action in the detail panel header — tinted so it
+   doesn't read as just another neutral "view …" button. */
+.btn-danger {
+  color: #ff7b72;
+  border-color: rgba(248, 81, 73, 0.4);
+  background: rgba(248, 81, 73, 0.1);
+}
+
+.btn-danger:hover:not(:disabled) {
+  border-color: #ff7b72;
+}
+
 .btn:disabled {
   opacity: 0.45;
   cursor: not-allowed;
@@ -565,18 +577,157 @@ textarea {
   gap: 10px;
 }
 
-.sbom-details-table td {
-  vertical-align: top;
+/* The detail panel is a stack of labelled sections (security signals,
+   malicious matches, compliance, metadata) — each one its own table with
+   its own columns, rather than a single table where section headings and
+   badge blocks had to be smuggled in as colSpan=2 rows. */
+.detail-section {
+  margin-top: 20px;
 }
 
-.sbom-details-table td:first-child {
+.detail-section:first-of-type {
+  margin-top: 0;
+}
+
+.detail-section-title {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
   color: var(--muted);
-  white-space: nowrap;
-  width: 1%;
 }
 
-.sbom-details-table td:last-child {
+/* Footnotes that qualify a whole section (e.g. which ecosystems get
+   scored) — small, and clearly outside the table's data. */
+.detail-section-note {
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+/* Signal/Status/Details: label and status stay narrow and unwrapped so the
+   badges line up down the page; the prose column takes the slack. */
+.table.signals-table td {
+  vertical-align: top;
+  padding: 10px 12px;
+}
+
+.table.signals-table td:first-child {
+  font-weight: 600;
+  width: 200px;
+}
+
+.table.signals-table td:nth-child(2) {
+  width: 220px;
+}
+
+/* Prose/summary cells: the table default is nowrap, which turns a
+   vulnerability summary or a sync error into a page-widening single line. */
+.table td.signal-detail {
   white-space: normal;
+  word-break: break-word;
+}
+
+.signal-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+/* The visible "hover me" affordance next to a signal label — muted by
+   default so it doesn't compete with the label text, brightens on hover to
+   confirm it's interactive. `cursor: help` backs up the icon shape itself
+   with the OS's own "there's a tooltip here" cursor. */
+.info-icon {
+  display: inline-flex;
+  color: var(--muted);
+  cursor: help;
+}
+
+.info-icon:hover {
+  color: var(--text);
+}
+
+/* Badges stacked in one cell wrap instead of forcing the column wider. */
+.badge-stack {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+/* Frames the malicious-match table as the alarm it is, without the
+   error-box styling swallowing the table inside it. */
+.danger-panel {
+  border: 1px solid rgba(248, 81, 73, 0.4);
+  background: rgba(248, 81, 73, 0.07);
+  border-radius: 8px;
+  padding: 2px 12px 10px;
+  margin-top: 6px;
+}
+
+.table.malicious-table td:first-child,
+.table.compliance-table td:first-child {
+  font-weight: 600;
+}
+
+.table.malicious-table tbody tr:last-child td,
+.table.compliance-table tbody tr:last-child td,
+.table.signals-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.table.malicious-table a {
+  text-decoration: none;
+}
+
+/* Same label/value shape as the metadata table, but inside the signature
+   modal, where the hashes get the full modal width to themselves. */
+.table.signature-table td {
+  vertical-align: top;
+  padding: 9px 12px;
+}
+
+.table.signature-table td:first-child {
+  color: var(--muted);
+  font-weight: 600;
+  white-space: nowrap;
+  width: 150px;
+}
+
+.table.signature-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.signature-actions {
+  margin-top: 12px;
+  border-top: none;
+  background: none;
+  padding: 0;
+}
+
+.sbom-details-table {
+  table-layout: fixed;
+}
+
+.table.sbom-details-table td {
+  vertical-align: middle;
+  padding: 10px 14px;
+}
+
+.table.sbom-details-table td:first-child {
+  color: var(--muted);
+  font-weight: 600;
+  white-space: nowrap;
+  width: 200px;
+}
+
+.table.sbom-details-table td:last-child {
+  white-space: normal;
+}
+
+.sbom-details-table tbody tr:nth-child(even) {
+  background: var(--panel-2);
 }
 
 .sbom-details-table .cell-actions {
@@ -584,6 +735,19 @@ textarea {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+}
+
+/* Every button that used to sit inline in a data row now lives here in one
+   row at the bottom of the table, so the rows above stay plain label/value
+   info and don't jump around as actions become available/unavailable. */
+.sbom-actions-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 14px 16px;
+  border-top: 2px solid var(--border);
+  background: var(--panel-2);
 }
 
 .sbom-json {

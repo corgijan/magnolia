@@ -15,10 +15,14 @@ const BATCH_SIZE: i64 = 20;
 /// *after* it was uploaded, which can happen any time, so this is a much
 /// shorter TTL than `reputation_sync::STALE_AFTER_DAYS` (reputation scores
 /// move slowly; malicious-package advisories can land at any moment).
-pub const STALE_AFTER_DAYS: i64 = 1;
+/// Matches the sync loop's own default tick interval
+/// (`MALICIOUS_SYNC_INTERVAL_SECS`, also 1 hour) — a shorter TTL than the
+/// tick cadence would just mean every manifest is already stale by the next
+/// tick anyway, so there'd be nothing to gain from it.
+pub const STALE_AFTER_HOURS: i64 = 1;
 
 pub fn stale_before_cutoff() -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now() - chrono::Duration::days(STALE_AFTER_DAYS)
+    chrono::Utc::now() - chrono::Duration::hours(STALE_AFTER_HOURS)
 }
 
 /// Periodic background job re-running the OSV malicious-package check
@@ -45,7 +49,7 @@ pub async fn run_malicious_sync_loop(db: Arc<Database>, client: Arc<OsvClient>, 
 /// to its own loop/force-sync handler. Returns how many manifests were
 /// successfully (re)checked — a manifest whose OSV call itself failed is not
 /// counted, and is left stale so it's retried on the very next pass instead
-/// of waiting out the full `STALE_AFTER_DAYS` window.
+/// of waiting out the full `STALE_AFTER_HOURS` window.
 pub async fn sync_pass(db: &Database, client: &OsvClient) -> usize {
     let pending = match db.list_manifests_needing_malicious_check(stale_before_cutoff(), BATCH_SIZE).await {
         Ok(p) => p,

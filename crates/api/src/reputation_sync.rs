@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use magnolia_db::Database;
-use magnolia_depsdev::DepsDevClient;
+use magnolia_depsdev::{DepsDevClient, RelatedProject};
 
 /// How many (ecosystem, registry_name) pairs to process per tick — each one
 /// costs up to two sequential deps.dev calls (`get_version` then
@@ -83,10 +83,10 @@ pub async fn sync_pass(db: &Database, client: &DepsDevClient) -> usize {
             }
         };
 
-        // No related project at all (deps.dev doesn't know this package's
-        // source repo) -- store as "checked, nothing found," not an error:
-        // there's genuinely no scorecard to have.
-        let Some(project_id) = version.related_projects.first().map(|p| p.project_key.id.clone()) else {
+        // No related project with a usable id at all (deps.dev doesn't know
+        // this package's source repo) -- store as "checked, nothing found,"
+        // not an error: there's genuinely no scorecard to have.
+        let Some(project_id) = pick_related_project_id(&version.related_projects) else {
             if let Err(e) = db.upsert_component_reputation(&identity.ecosystem, &identity.registry_name, None, None, None).await {
                 tracing::warn!(error = %e, "reputation sync: failed to record empty result");
             }
@@ -157,4 +157,56 @@ async fn backfill_ecosystem_phase(db: &Database) -> usize {
         tracing::info!(backfilled, "reputation sync: backfilled ecosystem/registry_name for pre-existing components");
     }
     backfilled
+}
+
+/// Picks the first related project with a non-empty id. Not just
+/// `related_projects.first()`: verified live against a real deps.dev
+/// response (`GET /v3/systems/MAVEN/packages/commons-io:commons-io/versions/
+/// 2.16.1`) that deps.dev itself can return a `relatedProjects` entry whose
+/// `projectKey.id` is an empty string (an `ISSUE_TRACKER`-type relation deps.dev
+/// couldn't resolve to an actual project, apparently still emitted instead of
+/// omitted) — taking that entry verbatim as `project_id` then makes
+/// `get_project("")` fail with a 400 ("invalid project key") for a package
+/// that may well have a perfectly good `SOURCE_REPO` entry later in the same
+/// list. Pure/no I/O so it's unit-testable on its own.
+fn pick_related_project_id(related: &[RelatedProject]) -> Option<String> {
+    related.iter().map(|p| p.project_key.id.clone()).find(|id| !id.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magnolia_depsdev::ProjectKey;
+
+    fn related(id: &str) -> RelatedProject {
+        RelatedProject { project_key: ProjectKey { id: id.to_string() } }
+    }
+
+    #[test]
+    fn pick_related_project_id_skips_a_leading_empty_id() {
+        // The exact shape deps.dev returned live for commons-io:commons-io —
+        // an ISSUE_TRACKER relation with no id, followed by a usable one.
+        let projects = vec![related(""), related("github.com/apache/commons-io")];
+
+        assert_eq!(pick_related_project_id(&projects), Some("github.com/apache/commons-io".to_string()));
+    }
+
+    #[test]
+    fn pick_related_project_id_returns_none_when_all_ids_are_empty() {
+        let projects = vec![related(""), related("")];
+
+        assert_eq!(pick_related_project_id(&projects), None);
+    }
+
+    #[test]
+    fn pick_related_project_id_returns_none_for_no_related_projects() {
+        assert_eq!(pick_related_project_id(&[]), None);
+    }
+
+    #[test]
+    fn pick_related_project_id_uses_the_only_entry_when_already_non_empty() {
+        let projects = vec![related("github.com/lodash/lodash")];
+
+        assert_eq!(pick_related_project_id(&projects), Some("github.com/lodash/lodash".to_string()));
+    }
 }

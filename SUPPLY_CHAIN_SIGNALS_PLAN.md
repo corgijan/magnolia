@@ -212,9 +212,11 @@ should read as "not checked yet," same language already used for
   manifests per tick, default hourly via `MALICIOUS_SYNC_INTERVAL_SECS`,
   gated on the same `osv` client the upload-time check uses — no separate
   enable/disable). Unlike reputation's 30-day TTL, manifests go stale after
-  just `STALE_AFTER_DAYS = 1` day, since the whole point is catching a
-  package that gets flagged `MAL-` sometime *after* it was already
-  uploaded — waiting a month would defeat that. `check_and_store_malicious_components`
+  just `STALE_AFTER_HOURS = 1` hour — matching the tick interval itself, so
+  every manifest is eligible for recheck on essentially every tick — since
+  the whole point is catching a package that gets flagged `MAL-` sometime
+  *after* it was already uploaded, as soon as reasonably possible.
+  `check_and_store_malicious_components`
   now returns `bool` (did the check actually complete) so both the upload-time
   call site and the sync job only advance `malicious_checked_at` on success —
   a failed attempt is retried on the very next pass instead of waiting out

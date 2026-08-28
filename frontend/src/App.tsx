@@ -22,14 +22,12 @@ import {
   Manifest,
   ManifestDiff,
   ManifestVersion,
-  NamespaceRegistrationSetting,
   RegisteredNamespace,
   ReindexResult,
   ReputationBucket,
   ReputationComponentSummary,
   ReputationStatus,
   ReputationSyncResult,
-  ReputationTenantSetting,
   setApiKey,
   Tenant,
   TreeHead,
@@ -119,6 +117,36 @@ function Hash({ value, chars = 16 }: { value: string; chars?: number }) {
 
 function Badge({ ok, children }: { ok: boolean; children: React.ReactNode }) {
   return <span className={`badge ${ok ? 'badge-ok' : 'badge-err'}`}>{children}</span>;
+}
+
+// A small "hover me" affordance — plain text with a `title` attribute works
+// for a mouse but gives no visual hint that more explanation exists; this
+// pairs the tooltip with a visible icon instead, same reasoning as the
+// tree-view icons using currentColor rather than emoji for consistent
+// cross-platform rendering.
+function InfoIcon() {
+  return (
+    <svg className="info-icon-glyph" width="13" height="13" viewBox="0 0 16 16" aria-hidden="true">
+      <circle cx="8" cy="8" r="6.5" fill="none" stroke="currentColor" strokeWidth="1.1" />
+      <circle cx="8" cy="5.15" r="0.95" fill="currentColor" />
+      <rect x="7.25" y="7.1" width="1.5" height="4.9" rx="0.6" fill="currentColor" />
+    </svg>
+  );
+}
+
+// A row label (e.g. a "Security signals" table's `Signal` column) plus an
+// `InfoIcon` carrying a `title` tooltip explaining what the label means —
+// used wherever a bare label like "Package reputation" needs a one-line
+// explanation without permanently taking up its own line of text.
+function SignalLabel({ label, tooltip }: { label: string; tooltip: string }) {
+  return (
+    <span className="signal-label">
+      {label}
+      <span className="info-icon" title={tooltip} aria-label={tooltip}>
+        <InfoIcon />
+      </span>
+    </span>
+  );
 }
 
 // Colors a Scorecard score by the bucket the backend already computed
@@ -306,10 +334,20 @@ function downloadJson(filename: string, data: unknown) {
   URL.revokeObjectURL(url);
 }
 
-function DownloadButton({ filename, data }: { filename: string; data: unknown }) {
+function DownloadButton({
+  filename,
+  data,
+  label = 'Download JSON',
+}: {
+  filename: string;
+  data: unknown;
+  /** Overrides the default when the caller already says what the JSON is
+   * (e.g. "Download signature" inside the signature modal). */
+  label?: string;
+}) {
   return (
     <button type="button" className="btn" onClick={() => downloadJson(filename, data)}>
-      Download JSON
+      {label}
     </button>
   );
 }
@@ -389,9 +427,8 @@ function Dashboard({
             <span className="muted"> — OSV, checked at upload time</span>
           </div>
           <div className="kv-row">
-            <span className="kv-label">Package reputation</span>
+            <span className="kv-label" title="OpenSSF Scorecard, via deps.dev">Package reputation</span>
             <Badge ok={config.reputation_enabled}>{config.reputation_enabled ? 'enabled' : 'disabled'}</Badge>
-            <span className="muted"> — OpenSSF Scorecard, via deps.dev</span>
           </div>
           <div className="kv-row">
             <span className="kv-label">DEV_MODE</span>
@@ -1405,7 +1442,8 @@ function GitRepoArtifact({ manifest }: { manifest: Manifest }) {
 
 // Live filter over the tree/table below — matches namespace or file name,
 // not an exact-hash jump (a manifest hash pasted in place of a URL-based
-// deep link is still reachable directly, e.g. via initialSelectedHash).
+// deep link is still reachable directly, e.g. via App's lifted
+// selectedManifestHash/selectManifest).
 function SbomSearchBox({ value, onChange }: { value: string; onChange: (value: string) => void }) {
   return (
     <div className="form-row">
@@ -1490,6 +1528,7 @@ function SbomDetailPanel({
   const [reputationDisabledForTenant, setReputationDisabledForTenant] = useState(false);
   const [maliciousCheckDisabledForTenant, setMaliciousCheckDisabledForTenant] = useState(false);
   const [showComponentReputationModal, setShowComponentReputationModal] = useState(false);
+  const [showSignatureModal, setShowSignatureModal] = useState(false);
 
   useEffect(() => {
     let mounted = true;
@@ -1633,9 +1672,30 @@ function SbomDetailPanel({
     fetchDiff(against);
   };
 
+  // Which of the three security signals apply to this manifest. They used to
+  // be section-header rows wedged into the metadata key/value table, which
+  // meant a colSpan=2 cell had to carry badges, prose and (for malicious
+  // matches) a whole bullet list — unreadable once more than one signal was
+  // present. They now share one Signal/Status/Details table of their own.
+  const showMaliciousSignal = !!manifest && !manifest.document_type && !maliciousCheckDisabledForTenant;
+  const showReputationSignal =
+    !!manifest && !manifest.document_type && !reputationDisabledForTenant && manifest.component_reputation.length > 0;
+  const showVulnSignal = !!manifest && !manifest.document_type && dtrackEnabled && !dtrackSyncDisabled;
+  const hasSecuritySignals = showMaliciousSignal || showReputationSignal || showVulnSignal;
+
   return (
     <div className="card">
-      <h2>{manifest?.document_type ? 'Document Details' : 'SBOM Details'}</h2>
+      {/* Revoke lives in the header rather than the bottom action row: it is
+          the one destructive action here, and pairing it with the title keeps
+          it away from the read-only "view X…" buttons it used to sit among. */}
+      <div className="card-header">
+        <h2>{manifest?.document_type ? 'Document Details' : 'SBOM Details'}</h2>
+        {!busy && manifest && !manifest.revoked && (
+          <button className="btn btn-danger" disabled={revoking} onClick={revoke}>
+            {revoking ? 'Revoking…' : 'Revoke'}
+          </button>
+        )}
+      </div>
       {busy && <Spinner label="Loading…" />}
       {error && <ErrorBox message={error} />}
       {!busy && manifest && (
@@ -1647,250 +1707,302 @@ function SbomDetailPanel({
           ) : (
             <SbomArtifact key={manifest.manifest_hash} manifest={manifest} />
           )}
-          <table className="table sbom-details-table">
-            <tbody>
-              <tr>
-                <td>status</td>
-                <td>
-                  <span className="cell-actions">
-                    <Badge ok={!manifest.revoked}>{manifest.revoked ? 'revoked' : 'active'}</Badge>
-                    {!manifest.revoked && (
-                      <button className="btn" disabled={revoking} onClick={revoke}>
-                        {revoking ? 'Revoking…' : 'Revoke'}
-                      </button>
-                    )}
-                  </span>
-                </td>
-              </tr>
-              {revokeError && (
-                <tr>
-                  <td colSpan={2}><ErrorBox message={revokeError} /></td>
-                </tr>
-              )}
-              {!maliciousCheckDisabledForTenant && manifest.malicious_components.length > 0 && (
-                <tr>
-                  <td colSpan={2}>
-                    <div className="error-box">
-                      {manifest.malicious_components.length} component
-                      {manifest.malicious_components.length === 1 ? '' : 's'} matched a known-malicious package
-                      advisory (<a href="https://osv.dev/" target="_blank" rel="noopener noreferrer">OSV</a>):
-                      <ul>
-                        {manifest.malicious_components.map((m) => (
-                          <li key={`${m.component_name}-${m.osv_id}`}>
-                            <strong>{m.component_name}{m.component_version ? `@${m.component_version}` : ''}</strong>
-                            {' '}— {m.osv_id}
-                            {m.summary ? `: ${m.summary}` : ''}
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  </td>
-                </tr>
-              )}
-              {manifest.revoked && (
-                <>
+          {revokeError && <ErrorBox message={revokeError} />}
+
+          {/* Security signals — one row per signal, each with its own status
+              and details column, instead of the old colSpan=2 header rows in
+              the middle of the metadata table.
+              Only real SBOMs ever get pushed to dtrack (document_type is
+              set for everything else — risk assessments, CVD policies,
+              git-repo entries, ...) — showing "not synced" on those would
+              be flat wrong, not just premature, since they're never
+              going to sync no matter how long you wait.
+              Once this tenant has turned sync off, the whole row is
+              hidden here — including any already-cached findings — so
+              the SBOM overview doesn't keep showing vulnerability data
+              the tenant asked to stop tracking. Cached rows aren't
+              deleted (same "mark, don't delete" idiom used elsewhere),
+              they're just not surfaced on this page while sync is off;
+              re-enabling sync brings them back into view immediately. */}
+          {hasSecuritySignals && (
+            <section className="detail-section">
+              <h3 className="detail-section-title">Security signals</h3>
+              <table className="table signals-table">
+                <thead>
                   <tr>
-                    <td>revoked_by</td>
-                    <td title={manifest.revoked_by ?? ''}>
-                      {manifest.revoked_by ? shortPrincipal(manifest.revoked_by) : '—'}
-                    </td>
+                    <th>Signal</th>
+                    <th>Status</th>
+                    <th>Details</th>
                   </tr>
-                  <tr>
-                    <td>revoked_at</td>
-                    <td>{manifest.revoked_at ? new Date(manifest.revoked_at).toLocaleString() : '—'}</td>
-                  </tr>
-                </>
-              )}
-              {manifest.compliance.length > 0 && (
-                <>
-                  <tr>
-                    <td colSpan={2}><strong>Compliance</strong></td>
-                  </tr>
-                  {manifest.compliance.map((c) => {
-                    const hasIssues = c.minimum_issues.length > 0 || c.missing_fields.length > 0;
-                    return (
-                      <tr key={c.profile_id}>
-                        <td>{c.profile_name}</td>
-                        <td>
-                          <span className="cell-actions">
-                            <Badge ok={c.meets_minimum}>{c.meets_minimum ? 'meets minimum' : 'below minimum'}</Badge>
-                            <Badge ok={c.fully_compliant}>
-                              {c.fully_compliant ? 'fully compliant' : 'not fully compliant'}
-                            </Badge>
-                            {hasIssues && (
-                              <button className="btn" onClick={() => setComplianceReportFor(c.profile_id)}>
-                                View non-compliance report
-                              </button>
-                            )}
+                </thead>
+                <tbody>
+                  {showMaliciousSignal && (
+                    <tr>
+                      <td>
+                        <SignalLabel
+                          label="Malicious packages"
+                          tooltip="Components checked by purl/version against OSV's MAL- (known-malicious-package) advisories. Informational only — never blocks an upload."
+                        />
+                      </td>
+                      <td>
+                        <Badge ok={manifest.malicious_components.length === 0}>
+                          {manifest.malicious_components.length === 0
+                            ? 'none found'
+                            : `${manifest.malicious_components.length} found`}
+                        </Badge>
+                      </td>
+                      <td className="signal-detail">
+                        {manifest.malicious_components.length === 0 ? (
+                          <span className="muted">
+                            No component matched a known-malicious package advisory.
                           </span>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </>
-              )}
-              {/* Only real SBOMs ever get pushed to dtrack (document_type is
-                  set for everything else — risk assessments, CVD policies,
-                  git-repo entries, ...) — showing "not synced" on those would
-                  be flat wrong, not just premature, since they're never
-                  going to sync no matter how long you wait.
-                  Once this tenant has turned sync off, the whole section is
-                  hidden here — including any already-cached findings — so
-                  the SBOM overview doesn't keep showing vulnerability data
-                  the tenant asked to stop tracking. Cached rows aren't
-                  deleted (same "mark, don't delete" idiom used elsewhere),
-                  they're just not surfaced on this page while sync is off;
-                  re-enabling sync brings them back into view immediately. */}
-              {!manifest.document_type && (
-                <>
-                  <tr>
-                    <td colSpan={2}><strong>Component changes</strong></td>
-                  </tr>
-                  <tr>
-                    <td colSpan={2}>
-                      <button className="btn" onClick={loadDiff}>View component diff</button>
-                    </td>
-                  </tr>
-                </>
-              )}
-              {!manifest.document_type && !reputationDisabledForTenant && manifest.component_reputation.length > 0 && (
-                <>
-                  <tr>
-                    <td colSpan={2}>
-                      <strong>Package reputation</strong>{' '}
-                      <span className="muted">(OpenSSF Scorecard, via deps.dev)</span>
-                    </td>
-                  </tr>
-                  <tr>
-                    <td colSpan={2}>
-                      <span className="cell-actions">
-                        <Badge ok={reputationSummary.pending === 0}>{reputationSummary.pending} pending</Badge>
-                        <Badge ok={true}>{reputationSummary.checked} checked</Badge>
-                        <Badge ok={reputationSummary.failed === 0}>{reputationSummary.failed} failed</Badge>
-                      </span>
-                    </td>
-                  </tr>
-                  <tr>
-                    <td colSpan={2}>
-                      <span className="cell-actions">
-                        {reputationSummary.red > 0 && (
-                          <span className="badge badge-err">{reputationSummary.red} red</span>
+                        ) : (
+                          <span className="muted">
+                            Matched a known-malicious package advisory — see the table below.
+                          </span>
                         )}
-                        {reputationSummary.yellow > 0 && (
-                          <span className="badge badge-warn">{reputationSummary.yellow} yellow</span>
-                        )}
-                        {reputationSummary.green > 0 && (
-                          <span className="badge badge-ok">{reputationSummary.green} green</span>
-                        )}
-                        {reputationSummary.noScore > 0 && (
-                          <span className="muted">{reputationSummary.noScore} no scorecard available</span>
-                        )}
-                        <button className="btn" onClick={() => setShowComponentReputationModal(true)}>
-                          View {reputationSummary.total} component score{reputationSummary.total === 1 ? '' : 's'}…
-                        </button>
-                      </span>
-                      <div className="muted" style={{ marginTop: 4 }}>
-                        Only components with a recognized package identity (npm, PyPI, crates.io, Go, Maven,
-                        NuGet, RubyGems) are scored.
-                      </div>
-                    </td>
-                  </tr>
-                </>
-              )}
-              {!manifest.document_type && dtrackEnabled && !dtrackSyncDisabled && (
-                <>
-                  <tr>
-                    <td colSpan={2}><strong>Vulnerability findings</strong></td>
-                  </tr>
-                  <tr>
-                    <td colSpan={2}>
-                      {manifest.vulnerability_findings.length > 0 ? (
-                        <span className="cell-actions">
-                          <FindingsSummaryBadges findings={manifest.vulnerability_findings} />
-                          <button
-                            className="btn"
-                            onClick={() => onViewFindings?.(manifest.manifest_hash)}
-                          >
-                            View &amp; triage findings →
-                          </button>
+                      </td>
+                    </tr>
+                  )}
+                  {showReputationSignal && (
+                    <tr>
+                      <td>
+                        <SignalLabel label="Package reputation" tooltip="OpenSSF Scorecard, via deps.dev" />
+                      </td>
+                      <td>
+                        <span className="badge-stack">
+                          {reputationSummary.red > 0 && (
+                            <span className="badge badge-err">{reputationSummary.red} red</span>
+                          )}
+                          {reputationSummary.yellow > 0 && (
+                            <span className="badge badge-warn">{reputationSummary.yellow} yellow</span>
+                          )}
+                          {reputationSummary.green > 0 && (
+                            <span className="badge badge-ok">{reputationSummary.green} green</span>
+                          )}
+                          {reputationSummary.red === 0
+                            && reputationSummary.yellow === 0
+                            && reputationSummary.green === 0 && (
+                            <span className="muted">no scores yet</span>
+                          )}
                         </span>
-                      ) : manifest.dtrack_synced_at ? (
-                        <>
-                          <Badge ok={true}>0 vulnerabilities found</Badge>{' '}
+                      </td>
+                      <td className="signal-detail">
+                        <span className="muted">
+                          {reputationSummary.checked} of {reputationSummary.total} checked
+                          {reputationSummary.pending > 0 ? ` · ${reputationSummary.pending} pending` : ''}
+                          {reputationSummary.failed > 0 ? ` · ${reputationSummary.failed} failed` : ''}
+                          {reputationSummary.noScore > 0
+                            ? ` · ${reputationSummary.noScore} without a scorecard`
+                            : ''}
+                        </span>
+                      </td>
+                    </tr>
+                  )}
+                  {showVulnSignal && (
+                    <tr>
+                      <td>
+                        <SignalLabel
+                          label="Vulnerability findings"
+                          tooltip="CVE/vulnerability scanning via Dependency-Track — a separate signal from the malicious-package check above; a component can have real CVEs without being a known-malicious package, or vice versa."
+                        />
+                      </td>
+                      <td>
+                        {manifest.vulnerability_findings.length > 0 ? (
+                          <FindingsSummaryBadges findings={manifest.vulnerability_findings} />
+                        ) : manifest.dtrack_synced_at ? (
+                          <Badge ok={true}>none found</Badge>
+                        ) : manifest.dtrack_push_error ? (
+                          <Badge ok={false}>sync error</Badge>
+                        ) : (
+                          <Badge ok={false}>not synced</Badge>
+                        )}
+                      </td>
+                      <td className="signal-detail">
+                        {manifest.vulnerability_findings.length > 0 ? (
+                          <span className="muted">
+                            {manifest.vulnerability_findings.length} finding
+                            {manifest.vulnerability_findings.length === 1 ? '' : 's'}
+                            {manifest.dtrack_synced_at
+                              ? ` · last checked ${new Date(manifest.dtrack_synced_at).toLocaleString()}`
+                              : ''}
+                          </span>
+                        ) : manifest.dtrack_synced_at ? (
                           <span className="muted">
                             Last checked {new Date(manifest.dtrack_synced_at).toLocaleString()}.
                           </span>
-                        </>
-                      ) : manifest.dtrack_push_error ? (
-                        <>
-                          <Badge ok={false}>sync error</Badge>{' '}
+                        ) : manifest.dtrack_push_error ? (
                           <span className="muted">{manifest.dtrack_push_error}</span>
-                        </>
-                      ) : (
-                        <>
-                          <Badge ok={false}>not synced</Badge>{' '}
+                        ) : (
                           <span className="muted">
                             This SBOM hasn't finished vulnerability scanning yet. Dependency-Track checks for new
                             uploads every {formatSyncWaitTime(dtrackSyncIntervalSecs)} — if this was uploaded
                             recently, please wait and check back.
                           </span>
-                        </>
-                      )}
-                    </td>
-                  </tr>
-                </>
+                        )}
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+              {showReputationSignal && (
+                <div className="muted detail-section-note">
+                </div>
               )}
-              <tr>
-                <td>version</td>
-                <td>{manifest.version}</td>
-              </tr>
-              <tr>
-                <td>namespace</td>
-                <td>{manifest.domain}{manifest.namespace}</td>
-              </tr>
-              <tr>
-                <td>sbom_hash</td>
-                <td><Hash value={manifest.sbom_hash} chars={24} /></td>
-              </tr>
-              <tr>
-                <td>previous_manifest_hash</td>
-                <td>{manifest.previous_manifest_hash ? <Hash value={manifest.previous_manifest_hash} chars={24} /> : 'none (first upload)'}</td>
-              </tr>
-              {manifest.dsse_envelope ? (
-                <>
+            </section>
+          )}
+
+          {/* The malicious matches themselves — a real table rather than the
+              bullet list that used to be stuffed into a single metadata cell,
+              since each match has three distinct fields worth scanning. */}
+          {showMaliciousSignal && manifest.malicious_components.length > 0 && (
+            <section className="detail-section">
+              <h3 className="detail-section-title">
+                Malicious package matches{' '}
+                <span className="muted">
+                  (<a href="https://osv.dev/" target="_blank" rel="noopener noreferrer">OSV</a>)
+                </span>
+              </h3>
+              <div className="danger-panel">
+                <table className="table malicious-table">
+                  <thead>
+                    <tr>
+                      <th>Component</th>
+                      <th>Advisory</th>
+                      <th>Summary</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {manifest.malicious_components.map((m) => (
+                      <tr key={`${m.component_name}-${m.osv_id}`}>
+                        <td>
+                          <strong>{m.component_name}</strong>
+                          {m.component_version ? `@${m.component_version}` : ''}
+                        </td>
+                        <td>
+                          <a
+                            href={`https://osv.dev/vulnerability/${encodeURIComponent(m.osv_id)}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                          >
+                            <VulnerabilityId vulnerabilityId={m.osv_id} />
+                          </a>
+                        </td>
+                        <td className="signal-detail">{m.summary ?? <span className="muted">—</span>}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          )}
+
+          {manifest.compliance.length > 0 && (
+            <section className="detail-section">
+              <h3 className="detail-section-title">Compliance</h3>
+              <table className="table compliance-table">
+                <thead>
                   <tr>
-                    <td>dsse signature</td>
-                    <td><Hash value={manifest.dsse_envelope.signatures[0]?.sig ?? ''} chars={24} /></td>
+                    <th>Profile</th>
+                    <th>Minimum</th>
+                    <th>Full</th>
                   </tr>
-                  <tr>
-                    <td>attestation</td>
-                    <td>
-                      <span className="cell-actions">
-                        <DownloadButton filename={`${manifest.manifest_hash}.dsse.json`} data={manifest.dsse_envelope} />
-                        <span className="muted">verify with cosign/openssl against this SBOM's hash</span>
-                      </span>
-                    </td>
-                  </tr>
-                </>
-              ) : (
+                </thead>
+                <tbody>
+                  {manifest.compliance.map((c) => (
+                    <tr key={c.profile_id}>
+                      <td>{c.profile_name}</td>
+                      <td>
+                        <Badge ok={c.meets_minimum}>{c.meets_minimum ? 'meets minimum' : 'below minimum'}</Badge>
+                      </td>
+                      <td>
+                        <Badge ok={c.fully_compliant}>
+                          {c.fully_compliant ? 'fully compliant' : 'not fully compliant'}
+                        </Badge>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </section>
+          )}
+
+          <section className="detail-section">
+            <h3 className="detail-section-title">Metadata</h3>
+            <table className="table sbom-details-table">
+              <tbody>
                 <tr>
-                  <td>signature</td>
+                  <td>status</td>
                   <td>
-                    {manifest.signature ? <Hash value={manifest.signature} chars={24} /> : 'none'}
-                    {' '}<em>(signed under legacy scheme, not third-party verifiable)</em>
+                    <Badge ok={!manifest.revoked}>{manifest.revoked ? 'revoked' : 'active'}</Badge>
                   </td>
                 </tr>
-              )}
-              <tr>
-                <td>created_by</td>
-                <td>{manifest.created_by}</td>
-              </tr>
-              <tr>
-                <td>created_at</td>
-                <td>{new Date(manifest.created_at).toLocaleString()}</td>
-              </tr>
-            </tbody>
-          </table>
+                {manifest.revoked && (
+                  <>
+                    <tr>
+                      <td>revoked_by</td>
+                      <td title={manifest.revoked_by ?? ''}>
+                        {manifest.revoked_by ? shortPrincipal(manifest.revoked_by) : '—'}
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>revoked_at</td>
+                      <td>{manifest.revoked_at ? new Date(manifest.revoked_at).toLocaleString() : '—'}</td>
+                    </tr>
+                  </>
+                )}
+                <tr>
+                  <td>version</td>
+                  <td>{manifest.version}</td>
+                </tr>
+                <tr>
+                  <td>namespace</td>
+                  <td>{manifest.domain}{manifest.namespace}</td>
+                </tr>
+                <tr>
+                  <td>sbom_hash</td>
+                  <td><Hash value={manifest.sbom_hash} chars={24} /></td>
+                </tr>
+                <tr>
+                  <td>previous_manifest_hash</td>
+                  <td>{manifest.previous_manifest_hash ? <Hash value={manifest.previous_manifest_hash} chars={24} /> : 'none (first upload)'}</td>
+                </tr>
+                <tr>
+                  <td>created_by</td>
+                  <td>{manifest.created_by}</td>
+                </tr>
+                <tr>
+                  <td>created_at</td>
+                  <td>{new Date(manifest.created_at).toLocaleString()}</td>
+                </tr>
+              </tbody>
+            </table>
+          </section>
+          <div className="sbom-actions-row">
+            <button className="btn" onClick={() => setShowSignatureModal(true)}>
+              View signature…
+            </button>
+            {manifest.compliance
+              .filter((c) => c.minimum_issues.length > 0 || c.missing_fields.length > 0)
+              .map((c) => (
+                <button key={c.profile_id} className="btn" onClick={() => setComplianceReportFor(c.profile_id)}>
+                  View non-compliance report — {c.profile_name}
+                </button>
+              ))}
+            {!manifest.document_type && (
+              <button className="btn" onClick={loadDiff}>View component diff</button>
+            )}
+            {!manifest.document_type && !reputationDisabledForTenant && manifest.component_reputation.length > 0 && (
+              <button className="btn" onClick={() => setShowComponentReputationModal(true)}>
+                View {reputationSummary.total} component score{reputationSummary.total === 1 ? '' : 's'}…
+              </button>
+            )}
+            {!manifest.document_type && dtrackEnabled && !dtrackSyncDisabled && manifest.vulnerability_findings.length > 0 && (
+              <button className="btn" onClick={() => onViewFindings?.(manifest.manifest_hash)}>
+                View &amp; triage findings →
+              </button>
+            )}
+          </div>
           {complianceReportFor && (() => {
             const c = manifest.compliance.find((p) => p.profile_id === complianceReportFor);
             if (!c) return null;
@@ -1989,6 +2101,81 @@ function SbomDetailPanel({
                   {diff.added.length === 0 && diff.removed.length === 0 && diff.changed.length === 0 && (
                     <span className="muted">No component changes since the previous version.</span>
                   )}
+                </div>
+              )}
+            </Modal>
+          )}
+          {showSignatureModal && (
+            <Modal title="Signature" onClose={() => setShowSignatureModal(false)}>
+              <table className="table signature-table">
+                <tbody>
+                  {manifest.dsse_envelope ? (
+                    <>
+                      <tr>
+                        <td>scheme</td>
+                        <td>DSSE envelope</td>
+                      </tr>
+                      <tr>
+                        <td>payload type</td>
+                        <td><code className="hash">{manifest.dsse_envelope.payloadType}</code></td>
+                      </tr>
+                      {manifest.dsse_envelope.signatures.map((s, i) => (
+                        <React.Fragment key={`${s.keyid}-${i}`}>
+                          <tr>
+                            <td>key id{manifest.dsse_envelope!.signatures.length > 1 ? ` #${i + 1}` : ''}</td>
+                            <td>{s.keyid ? <Hash value={s.keyid} chars={24} /> : <span className="muted">—</span>}</td>
+                          </tr>
+                          <tr>
+                            <td>signature{manifest.dsse_envelope!.signatures.length > 1 ? ` #${i + 1}` : ''}</td>
+                            <td><Hash value={s.sig} chars={24} /></td>
+                          </tr>
+                        </React.Fragment>
+                      ))}
+                      <tr>
+                        <td>signed hash</td>
+                        <td><Hash value={manifest.sbom_hash} chars={24} /></td>
+                      </tr>
+                      <tr>
+                        <td>attestation</td>
+                        <td className="signal-detail muted">
+                          verify with cosign/openssl against this SBOM's hash
+                        </td>
+                      </tr>
+                    </>
+                  ) : (
+                    <>
+                      <tr>
+                        <td>scheme</td>
+                        <td>
+                          legacy{' '}
+                          <span className="muted">(not third-party verifiable)</span>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td>signature</td>
+                        <td>
+                          {manifest.signature ? (
+                            <Hash value={manifest.signature} chars={24} />
+                          ) : (
+                            <span className="muted">none</span>
+                          )}
+                        </td>
+                      </tr>
+                      <tr>
+                        <td>signed hash</td>
+                        <td><Hash value={manifest.sbom_hash} chars={24} /></td>
+                      </tr>
+                    </>
+                  )}
+                </tbody>
+              </table>
+              {manifest.dsse_envelope && (
+                <div className="sbom-actions-row signature-actions">
+                  <DownloadButton
+                    filename={`${manifest.manifest_hash}.dsse.json`}
+                    data={manifest.dsse_envelope}
+                    label="Download signature"
+                  />
                 </div>
               )}
             </Modal>
@@ -2548,10 +2735,21 @@ function writeCurrentlyRunningViewEnabled(enabled: boolean): void {
 }
 
 function Leaves({
-  initialSelectedHash,
+  selectedHash,
+  setSelectedHash,
+  selectedGroup,
+  setSelectedGroup,
   onViewFindings,
 }: {
-  initialSelectedHash?: string;
+  /** Which manifest (if any) is shown in the detail pane, and which
+   * multi-version group (if any) is showing a version picker instead —
+   * both lifted up to `App` rather than local state here, so they survive
+   * `Leaves` unmounting when you switch to another tab and back (App only
+   * renders whichever tab's `tab === '...'` check currently matches). */
+  selectedHash: string | undefined;
+  setSelectedHash: (hash: string | undefined) => void;
+  selectedGroup: Leaf[] | null;
+  setSelectedGroup: (group: Leaf[] | null) => void;
   onViewFindings?: (manifestHash: string) => void;
 }) {
   const tenantId = useTenantOverride();
@@ -2560,22 +2758,14 @@ function Leaves({
   // Drives the namespace tree's active/inactive folder coloring — same
   // admin-curated set Settings → Manage namespace visibility edits.
   const [hiddenNamespaces, setHiddenNamespaces] = useState<Set<string>>(new Set());
-  // Leaves fully remounts each time you switch to this tab (App renders it
-  // conditionally), so this lazy init correctly re-seeds the selection when
-  // jumping here right after an upload, without needing to track/clear a
-  // "consumed" flag.
-  const [selectedHash, setSelectedHash] = useState<string | undefined>(initialSelectedHash);
-  // Set when a multi-version namespace row is clicked — the right pane
-  // shows a version picker instead of jumping straight to a manifest.
-  // Cleared by any selection that already names a specific manifest
-  // directly (search box, table row, "currently running" row, or a
-  // single-version tree row), so a stale "← All versions" link never
-  // points at an unrelated group.
-  const [selectedGroup, setSelectedGroup] = useState<Leaf[] | null>(null);
+  // Any selection that already names one specific manifest directly (search
+  // box, table row, "currently running" row, or a single-version tree row)
+  // clears a stale group so "← All versions" never points at an unrelated
+  // group.
   const selectHash = useCallback((hash: string) => {
     setSelectedGroup(null);
     setSelectedHash(hash);
-  }, []);
+  }, [setSelectedGroup, setSelectedHash]);
   const [view, setView] = useState<'tree' | 'table' | 'current'>('tree');
   const [showRevoked, setShowRevoked] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
@@ -4595,7 +4785,7 @@ function Settings({
 
       <div className="card">
         <div className="card-header">
-          <h2>Package reputation</h2>
+          <h2 title="OpenSSF Scorecard, via deps.dev">Package reputation</h2>
         </div>
         <div className="kv-row">
           <span className="kv-label">Deployment-wide</span>
@@ -4969,12 +5159,12 @@ function ConnectionGate({
 // super_admin (see the whoami-success handler below); otherwise a stale or
 // tampered URL param could make a non-platform key send an override the
 // backend will reject on every request.
-function readUrlState(): { tab: Tab | null; tenant: string | null } {
+function readUrlState(): { tab: Tab | null; tenant: string | null; manifest: string | null } {
   const params = new URLSearchParams(window.location.search);
   const tabParam = params.get('tab');
   const validTabIds: string[] = TABS.map((t) => t.id);
   const tab = tabParam && validTabIds.includes(tabParam) ? (tabParam as Tab) : null;
-  return { tab, tenant: params.get('tenant') };
+  return { tab, tenant: params.get('tenant'), manifest: params.get('manifest') };
 }
 
 export default function App() {
@@ -4982,7 +5172,28 @@ export default function App() {
   const [apiKey, setKey] = useState('');
   const [treeHead, setTreeHead] = useState<TreeHead | null>(null);
   const [headError, setHeadError] = useState('');
-  const [pendingSbomHash, setPendingSbomHash] = useState<string | undefined>(undefined);
+  // The Explorer's "currently viewed SBOM" — lifted up here (not local
+  // state inside Leaves) so it survives Leaves unmounting when you switch
+  // to another tab and back; Leaves would otherwise reset to nothing on
+  // every remount, since App only renders the tab whose `tab === '...'`
+  // check currently matches. Seeded from the URL (see the URL-sync effect
+  // below, which writes it back out under the same `?manifest=` param) so
+  // a copied link lands the recipient on the exact same SBOM, not just the
+  // same tab.
+  const [selectedManifestHash, setSelectedManifestHash] = useState<string | undefined>(
+    () => readUrlState().manifest ?? undefined
+  );
+  // Set when a multi-version namespace row is clicked instead of a single
+  // manifest — see `Leaves`' own doc comment on the same concept, now lifted
+  // alongside `selectedManifestHash` for the same reason.
+  const [selectedManifestGroup, setSelectedManifestGroup] = useState<Leaf[] | null>(null);
+  // Any selection that already names one specific manifest (search box,
+  // table row, "currently running" row, a single-version tree row) clears a
+  // stale group so "← All versions" never points at an unrelated group.
+  const selectManifest = useCallback((hash: string) => {
+    setSelectedManifestGroup(null);
+    setSelectedManifestHash(hash);
+  }, []);
   const [pendingFindingsManifestHash, setPendingFindingsManifestHash] = useState<string | undefined>(undefined);
   const [whoami, setWhoami] = useState<WhoAmI | null>(null);
   const [checkingKey, setCheckingKey] = useState(false);
@@ -5004,9 +5215,12 @@ export default function App() {
   // key may use a tenant override at all.
   const [viewTenantId, setViewTenantId] = useState(() => readUrlState().tenant ?? '');
 
-  // Keeps the URL in sync with the active tab/tenant (via replaceState, so
-  // switching tabs doesn't spam browser history) — makes the current view
-  // bookmarkable, shareable, and refresh-safe.
+  // Keeps the URL in sync with the active tab/tenant/SBOM (via replaceState,
+  // so switching tabs or SBOMs doesn't spam browser history) — makes the
+  // current view bookmarkable, shareable, and refresh-safe. `manifest` is
+  // only ever written while actually on the Explorer tab — it's "the SBOM
+  // this tab is showing," not a fact worth carrying into an unrelated tab's
+  // URL.
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     params.set('tab', tab);
@@ -5015,9 +5229,14 @@ export default function App() {
     } else {
       params.delete('tenant');
     }
+    if (tab === 'leaves' && selectedManifestHash) {
+      params.set('manifest', selectedManifestHash);
+    } else {
+      params.delete('manifest');
+    }
     const newUrl = `${window.location.pathname}?${params.toString()}`;
     window.history.replaceState(null, '', newUrl);
-  }, [tab, viewTenantId]);
+  }, [tab, viewTenantId, selectedManifestHash]);
 
   useEffect(() => {
     try {
@@ -5241,7 +5460,7 @@ export default function App() {
               <Upload
                 onUploaded={(result) => {
                   setTreeHead(result.signed_tree_head);
-                  setPendingSbomHash(result.manifest_hash);
+                  selectManifest(result.manifest_hash);
                   // An upload-only key can't see the Explorer (needs Read)
                   // — nothing to jump to in that case, so stay put.
                   if (roleCan(whoami.role, 'read')) {
@@ -5254,7 +5473,10 @@ export default function App() {
             {tab === 'tools' && roleCan(whoami.role, 'read') && <Tools />}
             {tab === 'leaves' && roleCan(whoami.role, 'read') && (
               <Leaves
-                initialSelectedHash={pendingSbomHash}
+                selectedHash={selectedManifestHash}
+                setSelectedHash={setSelectedManifestHash}
+                selectedGroup={selectedManifestGroup}
+                setSelectedGroup={setSelectedManifestGroup}
                 onViewFindings={(hash) => {
                   setPendingFindingsManifestHash(hash);
                   setTab('findings');
@@ -5265,7 +5487,7 @@ export default function App() {
             {tab === 'search' && roleCan(whoami.role, 'read') && (
               <ComponentSearch
                 onViewManifest={(hash) => {
-                  setPendingSbomHash(hash);
+                  selectManifest(hash);
                   setTab('leaves');
                 }}
               />
@@ -5274,7 +5496,7 @@ export default function App() {
               <Findings
                 initialManifestHash={pendingFindingsManifestHash}
                 onViewManifest={(hash) => {
-                  setPendingSbomHash(hash);
+                  selectManifest(hash);
                   setTab('leaves');
                 }}
               />

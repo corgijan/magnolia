@@ -17,6 +17,17 @@ use magnolia_osv::{OsvClient, PackageQuery};
 /// (ecosystem, name, version) triple, and there's no reliable way to guess an
 /// ecosystem from a bare SBOM component name alone.
 ///
+/// Queries by (ecosystem, name, version) — via `purl_to_osv_ecosystem` —
+/// whenever that's derivable and the component has a version, falling back
+/// to a bare purl query otherwise. Not just a style choice: OSV's purl-based
+/// `querybatch` matching turned out to be unreliable for Go specifically,
+/// verified live against a real `MAL-` entry (MAL-2026-3620,
+/// `github.com/BufferZoneCorp/config-loader`) that a purl query misses but
+/// an ecosystem+name+version query for the exact same package finds — see
+/// `purl_to_osv_ecosystem`'s doc comment for the full repro. Ecosystem+name
+/// querying is used whenever available since it's the proven-reliable path,
+/// not just as a Go-specific special case.
+///
 /// Returns whether the check actually completed (reached OSV and, if there
 /// were hits, stored them) — `false` only for a querybatch/storage failure.
 /// A failed summary fetch for an individual `MAL-` id doesn't count as a
@@ -36,8 +47,7 @@ pub async fn check_and_store_malicious_components(
         return true;
     }
 
-    let queries: Vec<PackageQuery> =
-        purled.iter().map(|c| PackageQuery::by_purl(c.purl.clone().expect("filtered for Some purl above"))).collect();
+    let queries: Vec<PackageQuery> = purled.iter().map(|c| build_query(c)).collect();
 
     let results = match osv.query_batch(&queries).await {
         Ok(r) => r,
@@ -88,6 +98,19 @@ pub async fn check_and_store_malicious_components(
 /// unit-testable on its own.
 fn purled_components(components: &[NewSbomComponent]) -> Vec<&NewSbomComponent> {
     components.iter().filter(|c| c.purl.as_deref().is_some_and(|p| !p.is_empty())).collect()
+}
+
+/// Builds one component's `PackageQuery` — ecosystem+name+version whenever
+/// derivable (the proven-reliable path, see this module's top-level doc
+/// comment), falling back to a bare purl query otherwise. Assumes `c.purl`
+/// is `Some` and non-empty (only ever called on `purled_components`'
+/// output). Pure/no I/O so it's unit-testable on its own.
+fn build_query(c: &NewSbomComponent) -> PackageQuery {
+    let purl = c.purl.clone().expect("build_query called on a component with no purl");
+    match (magnolia_core::purl_to_osv_ecosystem(&purl), c.version.as_deref()) {
+        (Some((ecosystem, name)), Some(version)) => PackageQuery::by_ecosystem(ecosystem, name, version),
+        _ => PackageQuery::by_purl(purl),
+    }
 }
 
 /// Every distinct `MAL-`-prefixed id across all of `results`, in first-seen
@@ -165,6 +188,46 @@ mod tests {
         assert_eq!(purled.len(), 2);
         assert_eq!(purled[0].name, "left-pad");
         assert_eq!(purled[1].name, "requests");
+    }
+
+    #[test]
+    fn build_query_prefers_ecosystem_name_version_for_go() {
+        // MAL-2026-3620's exact shape — purl-based querybatch misses this
+        // real advisory on OSV's side, ecosystem+name+version finds it. See
+        // this module's top-level doc comment for the live repro.
+        let c = NewSbomComponent {
+            name: "config-loader".to_string(),
+            version: Some("v1.0.0".to_string()),
+            purl: Some("pkg:golang/github.com/BufferZoneCorp/config-loader@v1.0.0".to_string()),
+            cpe: None,
+            is_primary: false,
+            ecosystem: None,
+            registry_name: None,
+        };
+
+        assert_eq!(build_query(&c), PackageQuery::by_ecosystem("Go", "github.com/BufferZoneCorp/config-loader", "v1.0.0"));
+    }
+
+    #[test]
+    fn build_query_falls_back_to_purl_when_no_version() {
+        let c = NewSbomComponent {
+            name: "arc".to_string(),
+            version: None,
+            purl: Some("pkg:golang/github.com/basekick-labs/arc".to_string()),
+            cpe: None,
+            is_primary: false,
+            ecosystem: None,
+            registry_name: None,
+        };
+
+        assert_eq!(build_query(&c), PackageQuery::by_purl("pkg:golang/github.com/basekick-labs/arc"));
+    }
+
+    #[test]
+    fn build_query_falls_back_to_purl_for_an_unmapped_ecosystem() {
+        let c = component("libfoo", Some("pkg:deb/debian/libfoo@1.0"));
+
+        assert_eq!(build_query(&c), PackageQuery::by_purl("pkg:deb/debian/libfoo@1.0"));
     }
 
     #[test]

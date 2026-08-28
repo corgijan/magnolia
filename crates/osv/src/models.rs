@@ -1,19 +1,23 @@
 use serde::{Deserialize, Serialize};
 
-/// One query for `POST /v1/querybatch`. Construct via [`PackageQuery::by_purl`]
-/// (preferred — `magnolia-api`'s malicious-package check uses this, since
-/// `sbom_components` already stores purls) or [`PackageQuery::by_ecosystem`]
-/// when only a plain name/version is available. OSV rejects a query carrying
-/// both `version` and a versioned purl (400 Bad Request) — these two
-/// constructors keep that mutually exclusive by construction.
-#[derive(Debug, Clone, Serialize)]
+/// One query for `POST /v1/querybatch`. Construct via
+/// [`PackageQuery::by_ecosystem`] whenever an (ecosystem, name, version)
+/// triple is derivable — `magnolia-api`'s malicious-package check prefers
+/// this over [`PackageQuery::by_purl`] since purl-based matching turned out
+/// to be unreliable for Go (verified live against a real `MAL-` entry; see
+/// `magnolia_core::purl_to_osv_ecosystem`'s doc comment), falling back to
+/// `by_purl` only when ecosystem+name can't be derived or no version is
+/// known. OSV rejects a query carrying both `version` and a versioned purl
+/// (400 Bad Request) — these two constructors keep that mutually exclusive
+/// by construction.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PackageQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
     package: PackageRef,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 struct PackageRef {
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,

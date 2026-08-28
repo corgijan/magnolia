@@ -77,6 +77,58 @@ pub fn purl_to_depsdev_package(purl: &str) -> Option<(&'static str, String)> {
     }
 }
 
+/// Maps a purl onto [OSV](https://osv.dev)'s own `ecosystem` enum
+/// (google.github.io/osv.dev/ecosystems.html) and per-ecosystem package-name
+/// convention — same shape as `purl_to_depsdev_package`, but OSV's
+/// vocabulary differs (`npm`/`PyPI`/`crates.io`/`Go`/`Maven`/`NuGet`/
+/// `RubyGems`, not deps.dev's `NPM`/`PYPI`/`CARGO`/`GO`/`MAVEN`/`NUGET`/
+/// `RUBYGEMS`).
+///
+/// Exists because `OsvClient::query_batch`'s purl-based queries turned out
+/// to be unreliable for Go specifically: verified live against a real
+/// `MAL-` entry (MAL-2026-3620, `github.com/BufferZoneCorp/config-loader`)
+/// — `POST /v1/querybatch` with `{"package":{"purl":
+/// "pkg:golang/github.com/BufferZoneCorp/config-loader@v1.0.0"}}` returns no
+/// match, but the *same* OSV request with `{"package":{"name":
+/// "github.com/BufferZoneCorp/config-loader","ecosystem":"Go"},"version":
+/// "1.0.0"}` finds it immediately, even though `GET /v1/vulns/MAL-2026-3620`
+/// shows that exact purl in its own `affected[].package.purl` field. Purl
+/// matching for Go modules on OSV's side appears to not reliably match its
+/// own malicious-packages feed — an OSV-side inconsistency, not something
+/// fixable here, so `malicious_check.rs` queries by ecosystem+name+version
+/// whenever it can (i.e. whenever this returns `Some` and the component has
+/// a version), falling back to purl-only otherwise. Not re-verified against
+/// every other ecosystem — Go is the one case with live confirmation either
+/// way.
+pub fn purl_to_osv_ecosystem(purl: &str) -> Option<(&'static str, String)> {
+    let p = parse_purl(purl)?;
+    match p.purl_type.as_str() {
+        "npm" => {
+            let name = match p.namespace {
+                Some(ns) => format!("@{ns}/{}", p.name),
+                None => p.name,
+            };
+            Some(("npm", name))
+        }
+        "pypi" => Some(("PyPI", p.name)),
+        "cargo" => Some(("crates.io", p.name)),
+        "golang" => {
+            let name = match p.namespace {
+                Some(ns) => format!("{ns}/{}", p.name),
+                None => p.name,
+            };
+            Some(("Go", name))
+        }
+        "maven" => {
+            let group = p.namespace?;
+            Some(("Maven", format!("{group}:{}", p.name)))
+        }
+        "nuget" => Some(("NuGet", p.name)),
+        "gem" => Some(("RubyGems", p.name)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +198,55 @@ mod tests {
         let p = parse_purl("pkg:npm/lodash@4.17.21?foo=bar#sub/path").unwrap();
         assert_eq!(p.purl_type, "npm");
         assert_eq!(p.name, "lodash");
+    }
+
+    #[test]
+    fn osv_go_module_path_matches_the_real_mal_advisory_case() {
+        // MAL-2026-3620 — verified live against OSV during testing.
+        assert_eq!(
+            purl_to_osv_ecosystem("pkg:golang/github.com/BufferZoneCorp/config-loader@v1.0.0"),
+            Some(("Go", "github.com/BufferZoneCorp/config-loader".to_string()))
+        );
+    }
+
+    #[test]
+    fn osv_npm_scoped_package() {
+        assert_eq!(
+            purl_to_osv_ecosystem("pkg:npm/angular/animation@12.3.1"),
+            Some(("npm", "@angular/animation".to_string()))
+        );
+    }
+
+    #[test]
+    fn osv_pypi_package() {
+        assert_eq!(purl_to_osv_ecosystem("pkg:pypi/requests@2.31.0"), Some(("PyPI", "requests".to_string())));
+    }
+
+    #[test]
+    fn osv_cargo_package() {
+        assert_eq!(purl_to_osv_ecosystem("pkg:cargo/serde@1.0.0"), Some(("crates.io", "serde".to_string())));
+    }
+
+    #[test]
+    fn osv_maven_group_and_artifact() {
+        assert_eq!(
+            purl_to_osv_ecosystem("pkg:maven/com.google.guava/guava@31.1-jre"),
+            Some(("Maven", "com.google.guava:guava".to_string()))
+        );
+    }
+
+    #[test]
+    fn osv_nuget_package() {
+        assert_eq!(purl_to_osv_ecosystem("pkg:nuget/Newtonsoft.Json@13.0.1"), Some(("NuGet", "Newtonsoft.Json".to_string())));
+    }
+
+    #[test]
+    fn osv_gem_package() {
+        assert_eq!(purl_to_osv_ecosystem("pkg:gem/rails@7.0.0"), Some(("RubyGems", "rails".to_string())));
+    }
+
+    #[test]
+    fn osv_unsupported_type_returns_none() {
+        assert_eq!(purl_to_osv_ecosystem("pkg:deb/debian/curl@7.74.0"), None);
     }
 }
