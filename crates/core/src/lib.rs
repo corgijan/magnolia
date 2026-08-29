@@ -21,7 +21,10 @@ pub use compliance::{
     profile_by_id, registered_profiles, ComplianceProfile, ComplianceReport,
 };
 pub use component_index::{extract_components, ExtractedComponent};
-pub use license::{evaluate_license_policy, normalize_license_expr, LicensePolicy, LicenseViolation, LicenseViolationReason};
+pub use license::{
+    evaluate_license_policy, is_valid_spdx_license_id, normalize_license_expr, LicensePolicy, LicenseViolation,
+    LicenseViolationReason,
+};
 pub use freshness::{classify_freshness, FreshnessStatus};
 pub use purl::{purl_to_depsdev_package, purl_to_osv_ecosystem};
 pub use vex_import::{parse_openvex, VexStatement};

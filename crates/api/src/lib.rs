@@ -123,7 +123,9 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/namespaces/registered",
-            get(handlers::list_registered_namespaces).post(handlers::create_namespace),
+            get(handlers::list_registered_namespaces)
+                .post(handlers::create_namespace)
+                .delete(handlers::delete_namespace),
         )
         .route(
             "/api/v1/compliance/profiles",

@@ -42,6 +42,23 @@ set -euo pipefail
 #                          fallback order below)
 #   --file=PATH           path to the Magnoliafile (default: search upward
 #                          from $PWD)
+#   --json                verify only: print the raw /verify JSON response
+#                          on stdout instead of the human-readable summary
+#                          (still exits non-zero on a "fail" verdict). All
+#                          progress/banner lines go to stderr regardless of
+#                          this flag, so stdout is safe to pipe into jq even
+#                          without --json for `upload` (whose success output
+#                          is already raw JSON).
+#   --verbose             verify only, human-readable mode: print every
+#                          check's full status/enforce_level/details, pass
+#                          and fail alike. Without it, only a terse
+#                          "<check-id> failed" line per failing check is
+#                          printed, right before the final
+#                          "verdict: pass|fail" line; a passing verdict
+#                          then prints nothing but that one line. The exit
+#                          code always reflects the verdict either way. No
+#                          effect with --json, which already prints
+#                          everything.
 #
 # tenant_domain is REQUIRED (in the Magnoliafile or via --tenant-domain) --
 # a human-readable domain (e.g. acme.example), not a UUID -- the script
@@ -87,6 +104,8 @@ SBOM=""
 FORMAT=""
 VERSION=""
 MAGNOLIAFILE=""
+JSON=""
+VERBOSE=""
 
 for arg in "$@"; do
   case "$arg" in
@@ -97,6 +116,8 @@ for arg in "$@"; do
     --format=*)     FORMAT="${arg#--format=}" ;;
     --version=*)    VERSION="${arg#--version=}" ;;
     --file=*)       MAGNOLIAFILE="${arg#--file=}" ;;
+    --json)         JSON="1" ;;
+    --verbose)      VERBOSE="1" ;;
     -h|--help)
       # Every leading `#` comment line after the shebang, stopping at the
       # first non-comment line -- self-maintaining as the header above
@@ -227,7 +248,7 @@ else
 fi
 
 if [ "$MODE" = "upload" ]; then
-  echo "==> uploading $SBOM to ${TENANT_URL}${NAMESPACE} @ $VERSION ($FORMAT) [tenant_domain=$TENANT_DOMAIN]"
+  echo "==> uploading $SBOM to ${TENANT_URL}${NAMESPACE} @ $VERSION ($FORMAT) [tenant_domain=$TENANT_DOMAIN]" >&2
   RESP="$(curl -sS -w '\n%{http_code}' -X POST "$TARGET_URL" \
     -H "Authorization: Bearer $MAGNOLIA_API_KEY" \
     -F "sbom_file=@${SBOM}" \
@@ -246,7 +267,7 @@ if [ "$MODE" = "upload" ]; then
 fi
 
 # --- verify: dry-run policy gate, no storage --------------------------
-echo "==> verifying $SBOM against ${TENANT_URL} ($FORMAT) [tenant_domain=$TENANT_DOMAIN]"
+echo "==> verifying $SBOM against ${TENANT_URL} ($FORMAT) [tenant_domain=$TENANT_DOMAIN]" >&2
 RESP="$(curl -sS -w '\n%{http_code}' -X POST "$TARGET_URL" \
   -H "Authorization: Bearer $MAGNOLIA_API_KEY" \
   -F "sbom_file=@${SBOM}" \
@@ -259,13 +280,26 @@ if [ "$STATUS" != "200" ]; then
   exit 1
 fi
 
+if [ -n "$JSON" ]; then
+  printf '%s\n' "$BODY"
+  VERDICT="$(printf '%s' "$BODY" | python3 -c "import json, sys; print(json.load(sys.stdin)['verdict'])")"
+  [ "$VERDICT" = "pass" ]
+  exit $?
+fi
+
 printf '%s' "$BODY" | python3 -c "
 import json, sys
 result = json.load(sys.stdin)
-for check in result['checks']:
-    print(f\"[{check['status']:^13}] {check['id']} (enforce_level={check['enforce_level']})\")
-    for detail in check['details']:
-        print(f'    - {detail}')
+verbose = sys.argv[1] == '1'
+if verbose:
+    for check in result['checks']:
+        print(f\"[{check['status']:^13}] {check['id']} (enforce_level={check['enforce_level']})\")
+        for detail in check['details']:
+            print(f'    - {detail}')
+else:
+    for check in result['checks']:
+        if check['status'] == 'fail':
+            print(f\"{check['id']} failed\")
 print(f\"verdict: {result['verdict']}\")
 sys.exit(0 if result['verdict'] == 'pass' else 1)
-"
+" "${VERBOSE:-0}"

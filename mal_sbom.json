@@ -24,6 +24,19 @@
       "name": "config-loader",
       "version": "v1.0.0",
       "purl": "pkg:golang/github.com/BufferZoneCorp/config-loader@v1.0.0"
+    },
+    {
+      "type": "library",
+      "name": "lodash",
+      "version": "4.17.21",
+      "purl": "pkg:npm/lodash@4.17.21",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
     }
   ]
 }

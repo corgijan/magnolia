@@ -4995,6 +4995,8 @@ function Settings({
   const [newNamespaceInput, setNewNamespaceInput] = useState('');
   const [createNamespaceBusy, setCreateNamespaceBusy] = useState(false);
   const [createNamespaceError, setCreateNamespaceError] = useState('');
+  const [deleteNamespaceBusy, setDeleteNamespaceBusy] = useState<string | null>(null);
+  const [deleteNamespaceError, setDeleteNamespaceError] = useState('');
 
   const loadRegisteredNamespaces = useCallback(() => {
     api.listRegisteredNamespaces(tenantId)
@@ -5203,6 +5205,19 @@ function Settings({
       setCreateNamespaceError(e instanceof Error ? e.message : String(e));
     } finally {
       setCreateNamespaceBusy(false);
+    }
+  };
+
+  const handleDeleteNamespace = async (namespace: string) => {
+    setDeleteNamespaceBusy(namespace);
+    setDeleteNamespaceError('');
+    try {
+      await api.deleteNamespace(namespace, tenantId);
+      loadRegisteredNamespaces();
+    } catch (e) {
+      setDeleteNamespaceError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDeleteNamespaceBusy(null);
     }
   };
 
@@ -5456,6 +5471,7 @@ function Settings({
         </div>
         {createNamespaceError && <ErrorBox message={createNamespaceError} />}
         {registeredNamespacesError && <ErrorBox message={registeredNamespacesError} />}
+        {deleteNamespaceError && <ErrorBox message={deleteNamespaceError} />}
         {registeredNamespaces !== null && registeredNamespaces.length > 0 && (
           <table className="table">
             <thead>
@@ -5463,6 +5479,7 @@ function Settings({
                 <th>Namespace</th>
                 <th>Created by</th>
                 <th>Created at</th>
+                <th></th>
               </tr>
             </thead>
             <tbody>
@@ -5476,6 +5493,15 @@ function Settings({
                   </td>
                   <td className="muted">{shortPrincipal(n.created_by)}</td>
                   <td className="muted">{new Date(n.created_at).toLocaleString()}</td>
+                  <td>
+                    <button
+                      className="btn"
+                      disabled={deleteNamespaceBusy === n.namespace}
+                      onClick={() => handleDeleteNamespace(n.namespace)}
+                    >
+                      {deleteNamespaceBusy === n.namespace ? 'Removing…' : 'Remove'}
+                    </button>
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -5572,6 +5598,20 @@ function Settings({
           license info" option below to flag them instead. This affects every uploader on the tenant, not
           just you.
         </p>
+        <p className="muted">
+          Identifiers must match the{' '}
+          <a href="https://spdx.org/licenses/" target="_blank" rel="noreferrer">
+            SPDX license list
+          </a>{' '}
+          exactly (case-sensitive). Common copyleft/deny-list examples: strong copyleft —{' '}
+          <code>GPL-2.0-only</code>, <code>GPL-3.0-only</code>, <code>AGPL-3.0-only</code>; weak
+          copyleft — <code>LGPL-2.1-only</code>, <code>LGPL-3.0-only</code>, <code>MPL-2.0</code>;
+          source-available/non-OSI — <code>SSPL-1.0</code>, <code>BUSL-1.1</code>,{' '}
+          <code>Elastic-2.0</code>; non-commercial — <code>CC-BY-NC-4.0</code>. Use the{' '}
+          <code>-only</code>/<code>-or-later</code> suffix that matches your policy (e.g. deny{' '}
+          <code>GPL-3.0-only</code> without also denying <code>GPL-3.0-or-later</code>, or vice versa,
+          if you want to distinguish them).
+        </p>
         {licensePolicyError && <ErrorBox message={licensePolicyError} />}
         {licensePolicy === null && !licensePolicyError && <Spinner label="Loading license policy…" />}
         {licensePolicy !== null && (
@@ -5589,7 +5629,7 @@ function Settings({
                       .filter((s) => s.length > 0),
                   })
                 }
-                placeholder="GPL-3.0-only, AGPL-3.0-only"
+                placeholder="GPL-3.0-only, AGPL-3.0-only, SSPL-1.0"
                 disabled={licensePolicyBusy}
               />
             </label>

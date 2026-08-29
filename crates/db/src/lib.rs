@@ -843,6 +843,21 @@ impl Database {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Un-registers one namespace. Returns `false` (not an error) if it
+    /// wasn't registered to begin with — same idempotent shape as
+    /// `create_namespace`. The only way to recover from registering the
+    /// wrong namespace (a typo, most commonly) once `require_namespace_registration`
+    /// is on, since a registered namespace otherwise has no expiry.
+    pub async fn delete_namespace(&self, tenant_id: Uuid, namespace: &str) -> Result<bool, DbError> {
+        let result = sqlx::query("DELETE FROM registered_namespaces WHERE tenant_id = $1 AND namespace = $2")
+            .bind(tenant_id)
+            .bind(namespace)
+            .execute(&self.pool)
+            .await
+            .map_err(map_query_error)?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Exact-match existence check, used by `upload_sbom` when this tenant
     /// has `require_namespace_registration` set — deliberately not a
     /// prefix/scope match like the listing/read methods above: a namespace

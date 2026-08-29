@@ -875,6 +875,11 @@ export const api = {
       body: JSON.stringify({ namespace }),
     }),
 
+  deleteNamespace: (namespace: string, tenantId?: string): Promise<void> =>
+    request(`/api/v1/namespaces/registered${tenantQs(tenantId, { namespace })}`, {
+      method: 'DELETE',
+    }),
+
   complianceProfiles: (): Promise<ComplianceProfileInfo[]> =>
     request('/api/v1/compliance/profiles'),
 

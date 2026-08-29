@@ -58,6 +58,21 @@ pub fn normalize_license_expr(expr: &str) -> Vec<String> {
     }
 }
 
+/// Whether `id` is a recognized SPDX license identifier — an exact,
+/// case-sensitive match against the same license list
+/// `spdx::Expression::parse` resolves compound expressions against (the
+/// `+`/`-or-later` suffix conventions included). Used to validate a
+/// tenant's deny-list entries at policy-save time: the Settings page's own
+/// copy tells an admin denied licenses must be SPDX identifiers, so a typo
+/// should be caught immediately rather than silently matching nothing
+/// forever. Deliberately not used by `normalize_license_expr` above, which
+/// stays lenient about a *component's* license text (SBOMs commonly carry
+/// free-text/non-SPDX strings there, and dropping them would lose real
+/// deny-list matches for opaque strings a tenant explicitly listed).
+pub fn is_valid_spdx_license_id(id: &str) -> bool {
+    spdx::license_id(id).is_some()
+}
+
 /// Pure policy check — no I/O, no knowledge of upload/verify call sites, so
 /// it can run identically at upload time (blocking when `enforce_level` is
 /// `block`) and inside `/verify`'s dry-run gate.
@@ -123,6 +138,26 @@ mod tests {
     #[test]
     fn normalize_falls_back_to_opaque_string_for_free_text() {
         assert_eq!(normalize_license_expr("Acme Proprietary License"), vec!["Acme Proprietary License".to_string()]);
+    }
+
+    #[test]
+    fn spdx_id_validation_accepts_known_identifiers() {
+        assert!(is_valid_spdx_license_id("MIT"));
+        assert!(is_valid_spdx_license_id("GPL-3.0-only"));
+        assert!(is_valid_spdx_license_id("AGPL-3.0-only"));
+    }
+
+    #[test]
+    fn spdx_id_validation_is_case_sensitive() {
+        assert!(!is_valid_spdx_license_id("mit"));
+        assert!(!is_valid_spdx_license_id("Gpl-3.0-Only"));
+    }
+
+    #[test]
+    fn spdx_id_validation_rejects_free_text_and_compound_expressions() {
+        assert!(!is_valid_spdx_license_id("Acme Proprietary License"));
+        assert!(!is_valid_spdx_license_id("MIT OR Apache-2.0"));
+        assert!(!is_valid_spdx_license_id(""));
     }
 
     #[test]

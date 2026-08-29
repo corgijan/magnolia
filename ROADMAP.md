@@ -169,3 +169,18 @@ findings.
 ## Status log
 
 - 2026-08-29 — Roadmap created.
+- 2026-08-29 — **All six features implemented** (commit `3d11f6b`): `/verify`
+  CI gate + `magnolia-upload.sh` verify support, webhooks
+  (`webhooks.rs` + outbox migration + test/deliveries endpoints), VEX import
+  (`core/vex_import.rs`, `triage_source` migration), blast radius
+  (`/components/affected`, `/vulnerabilities/:id/affected`), license
+  compliance (`core/license.rs`, `license_expr` + `tenant_license_policies`
+  migrations), freshness/EOL (`core/freshness.rs`, `freshness_sync.rs`,
+  `component_freshness` migration). 144 unit tests green, `tsc` clean,
+  eslint-breaking unused imports removed.
+- Open verification gaps: no DB-level tests (sqlx queries in the five new
+  migrations/queries only fail at runtime — needs a live-stack smoke test);
+  new endpoints and frontend panels not yet exercised against a running
+  deployment; webhook delivery never tested against a real receiver; no
+  security review of the new surface (webhook SSRF guard, HMAC signing,
+  `/verify` auth, VEX overwrite semantics) yet.

@@ -1564,6 +1564,39 @@ pub async fn create_namespace(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(serde::Deserialize)]
+pub struct DeleteNamespaceQuery {
+    pub namespace: String,
+    pub tenant_id: Option<Uuid>,
+}
+
+/// Un-registers a namespace — the only way back once a wrong one (a typo,
+/// most commonly) was registered and `require_namespace_registration` is
+/// on: it would otherwise sit there forever, blocking the *correct*
+/// namespace with no indication why, since `create_namespace` has no
+/// expiry and no uniqueness check against near-misses. Same gate as
+/// `create_namespace`. Idempotent: deleting an unregistered namespace
+/// succeeds without error, same "nothing actionable differs either way"
+/// reasoning that function's own doc comment gives.
+pub async fn delete_namespace(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<DeleteNamespaceQuery>,
+) -> Result<StatusCode, ApiError> {
+    require(&grant, Action::ManageSettings, &grant.namespace_scope)?;
+    let namespace = normalize_namespace(&q.namespace)?;
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    if !cross_tenant && !magnolia_auth::namespace_in_scope(&namespace, &grant.namespace_scope) {
+        return Err(ApiError::Forbidden("namespace out of scope".to_string()));
+    }
+
+    state.db.delete_namespace(tenant_id, &namespace).await.map_err(db_err)?;
+
+    let _ = record_audit(&state, &grant, "namespace_delete", &namespace, true, None).await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[derive(serde::Serialize)]
 pub struct SigningKeyJson {
     pub algorithm: String,
@@ -1735,8 +1768,20 @@ pub async fn upload_sbom(
     if tenant_record.require_namespace_registration
         && !state.db.namespace_is_registered(tenant_id, &namespace).await.map_err(db_err)?
     {
+        // Names the tenant's actual registered namespaces rather than just
+        // rejecting -- a bare "not registered" message gives no way to spot
+        // a typo (e.g. registering "/tets" and then trying to upload to
+        // "/test"), which otherwise looks exactly like a stuck/broken
+        // upload from the caller's side.
+        let registered = state.db.list_registered_namespaces(tenant_id, "/").await.map_err(db_err)?;
+        let hint = if registered.is_empty() {
+            "no namespaces are registered for this tenant yet".to_string()
+        } else {
+            let names: Vec<&str> = registered.iter().map(|r| r.namespace.as_str()).take(20).collect();
+            format!("registered namespaces: {}", names.join(", "))
+        };
         return Err(ApiError::BadRequest(format!(
-            "namespace '{namespace}' has not been registered for this tenant; create it first (see Settings)"
+            "namespace '{namespace}' has not been registered for this tenant ({hint}); create it first, or check for a typo (see Settings)"
         )));
     }
 
@@ -3456,6 +3501,17 @@ pub async fn set_license_policy(
     }
     let denied_licenses: Vec<String> =
         body.denied_licenses.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let invalid: Vec<&str> = denied_licenses
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !magnolia_core::is_valid_spdx_license_id(id))
+        .collect();
+    if !invalid.is_empty() {
+        return Err(ApiError::BadRequest(format!(
+            "not a recognized SPDX license identifier (case-sensitive): {}",
+            invalid.join(", ")
+        )));
+    }
     let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
     state
         .db
