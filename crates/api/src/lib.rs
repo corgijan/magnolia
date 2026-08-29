@@ -1,5 +1,6 @@
 mod dtrack_sync;
 mod errors;
+mod freshness_sync;
 mod handlers;
 mod malicious_check;
 mod malicious_sync;
@@ -8,16 +9,20 @@ mod reputation_sync;
 mod snapshot;
 mod state;
 mod auth;
+mod sync_loop;
+mod webhooks;
 
 pub use dtrack_sync::{run_sync_loop, sync_now};
 pub use errors::ApiError;
+pub use freshness_sync::run_freshness_sync_loop;
 pub use malicious_sync::run_malicious_sync_loop;
 pub use reputation_sync::run_reputation_sync_loop;
 pub use state::AppState;
 pub use auth::AuthGrant;
+pub use webhooks::run_webhook_delivery_loop;
 
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -40,6 +45,12 @@ pub fn create_router(state: AppState) -> Router {
             )),
         )
         .route(
+            "/api/v1/verify",
+            post(handlers::verify_sbom).layer(DefaultBodyLimit::max(
+                handlers::MAX_SBOM_BYTES + 64 * 1024,
+            )),
+        )
+        .route(
             "/api/v1/tree-head/latest",
             get(handlers::tree_head_latest),
         )
@@ -58,6 +69,12 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/leaves", get(handlers::leaves))
         .route("/api/v1/manifest/:manifest_hash", get(handlers::manifest))
         .route("/api/v1/manifest/:manifest_hash/vex", get(handlers::manifest_vex))
+        .route(
+            "/api/v1/manifest/:manifest_hash/vex/import",
+            post(handlers::import_manifest_vex).layer(DefaultBodyLimit::max(
+                handlers::MAX_SBOM_BYTES + 64 * 1024,
+            )),
+        )
         .route("/api/v1/manifest/:manifest_hash/diff", get(handlers::manifest_diff))
         .route("/api/v1/namespaces/manifests", get(handlers::namespace_manifest_versions))
         .route(
@@ -93,6 +110,10 @@ pub fn create_router(state: AppState) -> Router {
             get(handlers::reputation_tenant_setting).post(handlers::set_reputation_tenant_setting),
         )
         .route(
+            "/api/v1/settings/freshness",
+            get(handlers::freshness_tenant_setting).post(handlers::set_freshness_tenant_setting),
+        )
+        .route(
             "/api/v1/settings/malicious-check",
             get(handlers::malicious_check_tenant_setting).post(handlers::set_malicious_check_tenant_setting),
         )
@@ -109,14 +130,12 @@ pub fn create_router(state: AppState) -> Router {
             get(handlers::list_compliance_profiles),
         )
         .route(
-            "/api/v1/tools/compliance-check",
-            post(handlers::check_compliance).layer(DefaultBodyLimit::max(
-                handlers::MAX_SBOM_BYTES + 64 * 1024,
-            )),
-        )
-        .route(
             "/api/v1/compliance/settings",
             get(handlers::compliance_settings).post(handlers::set_compliance_setting),
+        )
+        .route(
+            "/api/v1/settings/license-policy",
+            get(handlers::license_policy).post(handlers::set_license_policy),
         )
         .route("/api/v1/snapshot", post(handlers::snapshot))
         .route(
@@ -127,11 +146,21 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/search/reindex",
             post(handlers::reindex_components),
         )
+        .route(
+            "/api/v1/components/affected",
+            get(handlers::components_affected),
+        )
+        .route(
+            "/api/v1/vulnerabilities/:vuln_id/affected",
+            get(handlers::vulnerability_affected),
+        )
         .route("/api/v1/findings", get(handlers::list_findings))
         .route("/api/v1/dtrack/sync", post(handlers::force_dtrack_sync))
         .route("/api/v1/reputation/sync", post(handlers::force_reputation_sync))
         .route("/api/v1/reputation/status", get(handlers::reputation_status))
         .route("/api/v1/reputation/components", get(handlers::reputation_components))
+        .route("/api/v1/freshness/sync", post(handlers::force_freshness_sync))
+        .route("/api/v1/freshness/status", get(handlers::freshness_status))
         .route("/api/v1/malicious/sync", post(handlers::force_malicious_sync))
         .route("/api/v1/malicious/status", get(handlers::malicious_check_status))
         .route(
@@ -145,6 +174,16 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/v1/tenants/:tenant_id", delete(handlers::delete_tenant))
         .route("/api/v1/audit-logs", get(handlers::audit_logs))
+        .route(
+            "/api/v1/webhooks",
+            get(handlers::list_webhooks).post(handlers::create_webhook),
+        )
+        .route(
+            "/api/v1/webhooks/:id",
+            patch(handlers::update_webhook).delete(handlers::delete_webhook),
+        )
+        .route("/api/v1/webhooks/:id/test", post(handlers::test_webhook))
+        .route("/api/v1/webhooks/:id/deliveries", get(handlers::webhook_deliveries))
         .layer(cors)
         .with_state(state)
 }

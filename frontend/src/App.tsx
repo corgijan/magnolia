@@ -1,12 +1,12 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import {
   api,
+  AffectedManifest,
   ApiHttpError,
   ApiKeyInfo,
   AuditEntry,
   ConsistencyProof,
   BackendConfig,
-  ComplianceReport,
   ComplianceSetting,
   ComponentSearchResult,
   CreateKeyResponse,
@@ -15,8 +15,11 @@ import {
   DtrackSyncResult,
   FindingComment,
   FindingWithContext,
+  FreshnessStatus,
+  FreshnessSyncResult,
   InclusionProof,
   Leaf,
+  LicensePolicy,
   MaliciousCheckStatus,
   MaliciousSyncResult,
   Manifest,
@@ -33,7 +36,15 @@ import {
   TreeHead,
   UploadResult,
   VEX_JUSTIFICATIONS,
+  VerifyCheck,
+  VerifyResult,
+  VexImportResult,
   VulnerabilityFinding,
+  WEBHOOK_EVENT_TYPES,
+  CreateWebhookResult,
+  WebhookDelivery,
+  WebhookEndpoint,
+  WebhookTestResult,
   WhoAmI,
 } from './api';
 import {
@@ -656,20 +667,30 @@ function Upload({
 
 // ---------- Tools (standalone compliance check, nothing archived) ----------
 
-function Tools() {
+// Status label -> badge tone. "warn" and "not_evaluated" both render as
+// neutral/attention (not the hard red of "fail") — neither one means the
+// equivalent upload would have been rejected.
+function verifyStatusOk(status: VerifyCheck['status']): boolean {
+  return status === 'pass';
+}
+
+function VerifyGateCheck() {
+  const tenantId = useTenantOverride();
   const [file, setFile] = useState<File | null>(null);
   const [format, setFormat] = useState<'cyclonedx' | 'spdx'>('cyclonedx');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const [reports, setReports] = useState<ComplianceReport[] | null>(null);
+  const [result, setResult] = useState<VerifyResult | null>(null);
+  const [detailsFor, setDetailsFor] = useState<string | null>(null);
 
-  const check = async () => {
+  const verify = async () => {
     if (!file) return;
     setBusy(true);
     setError('');
-    setReports(null);
+    setResult(null);
+    setDetailsFor(null);
     try {
-      setReports(await api.checkCompliance(file, format));
+      setResult(await api.verifySbom(file, format, tenantId));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -677,13 +698,24 @@ function Tools() {
     }
   };
 
+  const detailsCheck = result?.checks.find((c) => c.id === detailsFor) ?? null;
+  const [complianceDetailsFor, setComplianceDetailsFor] = useState<string | null>(null);
+  const complianceDetails = result?.compliance.find((c) => c.profile_id === complianceDetailsFor) ?? null;
+  const nonComplianceChecks = result?.checks.filter((c) => !c.id.startsWith('compliance:')) ?? [];
+
   return (
     <div className="card">
-      <h2>Tools</h2>
+      <h2>Check an SBOM (CI policy gate)</h2>
       <p className="muted">
-        Check whether an SBOM meets compliance requirements — BSI TR-03183, NTIA minimum
-        elements — before uploading it for real. Nothing checked here is stored, indexed, or
-        added to the Merkle log; it's a scratch check, not an upload.
+        Runs the same schema, compliance-profile, and license-policy checks a real upload would
+        enforce for this tenant, plus a synchronous malicious-package check — nothing here is stored,
+        indexed, or added to the Merkle log. This is what <code>magnolia-upload.sh verify</code> calls
+        from CI; use this page to preview the same result by hand. Every registered compliance
+        profile (BSI TR-03183, NTIA minimum elements) and this tenant's configured license policy
+        are always previewed here, even when a profile isn't enabled or a policy's enforce_level is
+        "off" (Settings → Compliance checks / License policy) — those checks can still "warn" from
+        real findings but never flip the verdict unless actually enforced. Package reputation and
+        Dependency-Track findings are asynchronous and always report "not evaluated" here.
       </p>
       <label className="field">
         <span>File</span>
@@ -691,7 +723,7 @@ function Tools() {
           type="file"
           onChange={(e) => {
             setFile(e.target.files ? e.target.files[0] : null);
-            setReports(null);
+            setResult(null);
           }}
         />
       </label>
@@ -702,56 +734,140 @@ function Tools() {
           <option value="spdx">SPDX (JSON)</option>
         </select>
       </label>
-      <button className="btn primary" disabled={!file || busy} onClick={check}>
-        {busy ? 'Checking…' : 'Check compliance'}
+      <button className="btn primary" disabled={!file || busy} onClick={verify}>
+        {busy ? 'Verifying…' : 'Run policy gate'}
       </button>
       {error && <ErrorBox message={error} />}
-      {reports && reports.length === 0 && (
-        <div className="muted" style={{ marginTop: 12 }}>
-          No compliance profile applies to this format.
+      {result && (
+        <div style={{ marginTop: 12 }}>
+          <div className="cell-actions" style={{ marginBottom: 8 }}>
+            <strong>Verdict:</strong>
+            <Badge ok={result.verdict === 'pass'}>{result.verdict}</Badge>
+          </div>
+          <table className="table">
+            <thead>
+              <tr>
+                <th>check</th>
+                <th>status</th>
+                <th>enforce_level</th>
+                <th>details</th>
+              </tr>
+            </thead>
+            <tbody>
+              {nonComplianceChecks.map((c) => (
+                <tr key={c.id}>
+                  <td>{c.id}</td>
+                  <td>
+                    <Badge ok={verifyStatusOk(c.status)}>{c.status}</Badge>
+                  </td>
+                  <td className="muted">{c.enforce_level}</td>
+                  <td className="signal-detail">
+                    {c.details.length === 0 ? (
+                      <span className="muted">—</span>
+                    ) : (
+                      <button className="btn" onClick={() => setDetailsFor(c.id)}>
+                        View details ({c.details.length})
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+
+          {result.compliance.length > 0 && (
+            <>
+              <div style={{ marginTop: 20, marginBottom: 8 }}>
+                <strong>Compliance profiles</strong>
+                <span className="muted"> — minimum vs. full compliance, per profile.</span>
+              </div>
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>profile</th>
+                    <th>enforce_level</th>
+                    <th>minimum</th>
+                    <th>fully compliant</th>
+                    <th>details</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {result.compliance.map((c) => {
+                    const hasIssues = c.minimum_issues.length > 0 || c.missing_fields.length > 0;
+                    return (
+                      <tr key={c.profile_id}>
+                        <td>{c.profile_name}</td>
+                        <td className="muted">{c.enforce_level}</td>
+                        <td>
+                          <Badge ok={c.meets_minimum}>{c.meets_minimum ? 'meets minimum' : 'below minimum'}</Badge>
+                        </td>
+                        <td>
+                          <Badge ok={c.fully_compliant}>
+                            {c.fully_compliant ? 'fully compliant' : 'not fully compliant'}
+                          </Badge>
+                        </td>
+                        <td className="signal-detail">
+                          {hasIssues ? (
+                            <button className="btn" onClick={() => setComplianceDetailsFor(c.profile_id)}>
+                              View details
+                            </button>
+                          ) : (
+                            <span className="muted">—</span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </>
+          )}
         </div>
       )}
-      {reports && reports.length > 0 && (
-        <div className="compliance-block">
-          {reports.map((r) => {
-            const hasIssues = r.minimum_issues.length > 0 || r.missing_fields.length > 0;
-            return (
-              <div key={r.profile_id} className="compliance-profile">
-                <div className="cell-actions">
-                  <strong>{r.profile_name}</strong>
-                  <Badge ok={r.meets_minimum}>{r.meets_minimum ? 'meets minimum' : 'below minimum'}</Badge>
-                  <Badge ok={r.fully_compliant}>
-                    {r.fully_compliant ? 'fully compliant' : 'not fully compliant'}
-                  </Badge>
-                </div>
-                {r.minimum_issues.length > 0 && (
-                  <div className="muted">
-                    Missing for minimum compliance:
-                    <ul>
-                      {r.minimum_issues.map((m, i) => (
-                        <li key={i}>{m}</li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-                {r.meets_minimum && !r.fully_compliant && r.missing_fields.length > 0 && (
-                  <div className="muted">
-                    Missing for full compliance:
-                    <ul>
-                      {r.missing_fields.map((m, i) => (
-                        <li key={i}>{m}</li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-                {!hasIssues && <div className="muted">No issues found.</div>}
+      {detailsCheck && (
+        <Modal title={`Details — ${detailsCheck.id}`} onClose={() => setDetailsFor(null)}>
+          <ul style={{ margin: 0, paddingLeft: 18 }}>
+            {detailsCheck.details.map((d, i) => (
+              <li key={i}>{d}</li>
+            ))}
+          </ul>
+        </Modal>
+      )}
+      {complianceDetails && (
+        <Modal
+          title={`Compliance details — ${complianceDetails.profile_name}`}
+          onClose={() => setComplianceDetailsFor(null)}
+        >
+          {complianceDetails.minimum_issues.length > 0 && (
+            <div className="muted">
+              Missing for minimum compliance:
+              <ul>
+                {complianceDetails.minimum_issues.map((m, i) => (
+                  <li key={i}>{m}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {complianceDetails.meets_minimum &&
+            !complianceDetails.fully_compliant &&
+            complianceDetails.missing_fields.length > 0 && (
+              <div className="muted">
+                Missing for full compliance:
+                <ul>
+                  {complianceDetails.missing_fields.map((m, i) => (
+                    <li key={i}>{m}</li>
+                  ))}
+                </ul>
               </div>
-            );
-          })}
-        </div>
+            )}
+        </Modal>
       )}
     </div>
   );
+}
+
+function Tools() {
+  return <VerifyGateCheck />;
 }
 
 // ---------- Manifest lookup / SBOM artifact view ----------
@@ -1493,6 +1609,103 @@ function VersionPicker({ leaves, onSelect }: { leaves: Leaf[]; onSelect: (hash: 
   );
 }
 
+// Imports a supplier VEX document and applies its statements to this
+// manifest's cached findings — a one-shot form + result summary, not a
+// persistent view, so it's its own small modal rather than folded into
+// SbomDetailPanel's already-large state.
+function VexImportModal({
+  manifestHash,
+  tenantId,
+  onClose,
+}: {
+  manifestHash: string;
+  tenantId?: string;
+  onClose: () => void;
+}) {
+  const [file, setFile] = useState<File | null>(null);
+  const [overwrite, setOverwrite] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [result, setResult] = useState<VexImportResult | null>(null);
+
+  const doImport = async () => {
+    if (!file) return;
+    setBusy(true);
+    setError('');
+    setResult(null);
+    try {
+      setResult(await api.importVex(manifestHash, file, overwrite, tenantId));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal title="Import VEX document" onClose={onClose}>
+      <p className="muted">
+        Applies an OpenVEX document's statements to this manifest's cached findings. Matching is by
+        exact vulnerability id (no CVE↔GHSA alias resolution in this version) and, when a statement
+        names specific products, by purl against this manifest's indexed components — a statement with
+        no products applies to every cached finding for its vulnerability id. A finding that already
+        carries a human triage is left untouched unless "Overwrite" is checked; a finding whose current
+        triage came from an earlier VEX import is always safely refreshed.
+      </p>
+      <label className="field">
+        <span>VEX file (OpenVEX JSON)</span>
+        <input
+          type="file"
+          accept=".json,application/json"
+          onChange={(e) => {
+            setFile(e.target.files ? e.target.files[0] : null);
+            setResult(null);
+          }}
+        />
+      </label>
+      <label className="checkbox-field">
+        <input type="checkbox" checked={overwrite} onChange={(e) => setOverwrite(e.target.checked)} />
+        Overwrite existing human-triaged findings
+      </label>
+      <button className="btn primary" disabled={!file || busy} onClick={doImport}>
+        {busy ? 'Importing…' : 'Import'}
+      </button>
+      {error && <ErrorBox message={error} />}
+      {result && (
+        <div style={{ marginTop: 12 }}>
+          <div className="cell-actions">
+            <Badge ok={true}>{result.applied} applied</Badge>
+            {result.skipped_manual > 0 && (
+              <Badge ok={false}>{result.skipped_manual} skipped (manual triage)</Badge>
+            )}
+            {result.unmatched.length > 0 && <Badge ok={false}>{result.unmatched.length} unmatched</Badge>}
+          </div>
+          {result.unmatched.length > 0 && (
+            <table className="table" style={{ marginTop: 8 }}>
+              <thead>
+                <tr>
+                  <th>vulnerability</th>
+                  <th>reason</th>
+                </tr>
+              </thead>
+              <tbody>
+                {result.unmatched.map((u, i) => (
+                  <tr key={i}>
+                    <td>
+                      <VulnerabilityId vulnerabilityId={u.vuln_id} />
+                    </td>
+                    <td className="muted">{u.reason}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+    </Modal>
+  );
+}
+
 function SbomDetailPanel({
   hash,
   tenantId,
@@ -1526,9 +1739,13 @@ function SbomDetailPanel({
   const [diffAgainst, setDiffAgainst] = useState<string>(''); // '' means "previous version" (server default)
   const [diffVersions, setDiffVersions] = useState<ManifestVersion[] | null>(null);
   const [reputationDisabledForTenant, setReputationDisabledForTenant] = useState(false);
+  const [freshnessDisabledForTenant, setFreshnessDisabledForTenant] = useState(false);
   const [maliciousCheckDisabledForTenant, setMaliciousCheckDisabledForTenant] = useState(false);
+  const [licenseEnforceLevel, setLicenseEnforceLevel] = useState<'off' | 'warn' | 'block'>('off');
   const [showComponentReputationModal, setShowComponentReputationModal] = useState(false);
+  const [showComponentFreshnessModal, setShowComponentFreshnessModal] = useState(false);
   const [showSignatureModal, setShowSignatureModal] = useState(false);
+  const [showVexImportModal, setShowVexImportModal] = useState(false);
 
   useEffect(() => {
     let mounted = true;
@@ -1541,8 +1758,14 @@ function SbomDetailPanel({
     api.reputationTenantSetting(tenantId)
       .then((s) => mounted && setReputationDisabledForTenant(s.disabled))
       .catch(() => {});
+    api.freshnessTenantSetting(tenantId)
+      .then((s) => mounted && setFreshnessDisabledForTenant(s.disabled))
+      .catch(() => {});
     api.maliciousCheckTenantSetting(tenantId)
       .then((s) => mounted && setMaliciousCheckDisabledForTenant(s.disabled))
+      .catch(() => {});
+    api.licensePolicy(tenantId)
+      .then((p) => mounted && setLicenseEnforceLevel(p.enforce_level))
       .catch(() => {});
     return () => {
       mounted = false;
@@ -1592,6 +1815,37 @@ function SbomDetailPanel({
       return a.scorecard_score - b.scorecard_score;
     });
   }, [manifest?.component_reputation]);
+
+  const freshnessSummary = useMemo(() => {
+    const rows = manifest?.component_freshness ?? [];
+    let current = 0, behind = 0, majorBehind = 0, unknown = 0, pending = 0;
+    for (const r of rows) {
+      if (r.checked_at === null) pending++;
+      else if (r.status === 'major_behind') majorBehind++;
+      else if (r.status === 'behind') behind++;
+      else if (r.status === 'unknown') unknown++;
+      else current++;
+    }
+    return { total: rows.length, current, behind, majorBehind, unknown, pending };
+  }, [manifest?.component_freshness]);
+
+  // Furthest-behind first (major_behind, then behind, then unknown, then
+  // current), same "worst first" convention as sortedComponentReputation —
+  // pending (not checked yet) components sort last in their original order,
+  // there's nothing to rank them by.
+  const sortedComponentFreshness = useMemo(() => {
+    const rows = manifest?.component_freshness ?? [];
+    const rank = (status: string | null) => {
+      switch (status) {
+        case 'major_behind': return 0;
+        case 'behind': return 1;
+        case 'unknown': return 2;
+        case 'current': return 3;
+        default: return 4; // pending
+      }
+    };
+    return [...rows].sort((a, b) => rank(a.status) - rank(b.status));
+  }, [manifest?.component_freshness]);
 
   const load = useCallback(async () => {
     setBusy(true);
@@ -1681,7 +1935,11 @@ function SbomDetailPanel({
   const showReputationSignal =
     !!manifest && !manifest.document_type && !reputationDisabledForTenant && manifest.component_reputation.length > 0;
   const showVulnSignal = !!manifest && !manifest.document_type && dtrackEnabled && !dtrackSyncDisabled;
-  const hasSecuritySignals = showMaliciousSignal || showReputationSignal || showVulnSignal;
+  const showLicenseSignal = !!manifest && !manifest.document_type && licenseEnforceLevel !== 'off';
+  const showFreshnessSignal =
+    !!manifest && !manifest.document_type && !freshnessDisabledForTenant && manifest.component_freshness.length > 0;
+  const hasSecuritySignals =
+    showMaliciousSignal || showReputationSignal || showVulnSignal || showLicenseSignal || showFreshnessSignal;
 
   return (
     <div className="card">
@@ -1843,6 +2101,79 @@ function SbomDetailPanel({
                       </td>
                     </tr>
                   )}
+                  {showLicenseSignal && (
+                    <tr>
+                      <td>
+                        <SignalLabel
+                          label="License compliance"
+                          tooltip={
+                            'Components checked against this tenant\'s license policy (Settings → License policy).' +
+                            (licenseEnforceLevel === 'block' ? ' Denied licenses block uploads outright.' : ' Warn only — never blocks an upload.')
+                          }
+                        />
+                      </td>
+                      <td>
+                        <Badge ok={manifest.license_violations.length === 0}>
+                          {manifest.license_violations.length === 0
+                            ? 'none found'
+                            : `${manifest.license_violations.length} violation${manifest.license_violations.length === 1 ? '' : 's'}`}
+                        </Badge>
+                      </td>
+                      <td className="signal-detail">
+                        {manifest.license_violations.length === 0 ? (
+                          <span className="muted">No component violates this tenant's license policy.</span>
+                        ) : (
+                          <span className="muted">
+                            {manifest.license_violations
+                              .map((v) =>
+                                v.reason === 'denied'
+                                  ? `${v.component_name} (${v.denied_license})`
+                                  : `${v.component_name} (no license information)`
+                              )
+                              .join(', ')}
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  )}
+                  {showFreshnessSignal && (
+                    <tr>
+                      <td>
+                        <SignalLabel
+                          label="Outdated components"
+                          tooltip="Each component's version compared against deps.dev's latest-known version. Informational only — never blocks an upload."
+                        />
+                      </td>
+                      <td>
+                        <span className="badge-stack">
+                          {freshnessSummary.majorBehind > 0 && (
+                            <span className="badge badge-err">{freshnessSummary.majorBehind} major behind</span>
+                          )}
+                          {freshnessSummary.behind > 0 && (
+                            <span className="badge badge-warn">{freshnessSummary.behind} behind</span>
+                          )}
+                          {freshnessSummary.majorBehind === 0 && freshnessSummary.behind === 0 && (
+                            <span className="badge badge-ok">up to date</span>
+                          )}
+                        </span>
+                      </td>
+                      <td className="signal-detail">
+                        <span className="cell-actions">
+                          <span className="muted">
+                            {freshnessSummary.current} current · {freshnessSummary.behind} behind ·{' '}
+                            {freshnessSummary.majorBehind} major behind
+                            {freshnessSummary.unknown > 0 ? ` · ${freshnessSummary.unknown} unknown` : ''}
+                            {freshnessSummary.pending > 0 ? ` · ${freshnessSummary.pending} pending` : ''}
+                          </span>
+                          {(freshnessSummary.behind > 0 || freshnessSummary.majorBehind > 0) && (
+                            <button className="btn" onClick={() => setShowComponentFreshnessModal(true)}>
+                              View outdated components…
+                            </button>
+                          )}
+                        </span>
+                      </td>
+                    </tr>
+                  )}
                 </tbody>
               </table>
               {showReputationSignal && (
@@ -1991,6 +2322,11 @@ function SbomDetailPanel({
               ))}
             {!manifest.document_type && (
               <button className="btn" onClick={loadDiff}>View component diff</button>
+            )}
+            {!manifest.document_type && (
+              <button className="btn" onClick={() => setShowVexImportModal(true)}>
+                Import VEX…
+              </button>
             )}
             {!manifest.document_type && !reputationDisabledForTenant && manifest.component_reputation.length > 0 && (
               <button className="btn" onClick={() => setShowComponentReputationModal(true)}>
@@ -2214,6 +2550,42 @@ function SbomDetailPanel({
               </table>
             </Modal>
           )}
+          {showComponentFreshnessModal && manifest && (
+            <Modal title="Outdated components" onClose={() => setShowComponentFreshnessModal(false)}>
+              <p className="muted">Furthest behind first.</p>
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Status</th>
+                    <th>Component</th>
+                    <th>Installed</th>
+                    <th>Latest known</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sortedComponentFreshness
+                    .filter((r) => r.status === 'major_behind' || r.status === 'behind')
+                    .map((r) => (
+                      <tr key={r.component_name}>
+                        <td>
+                          <Badge ok={false}>{r.status === 'major_behind' ? 'major behind' : 'behind'}</Badge>
+                        </td>
+                        <td>{r.component_name}</td>
+                        <td className="muted">{r.component_version ?? '—'}</td>
+                        <td className="muted">{r.latest_version ?? '—'}</td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            </Modal>
+          )}
+          {showVexImportModal && manifest && (
+            <VexImportModal
+              manifestHash={manifest.manifest_hash}
+              tenantId={tenantId}
+              onClose={() => setShowVexImportModal(false)}
+            />
+          )}
         </div>
       )}
     </div>
@@ -2228,6 +2600,100 @@ function severityBadgeOk(severity: string): boolean {
 // tag so it reads as an identifier rather than running text.
 function VulnerabilityId({ vulnerabilityId }: { vulnerabilityId: string }) {
   return <span className="vuln-id">{vulnerabilityId}</span>;
+}
+
+// Blast-radius view for one vulnerability/advisory id — every manifest in
+// scope that a finding or malicious-package match with this id was found
+// on, across the whole archive (not just the manifest the user started
+// from). Fetched on demand rather than eagerly, since most finding rows are
+// never expanded this way.
+function AffectedManifestsModal({
+  vulnId,
+  tenantId,
+  onClose,
+  onViewManifest,
+}: {
+  vulnId: string;
+  tenantId?: string;
+  onClose: () => void;
+  onViewManifest: (hash: string) => void;
+}) {
+  const [rows, setRows] = useState<AffectedManifest[] | null>(null);
+  const [busy, setBusy] = useState(true);
+  const [error, setError] = useState('');
+  // Defaults on, same reasoning as the Findings tab's own currentOnly
+  // default: day-to-day "where is this actually still a problem" triage
+  // should default to what's actually deployed, not every historical
+  // version that ever shipped it. Off shows the full history, revoked
+  // versions included.
+  const [currentOnly, setCurrentOnly] = useState(true);
+
+  useEffect(() => {
+    let mounted = true;
+    setBusy(true);
+    setError('');
+    api
+      .vulnerabilityAffected(vulnId, { currentOnly }, tenantId)
+      .then((res) => mounted && setRows(res))
+      .catch((e) => mounted && setError(e instanceof Error ? e.message : String(e)))
+      .finally(() => mounted && setBusy(false));
+    return () => {
+      mounted = false;
+    };
+  }, [vulnId, tenantId, currentOnly]);
+
+  return (
+    <Modal title={`Affected by ${vulnId}`} onClose={onClose}>
+      <label
+        className="checkbox-field"
+        style={{ marginBottom: 12 }}
+        title={
+          'Uses the same namespace visibility as the "Currently running" view (Settings → ' +
+          'Manage namespace visibility): only the latest non-revoked upload per active ' +
+          'namespace. Off shows every historical version, revoked included.'
+        }
+      >
+        <input type="checkbox" checked={currentOnly} onChange={(e) => setCurrentOnly(e.target.checked)} />
+        Currently running only
+      </label>
+      {busy && <div className="muted">Loading…</div>}
+      {error && <ErrorBox message={error} />}
+      {!busy && !error && rows !== null && rows.length === 0 && (
+        <div className="muted">No manifests in scope are currently affected.</div>
+      )}
+      {!busy && rows !== null && rows.length > 0 && (
+        <table className="table">
+          <thead>
+            <tr>
+              <th>namespace / release</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.manifest_hash}>
+                <td>
+                  {r.domain}
+                  {r.namespace} <span className="muted">{r.release_version}</span>
+                  {r.revoked && (
+                    <>
+                      {' '}
+                      <Badge ok={false}>revoked</Badge>
+                    </>
+                  )}
+                </td>
+                <td>
+                  <button className="btn" onClick={() => onViewManifest(r.manifest_hash)}>
+                    View SBOM
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </Modal>
+  );
 }
 
 // Compact severity-count summary shown on the SBOM Details overview, e.g.
@@ -3334,6 +3800,11 @@ function ComponentSearch({ onViewManifest }: { onViewManifest: (hash: string) =>
       )}
       {results !== null && visibleResults.length === 0 && <div className="muted">No matches.</div>}
       {results !== null && visibleResults.length > 0 && (
+        <div className="muted" style={{ marginTop: 8 }}>
+          Used in {visibleResults.length} manifest{visibleResults.length === 1 ? '' : 's'}.
+        </div>
+      )}
+      {results !== null && visibleResults.length > 0 && (
         <table className="table">
           <thead>
             <tr>
@@ -3341,6 +3812,7 @@ function ComponentSearch({ onViewManifest }: { onViewManifest: (hash: string) =>
               <th>release</th>
               <th>component</th>
               <th>version</th>
+              <th>license</th>
               <th></th>
             </tr>
           </thead>
@@ -3360,6 +3832,7 @@ function ComponentSearch({ onViewManifest }: { onViewManifest: (hash: string) =>
                   {r.name} {r.is_primary && <Badge ok={true}>primary</Badge>}
                 </td>
                 <td>{r.version ?? '—'}</td>
+                <td className="muted">{r.license_expr ?? '—'}</td>
                 <td>{r.revoked && <Badge ok={false}>revoked</Badge>}</td>
               </tr>
             ))}
@@ -3416,6 +3889,7 @@ function Findings({
   const [dtrackSyncDisabled, setDtrackSyncDisabled] = useState(false);
   const [dtrackSyncIntervalSecs, setDtrackSyncIntervalSecs] = useState<number | null>(null);
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
+  const [affectedVulnId, setAffectedVulnId] = useState<string | null>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -3661,7 +4135,17 @@ function Findings({
                       <Badge ok={severityBadgeOk(f.severity)}>{f.severity}</Badge>
                     </td>
                     <td>
-                      <VulnerabilityId vulnerabilityId={f.vulnerability_id} />
+                      <VulnerabilityId vulnerabilityId={f.vulnerability_id} />{' '}
+                      <button
+                        className="link-button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setAffectedVulnId(f.vulnerability_id);
+                        }}
+                        title="Show every manifest in scope affected by this vulnerability"
+                      >
+                        affected elsewhere?
+                      </button>
                       {f.vex_status && (
                         <div className="muted">triaged: {f.vex_status}</div>
                       )}
@@ -3728,6 +4212,14 @@ function Findings({
             Next →
           </button>
         </div>
+      )}
+      {affectedVulnId && (
+        <AffectedManifestsModal
+          vulnId={affectedVulnId}
+          tenantId={tenantId}
+          onClose={() => setAffectedVulnId(null)}
+          onViewManifest={onViewManifest}
+        />
       )}
     </div>
   );
@@ -4140,6 +4632,278 @@ function Audit() {
 
 // ---------- Settings (per-namespace "Currently running" visibility) ----------
 
+// ---------- Webhooks ----------
+
+function WebhookDeliveriesList({ webhookId, tenantId }: { webhookId: string; tenantId?: string }) {
+  const [deliveries, setDeliveries] = useState<WebhookDelivery[] | null>(null);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let mounted = true;
+    api
+      .webhookDeliveries(webhookId, tenantId)
+      .then((d) => mounted && setDeliveries(d))
+      .catch((e) => mounted && setError(e instanceof Error ? e.message : String(e)));
+    return () => {
+      mounted = false;
+    };
+  }, [webhookId, tenantId]);
+
+  if (error) return <ErrorBox message={error} />;
+  if (deliveries === null) return <Spinner label="Loading deliveries…" />;
+  if (deliveries.length === 0) return <div className="muted">No deliveries yet.</div>;
+
+  return (
+    <table className="table">
+      <thead>
+        <tr>
+          <th>event</th>
+          <th>status</th>
+          <th>attempts</th>
+          <th>last error</th>
+          <th>created</th>
+        </tr>
+      </thead>
+      <tbody>
+        {deliveries.map((d) => (
+          <tr key={d.id}>
+            <td>{d.event_type}</td>
+            <td>
+              <Badge ok={d.status === 'delivered'}>{d.status}</Badge>
+            </td>
+            <td>{d.attempts}</td>
+            <td className="muted">{d.last_error ?? '—'}</td>
+            <td className="muted">{new Date(d.created_at).toLocaleString()}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function WebhooksSettings() {
+  const tenantId = useTenantOverride();
+  const [webhooks, setWebhooks] = useState<WebhookEndpoint[] | null>(null);
+  const [error, setError] = useState('');
+  const [newUrl, setNewUrl] = useState('');
+  const [newEventTypes, setNewEventTypes] = useState<string[]>([]);
+  const [createBusy, setCreateBusy] = useState(false);
+  const [createdSecret, setCreatedSecret] = useState<CreateWebhookResult | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [testResults, setTestResults] = useState<Record<string, WebhookTestResult>>({});
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    api
+      .listWebhooks(tenantId)
+      .then(setWebhooks)
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  }, [tenantId]);
+
+  useEffect(load, [load]);
+
+  const toggleNewEventType = (et: string) => {
+    setNewEventTypes((prev) => (prev.includes(et) ? prev.filter((x) => x !== et) : [...prev, et]));
+  };
+
+  const create = async () => {
+    if (!newUrl.trim() || newEventTypes.length === 0) return;
+    setCreateBusy(true);
+    setError('');
+    setCreatedSecret(null);
+    try {
+      const res = await api.createWebhook(newUrl.trim(), newEventTypes, tenantId);
+      setCreatedSecret(res);
+      setNewUrl('');
+      setNewEventTypes([]);
+      load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setCreateBusy(false);
+    }
+  };
+
+  const toggleEnabled = async (w: WebhookEndpoint) => {
+    setBusyId(w.id);
+    setError('');
+    try {
+      await api.updateWebhook(w.id, w.url, w.event_types, !w.enabled, tenantId);
+      load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const remove = async (id: string) => {
+    if (!window.confirm('Delete this webhook endpoint? This cannot be undone.')) return;
+    setBusyId(id);
+    setError('');
+    try {
+      await api.deleteWebhook(id, tenantId);
+      load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const test = async (id: string) => {
+    setBusyId(id);
+    setError('');
+    try {
+      const res = await api.testWebhook(id, tenantId);
+      setTestResults((prev) => ({ ...prev, [id]: res }));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  return (
+    <div className="card">
+      <div className="card-header">
+        <h2>Webhooks</h2>
+        <button className="btn" onClick={load}>
+          Refresh
+        </button>
+      </div>
+      <p className="muted">
+        Push events to a URL you control instead of polling: manifest.uploaded, manifest.revoked,
+        finding.new_critical, malicious.match_found, dtrack.push_failed. Each delivery is POSTed as JSON
+        with an <code>X-Aise-Signature: sha256=&lt;hmac&gt;</code> header — verify it against the raw
+        request body using the secret shown once below. Failed deliveries retry with backoff (1m → 5m →
+        30m → 2h) up to 8 attempts before being marked failed for good.
+      </p>
+      {error && <ErrorBox message={error} />}
+      {createdSecret && (
+        <div className="result-box" style={{ marginBottom: 12 }}>
+          <strong>Signing secret for {createdSecret.url} (shown once — copy it now):</strong>
+          <div className="cell-actions">
+            <code>{createdSecret.secret}</code>
+            <CopyButton text={createdSecret.secret} />
+          </div>
+        </div>
+      )}
+      <div className="form-row" style={{ alignItems: 'flex-end' }}>
+        <label className="field" style={{ flex: '1 1 320px', minWidth: 260 }}>
+          <span>Endpoint URL</span>
+          <input
+            value={newUrl}
+            onChange={(e) => setNewUrl(e.target.value)}
+            placeholder="https://example.com/hooks/aise"
+          />
+        </label>
+        <button
+          className="btn primary"
+          style={{ marginBottom: 0 }}
+          disabled={createBusy || !newUrl.trim() || newEventTypes.length === 0}
+          onClick={create}
+        >
+          {createBusy ? 'Adding…' : 'Add endpoint'}
+        </button>
+      </div>
+      <div className="form-row" style={{ marginTop: 8 }}>
+        {WEBHOOK_EVENT_TYPES.map((et) => (
+          <label key={et} className="checkbox-field">
+            <input type="checkbox" checked={newEventTypes.includes(et)} onChange={() => toggleNewEventType(et)} />
+            {et}
+          </label>
+        ))}
+      </div>
+
+      {webhooks === null && !error && <Spinner label="Loading webhooks…" />}
+      {webhooks !== null && webhooks.length === 0 && (
+        <div className="muted" style={{ marginTop: 12 }}>
+          No webhook endpoints registered.
+        </div>
+      )}
+      {webhooks !== null && webhooks.length > 0 && (
+        <table className="table" style={{ marginTop: 12 }}>
+          <thead>
+            <tr>
+              <th>url</th>
+              <th>events</th>
+              <th>status</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {webhooks.map((w) => {
+              const expanded = expandedId === w.id;
+              const testResult = testResults[w.id];
+              return (
+                <React.Fragment key={w.id}>
+                  <tr className="row-clickable" onClick={() => setExpandedId(expanded ? null : w.id)}>
+                    <td>{w.url}</td>
+                    <td className="muted">{w.event_types.join(', ')}</td>
+                    <td>
+                      <Badge ok={w.enabled}>{w.enabled ? 'enabled' : 'disabled'}</Badge>
+                      {testResult && (
+                        <div className="muted">
+                          test: <Badge ok={testResult.ok}>{testResult.ok ? 'delivered' : 'failed'}</Badge>
+                          {testResult.error && ` — ${testResult.error}`}
+                        </div>
+                      )}
+                    </td>
+                    <td>
+                      <span className="cell-actions">
+                        <button
+                          className="btn"
+                          disabled={busyId === w.id}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            test(w.id);
+                          }}
+                        >
+                          Test
+                        </button>
+                        <button
+                          className="btn"
+                          disabled={busyId === w.id}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggleEnabled(w);
+                          }}
+                        >
+                          {w.enabled ? 'Disable' : 'Enable'}
+                        </button>
+                        <button
+                          className="btn btn-danger"
+                          disabled={busyId === w.id}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            remove(w.id);
+                          }}
+                        >
+                          Delete
+                        </button>
+                      </span>
+                    </td>
+                  </tr>
+                  {expanded && (
+                    <tr>
+                      <td colSpan={4}>
+                        <WebhookDeliveriesList webhookId={w.id} tenantId={tenantId} />
+                      </td>
+                    </tr>
+                  )}
+                </React.Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+// ---------- Settings (per-namespace "Currently running" visibility) ----------
+
 function Settings({
   onDtrackSyncDisabledChange,
   treeHead,
@@ -4161,7 +4925,9 @@ function Settings({
   headError: string;
 }) {
   const tenantId = useTenantOverride();
-  const [settingsGroup, setSettingsGroup] = useState<'info' | 'general' | 'checks' | 'compliance'>('info');
+  const [settingsGroup, setSettingsGroup] = useState<'info' | 'general' | 'checks' | 'compliance' | 'webhooks'>(
+    'info'
+  );
   const [leaves, setLeaves] = useState<Leaf[] | null>(null);
   const [hiddenNamespaces, setHiddenNamespaces] = useState<Set<string>>(new Set());
   const [error, setError] = useState('');
@@ -4171,6 +4937,10 @@ function Settings({
   );
   const [complianceSettings, setComplianceSettings] = useState<ComplianceSetting[] | null>(null);
   const [busyProfile, setBusyProfile] = useState<string | null>(null);
+  const [licensePolicy, setLicensePolicyState] = useState<LicensePolicy | null>(null);
+  const [licensePolicyDraft, setLicensePolicyDraft] = useState('');
+  const [licensePolicyBusy, setLicensePolicyBusy] = useState(false);
+  const [licensePolicyError, setLicensePolicyError] = useState('');
   const [showNamespaceModal, setShowNamespaceModal] = useState(false);
   const [showSnapshotExtended, setShowSnapshotExtended] = useState(false);
   const [snapshotNamespace, setSnapshotNamespace] = useState('');
@@ -4199,6 +4969,15 @@ function Settings({
   const [showReputationModal, setShowReputationModal] = useState(false);
   const [reputationComponents, setReputationComponents] = useState<ReputationComponentSummary[] | null>(null);
   const [reputationComponentsError, setReputationComponentsError] = useState('');
+  const [freshnessEnabled, setFreshnessEnabled] = useState<boolean | null>(null);
+  const [freshnessSyncBusy, setFreshnessSyncBusy] = useState(false);
+  const [freshnessSyncError, setFreshnessSyncError] = useState('');
+  const [freshnessSyncResult, setFreshnessSyncResult] = useState<FreshnessSyncResult | null>(null);
+  const [freshnessStatus, setFreshnessStatus] = useState<FreshnessStatus | null>(null);
+  const [freshnessStatusError, setFreshnessStatusError] = useState('');
+  const [freshnessDisabled, setFreshnessDisabled] = useState<boolean | null>(null);
+  const [freshnessDisabledBusy, setFreshnessDisabledBusy] = useState(false);
+  const [freshnessDisabledError, setFreshnessDisabledError] = useState('');
   const [maliciousCheckEnabled, setMaliciousCheckEnabled] = useState<boolean | null>(null);
   const [maliciousCheckDisabled, setMaliciousCheckDisabled] = useState<boolean | null>(null);
   const [maliciousCheckDisabledBusy, setMaliciousCheckDisabledBusy] = useState(false);
@@ -4235,6 +5014,15 @@ function Settings({
       .catch((e) => setReputationStatusError(e instanceof Error ? e.message : String(e)));
   }, []);
 
+  const loadFreshnessStatus = useCallback(() => {
+    api.freshnessStatus()
+      .then((s) => {
+        setFreshnessStatus(s);
+        setFreshnessStatusError('');
+      })
+      .catch((e) => setFreshnessStatusError(e instanceof Error ? e.message : String(e)));
+  }, []);
+
   const loadMaliciousCheckStatus = useCallback(() => {
     api.maliciousCheckStatus()
       .then((s) => {
@@ -4251,12 +5039,14 @@ function Settings({
         if (!mounted) return;
         setDtrackEnabled(c.dtrack_enabled);
         setReputationEnabled(c.reputation_enabled);
+        setFreshnessEnabled(c.freshness_enabled);
         setMaliciousCheckEnabled(c.malicious_check_enabled);
       })
       .catch(() => {
         if (!mounted) return;
         setDtrackEnabled(null);
         setReputationEnabled(null);
+        setFreshnessEnabled(null);
         setMaliciousCheckEnabled(null);
       });
     api.dtrackSyncSetting(tenantId)
@@ -4268,6 +5058,9 @@ function Settings({
     api.reputationTenantSetting(tenantId)
       .then((s) => mounted && setReputationDisabled(s.disabled))
       .catch(() => mounted && setReputationDisabled(null));
+    api.freshnessTenantSetting(tenantId)
+      .then((s) => mounted && setFreshnessDisabled(s.disabled))
+      .catch(() => mounted && setFreshnessDisabled(null));
     api.maliciousCheckTenantSetting(tenantId)
       .then((s) => mounted && setMaliciousCheckDisabled(s.disabled))
       .catch(() => mounted && setMaliciousCheckDisabled(null));
@@ -4280,6 +5073,7 @@ function Settings({
   }, [tenantId]);
 
   useEffect(loadReputationStatus, [loadReputationStatus]);
+  useEffect(loadFreshnessStatus, [loadFreshnessStatus]);
   useEffect(loadMaliciousCheckStatus, [loadMaliciousCheckStatus]);
   useEffect(loadRegisteredNamespaces, [loadRegisteredNamespaces]);
 
@@ -4333,6 +5127,33 @@ function Settings({
       setReputationDisabledError(e instanceof Error ? e.message : String(e));
     } finally {
       setReputationDisabledBusy(false);
+    }
+  };
+
+  const toggleFreshnessDisabled = async (disabled: boolean) => {
+    setFreshnessDisabledBusy(true);
+    setFreshnessDisabledError('');
+    try {
+      await api.setFreshnessTenantSetting(disabled, tenantId);
+      setFreshnessDisabled(disabled);
+    } catch (e) {
+      setFreshnessDisabledError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFreshnessDisabledBusy(false);
+    }
+  };
+
+  const forceFreshnessSync = async () => {
+    setFreshnessSyncBusy(true);
+    setFreshnessSyncError('');
+    setFreshnessSyncResult(null);
+    try {
+      setFreshnessSyncResult(await api.forceFreshnessSync());
+      loadFreshnessStatus();
+    } catch (e) {
+      setFreshnessSyncError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFreshnessSyncBusy(false);
     }
   };
 
@@ -4432,9 +5253,31 @@ function Settings({
     api.complianceSettings(tenantId)
       .then(setComplianceSettings)
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+    api.licensePolicy(tenantId)
+      .then((p) => {
+        setLicensePolicyState(p);
+        setLicensePolicyDraft(p.denied_licenses.join(', '));
+      })
+      .catch((e) => setLicensePolicyError(e instanceof Error ? e.message : String(e)));
   }, [tenantId]);
 
   useEffect(load, [load]);
+
+  const saveLicensePolicy = async (next: Partial<LicensePolicy>) => {
+    const base = licensePolicy ?? { denied_licenses: [], flag_unknown: false, enforce_level: 'off' as const };
+    const updated: LicensePolicy = { ...base, ...next };
+    setLicensePolicyBusy(true);
+    setLicensePolicyError('');
+    try {
+      await api.setLicensePolicy(updated, tenantId);
+      setLicensePolicyState(updated);
+      if (next.denied_licenses) setLicensePolicyDraft(next.denied_licenses.join(', '));
+    } catch (e) {
+      setLicensePolicyError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLicensePolicyBusy(false);
+    }
+  };
 
   const setCompliance = async (profileId: string, enabled: boolean, enforceLevel: 'off' | 'minimum' | 'full') => {
     // When disabling, always send enforce_level "off" regardless of what
@@ -4527,6 +5370,12 @@ function Settings({
           onClick={() => setSettingsGroup('compliance')}
         >
           Compliance checks
+        </button>
+        <button
+          className={`subnav-link ${settingsGroup === 'webhooks' ? 'active' : ''}`}
+          onClick={() => setSettingsGroup('webhooks')}
+        >
+          Webhooks
         </button>
       </div>
 
@@ -4710,8 +5559,70 @@ function Settings({
           </table>
         )}
       </div>
+      <div className="card">
+        <div className="card-header">
+          <h2>License policy</h2>
+        </div>
+        <p className="muted">
+          Optional, off by default. Denied licenses are matched against each SPDX identifier resolved
+          out of a component's (possibly compound) license expression — e.g. a deny-list entry of
+          "GPL-3.0-only" also matches a component licensed "MIT AND GPL-3.0-only". "Block" rejects the
+          upload outright; "warn" only surfaces violations on the SBOM's detail view. Components with no
+          license info at all (missing, or SPDX "NOASSERTION") are ignored by default — set the "no
+          license info" option below to flag them instead. This affects every uploader on the tenant, not
+          just you.
+        </p>
+        {licensePolicyError && <ErrorBox message={licensePolicyError} />}
+        {licensePolicy === null && !licensePolicyError && <Spinner label="Loading license policy…" />}
+        {licensePolicy !== null && (
+          <div className="form-row" style={{ alignItems: 'flex-end' }}>
+            <label className="field" style={{ flex: '1 1 320px', minWidth: 260 }}>
+              <span>Denied licenses (comma-separated SPDX identifiers)</span>
+              <input
+                value={licensePolicyDraft}
+                onChange={(e) => setLicensePolicyDraft(e.target.value)}
+                onBlur={() =>
+                  saveLicensePolicy({
+                    denied_licenses: licensePolicyDraft
+                      .split(',')
+                      .map((s) => s.trim())
+                      .filter((s) => s.length > 0),
+                  })
+                }
+                placeholder="GPL-3.0-only, AGPL-3.0-only"
+                disabled={licensePolicyBusy}
+              />
+            </label>
+            <label className="field" style={{ flex: '0 1 220px', minWidth: 180, marginBottom: 0 }}>
+              <span>Components with no license info</span>
+              <select
+                value={licensePolicy.flag_unknown ? 'flag' : 'ignore'}
+                disabled={licensePolicyBusy}
+                onChange={(e) => saveLicensePolicy({ flag_unknown: e.target.value === 'flag' })}
+              >
+                <option value="ignore">ignore (default)</option>
+                <option value="flag">flag as a violation</option>
+              </select>
+            </label>
+            <label className="field" style={{ flex: '0 1 220px', minWidth: 180, marginBottom: 0 }}>
+              <span>Enforcement</span>
+              <select
+                value={licensePolicy.enforce_level}
+                disabled={licensePolicyBusy}
+                onChange={(e) => saveLicensePolicy({ enforce_level: e.target.value as LicensePolicy['enforce_level'] })}
+              >
+                <option value="off">off</option>
+                <option value="warn">warn (report only)</option>
+                <option value="block">block uploads</option>
+              </select>
+            </label>
+          </div>
+        )}
+      </div>
         </>
       )}
+
+      {settingsGroup === 'webhooks' && <WebhooksSettings />}
 
       {settingsGroup === 'checks' && (
         <>
@@ -4855,6 +5766,85 @@ function Settings({
           </div>
         )}
         {reputationDisabledError && <ErrorBox message={reputationDisabledError} />}
+      </div>
+
+      <div className="card">
+        <div className="card-header">
+          <h2 title="Compares each component's version against deps.dev's latest-known version">
+            Outdated components
+          </h2>
+        </div>
+        <p className="muted">
+          Shares deps.dev's presence gate with Package reputation above — there is no separate
+          deployment flag for this.
+        </p>
+        <div className="kv-row">
+          <span className="kv-label">Deployment-wide</span>
+          {freshnessEnabled === null ? (
+            <span className="muted">unknown</span>
+          ) : (
+            <Badge ok={freshnessEnabled}>{freshnessEnabled ? 'enabled' : 'disabled'}</Badge>
+          )}
+        </div>
+        {freshnessEnabled && (
+          <div className="kv-row">
+            <span className="kv-label">Components</span>
+            {freshnessStatus ? (
+              <span className="cell-actions">
+                <Badge ok={freshnessStatus.pending === 0}>{freshnessStatus.pending} pending</Badge>
+                <Badge ok={true}>{freshnessStatus.checked} checked</Badge>
+                <Badge ok={freshnessStatus.failed === 0}>{freshnessStatus.failed} failed</Badge>
+                <button className="btn" onClick={loadFreshnessStatus}>Refresh</button>
+              </span>
+            ) : (
+              <span className="muted">loading…</span>
+            )}
+          </div>
+        )}
+        {freshnessStatusError && <ErrorBox message={freshnessStatusError} />}
+        {freshnessEnabled && (
+          <div className="kv-row">
+            <span className="kv-label">Background job</span>
+            <span className="cell-actions">
+              <button className="btn" disabled={freshnessSyncBusy} onClick={forceFreshnessSync}>
+                {freshnessSyncBusy ? 'Syncing…' : 'Force freshness sync'}
+              </button>
+              <span className="muted">
+                Runs one batch of the deps.dev latest-version lookup job now instead of waiting for its
+                next scheduled tick — deployment-wide, not scoped to this tenant.
+              </span>
+            </span>
+          </div>
+        )}
+        {freshnessSyncResult && (
+          <div className="muted">
+            Sync pass complete — processed {freshnessSyncResult.components_processed} component
+            {freshnessSyncResult.components_processed === 1 ? '' : 's'}. One pass only covers a bounded
+            batch — run it again if you have more than that still pending.
+          </div>
+        )}
+        {freshnessSyncError && <ErrorBox message={freshnessSyncError} />}
+        {freshnessEnabled && (
+          <div className="kv-row">
+            <span className="kv-label">This tenant</span>
+            <label className="checkbox-field">
+              <input
+                type="checkbox"
+                checked={!(freshnessDisabled ?? false)}
+                disabled={freshnessDisabledBusy || freshnessDisabled === null}
+                onChange={(e) => toggleFreshnessDisabled(!e.target.checked)}
+              />
+              {freshnessDisabled ? 'disabled' : 'enabled'} for this tenant
+            </label>
+            <span className="muted">
+              {' '}
+              — {freshnessDisabled
+                ? 'the "Outdated components" panel is hidden on this tenant\'s SBOM detail views (the background job keeps running for everyone else)'
+                : 'the panel is shown as usual'}
+            </span>
+          </div>
+        )}
+        {freshnessDisabledError && <ErrorBox message={freshnessDisabledError} />}
       </div>
 
       {showReputationModal && (

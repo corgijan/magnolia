@@ -32,15 +32,23 @@ pub fn stale_before_cutoff() -> chrono::DateTime<chrono::Utc> {
 /// surface on a manifest uploaded before that happened. Same shape as
 /// `reputation_sync.rs`: no per-manifest state to reconcile beyond
 /// `manifests.malicious_checked_at`, just a deployment-global backlog
-/// worked through one tick's worth at a time. Every per-item failure is
+/// worked through one bounded batch at a time. Every per-item failure is
 /// caught and logged, never propagated — a transient OSV outage must not
-/// kill the loop.
-pub async fn run_malicious_sync_loop(db: Arc<Database>, client: Arc<OsvClient>, interval: Duration) {
-    let mut ticker = tokio::time::interval(interval);
-    loop {
-        ticker.tick().await;
-        sync_pass(&db, &client).await;
-    }
+/// kill the loop. Bursts through a large backlog at `burst_interval`
+/// spacing rather than waiting a full `interval` between every batch — see
+/// `sync_loop::run_burst_loop`.
+pub async fn run_malicious_sync_loop(
+    db: Arc<Database>,
+    client: Arc<OsvClient>,
+    interval: Duration,
+    burst_interval: Duration,
+) {
+    crate::sync_loop::run_burst_loop(interval, burst_interval, move || {
+        let db = db.clone();
+        let client = client.clone();
+        async move { sync_pass(&db, &client).await }
+    })
+    .await;
 }
 
 /// One batch's worth of the malicious-sync loop's work, run either by the
@@ -68,9 +76,9 @@ pub async fn sync_pass(db: &Database, client: &OsvClient) -> usize {
                 continue;
             }
         };
-        // `ecosystem`/`registry_name` are reputation-only fields —
-        // `check_and_store_malicious_components` never reads them, only
-        // `name`/`version`/`purl`.
+        // `ecosystem`/`registry_name`/`license_expr` are reputation/license-only
+        // fields — `check_and_store_malicious_components` never reads them,
+        // only `name`/`version`/`purl`.
         let components: Vec<NewSbomComponent> = rows
             .into_iter()
             .map(|c| NewSbomComponent {
@@ -81,18 +89,43 @@ pub async fn sync_pass(db: &Database, client: &OsvClient) -> usize {
                 is_primary: c.is_primary,
                 ecosystem: None,
                 registry_name: None,
+                license_expr: None,
             })
             .collect();
 
-        let ok =
+        let Ok(new_findings) =
             crate::malicious_check::check_and_store_malicious_components(db, client, &manifest_hash, &components)
-                .await;
-        if !ok {
+                .await
+        else {
             continue;
-        }
+        };
         if let Err(e) = db.touch_manifest_malicious_checked(&manifest_hash).await {
             tracing::warn!(manifest_hash = %manifest_hash, error = %e, "malicious sync: failed to record malicious_checked_at");
             continue;
+        }
+        if !new_findings.is_empty() {
+            match db.get_manifest(&manifest_hash).await {
+                Ok(Some(m)) => {
+                    crate::webhooks::emit_event(
+                        db,
+                        m.tenant_id,
+                        crate::webhooks::EVENT_MALICIOUS_MATCH_FOUND,
+                        serde_json::json!({
+                            "manifest_hash": manifest_hash,
+                            "matches": new_findings.iter().map(|f| serde_json::json!({
+                                "component_name": f.component_name,
+                                "component_version": f.component_version,
+                                "osv_id": f.osv_id,
+                            })).collect::<Vec<_>>(),
+                        }),
+                    )
+                    .await;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(manifest_hash = %manifest_hash, error = %e, "malicious sync: failed to look up tenant for webhook event");
+                }
+            }
         }
         processed += 1;
     }

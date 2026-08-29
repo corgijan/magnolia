@@ -10,9 +10,9 @@ use magnolia_auth::{generate_server_key, Action, Role};
 use magnolia_core::{
     build_envelope, ed25519_public_key_base64, ed25519_public_key_pem, pae, profile_by_id,
     registered_profiles, ComplianceReport as CoreComplianceReport, ConsistencyProof,
-    DocumentPredicate, DocumentStatement, InclusionProof, ManifestPredicate, ManifestStatement,
-    MerkleTree, SbomFormat, SignedTreeHead, Statement, Subject, DOCUMENT_PREDICATE_TYPE,
-    DSSE_PAYLOAD_TYPE, IN_TOTO_STATEMENT_TYPE, MANIFEST_PREDICATE_TYPE,
+    DocumentPredicate, DocumentStatement, InclusionProof, LicenseViolation as CoreLicenseViolation,
+    ManifestPredicate, ManifestStatement, MerkleTree, SbomFormat, SignedTreeHead, Statement, Subject,
+    DOCUMENT_PREDICATE_TYPE, DSSE_PAYLOAD_TYPE, IN_TOTO_STATEMENT_TYPE, MANIFEST_PREDICATE_TYPE,
 };
 use magnolia_db::{DtrackFindingRecord, SbomComponentRow};
 use sha2::{Digest, Sha256};
@@ -120,6 +120,18 @@ pub struct ManifestJson {
     /// yet, same "not checked yet, not an error" convention as
     /// `dtrack_synced_at: null`.
     pub component_reputation: Vec<ComponentReputationJson>,
+    /// This tenant's license-policy violations for this manifest's
+    /// components — recomputed on read from the stored SBOM bytes and the
+    /// tenant's current policy (same "always live, never a stale snapshot"
+    /// convention as `compliance` above), so an edit to the policy is
+    /// reflected immediately on every manifest, not just new uploads. Empty
+    /// whenever the tenant's `enforce_level` is `off`.
+    pub license_violations: Vec<LicenseViolationJson>,
+    /// Cached deps.dev latest-version results for this manifest's
+    /// components, classified against the installed version — populated in
+    /// the background (see `freshness_sync.rs`), same "not checked yet, not
+    /// an error" convention as `component_reputation`.
+    pub component_freshness: Vec<ComponentFreshnessJson>,
 }
 
 #[derive(serde::Serialize)]
@@ -185,6 +197,48 @@ impl From<magnolia_db::ComponentReputationRecord> for ComponentReputationJson {
     }
 }
 
+/// One component's cached deps.dev latest-version result, classified
+/// against the installed version. Only present for components with a
+/// usable purl whose (ecosystem, registry_name) the freshness background
+/// job has actually reached — see `freshness_sync.rs`.
+#[derive(serde::Serialize)]
+pub struct ComponentFreshnessJson {
+    pub component_name: String,
+    pub component_version: Option<String>,
+    pub latest_version: Option<String>,
+    /// `"current"` | `"behind"` | `"major_behind"` | `"unknown"` — `None`
+    /// only when the freshness job hasn't reached this component yet
+    /// (`checked_at` also `None`), distinct from `"unknown"` (checked, but
+    /// one of the two version strings isn't parseable SemVer).
+    pub status: Option<magnolia_core::FreshnessStatus>,
+    pub checked_at: Option<DateTime<Utc>>,
+    pub fetch_error: Option<String>,
+}
+
+/// Not a plain `From` impl since `status` is a derived field, not a stored
+/// column — `None` only when the freshness job hasn't reached this
+/// component yet; `Some(Unknown)` (as opposed to `None`) once it has been
+/// checked but one of the two version strings isn't parseable SemVer, so
+/// the frontend can tell "pending" apart from "checked, but can't compare."
+fn component_freshness_json(r: magnolia_db::ComponentFreshnessRecord) -> ComponentFreshnessJson {
+    let status = if r.checked_at.is_some() {
+        match (r.component_version.as_deref(), r.latest_version.as_deref()) {
+            (Some(cv), Some(lv)) => Some(magnolia_core::classify_freshness(cv, lv)),
+            _ => Some(magnolia_core::FreshnessStatus::Unknown),
+        }
+    } else {
+        None
+    };
+    ComponentFreshnessJson {
+        component_name: r.component_name,
+        component_version: r.component_version,
+        latest_version: r.latest_version,
+        status,
+        checked_at: r.checked_at,
+        fetch_error: r.fetch_error,
+    }
+}
+
 #[derive(serde::Serialize)]
 pub struct ComplianceProfileJson {
     pub id: String,
@@ -219,6 +273,48 @@ pub struct ComplianceReportJson {
     pub missing_fields: Vec<String>,
 }
 
+#[derive(serde::Serialize)]
+pub struct LicensePolicyJson {
+    pub denied_licenses: Vec<String>,
+    pub flag_unknown: bool,
+    pub enforce_level: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetLicensePolicyRequest {
+    pub denied_licenses: Vec<String>,
+    pub flag_unknown: bool,
+    pub enforce_level: String,
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct LicenseViolationJson {
+    pub component_name: String,
+    pub component_version: Option<String>,
+    pub license_expr: Option<String>,
+    /// "denied" or "unknown" — see `magnolia_core::LicenseViolationReason`.
+    pub reason: String,
+    /// The specific denied identifier matched, e.g. "GPL-3.0-only" out of a
+    /// compound "MIT AND GPL-3.0-only" expression — `None` for `unknown`.
+    pub denied_license: Option<String>,
+}
+
+impl From<CoreLicenseViolation> for LicenseViolationJson {
+    fn from(v: CoreLicenseViolation) -> Self {
+        let (reason, denied_license) = match v.reason {
+            magnolia_core::LicenseViolationReason::Denied { denied } => ("denied".to_string(), Some(denied)),
+            magnolia_core::LicenseViolationReason::Unknown => ("unknown".to_string(), None),
+        };
+        Self {
+            component_name: v.component_name,
+            component_version: v.component_version,
+            license_expr: v.license_expr,
+            reason,
+            denied_license,
+        }
+    }
+}
+
 impl From<CoreComplianceReport> for ComplianceReportJson {
     fn from(r: CoreComplianceReport) -> Self {
         Self {
@@ -250,6 +346,10 @@ pub struct DtrackFindingJson {
     pub vex_comment: Option<String>,
     pub triaged_by: Option<String>,
     pub triaged_at: Option<DateTime<Utc>>,
+    /// `"manual"` | `"vex_import"` | `null` (never triaged, or triaged
+    /// before this field existed) — lets the UI show where the current
+    /// triage came from, e.g. "imported from VEX".
+    pub triage_source: Option<String>,
 }
 
 impl From<DtrackFindingRecord> for DtrackFindingJson {
@@ -267,6 +367,7 @@ impl From<DtrackFindingRecord> for DtrackFindingJson {
             vex_comment: r.vex_comment,
             triaged_by: r.triaged_by,
             triaged_at: r.triaged_at,
+            triage_source: r.triage_source,
         }
     }
 }
@@ -286,6 +387,7 @@ pub struct FindingWithContextJson {
     pub vex_comment: Option<String>,
     pub triaged_by: Option<String>,
     pub triaged_at: Option<DateTime<Utc>>,
+    pub triage_source: Option<String>,
     pub domain: String,
     pub namespace: String,
     pub release_version: String,
@@ -392,6 +494,7 @@ pub async fn list_findings(
                 vex_comment: r.vex_comment,
                 triaged_by: r.triaged_by,
                 triaged_at: r.triaged_at,
+                triage_source: r.triage_source,
                 domain: domain.clone(),
                 namespace: r.namespace,
                 release_version: r.release_version,
@@ -415,12 +518,44 @@ pub struct ComponentSearchResultJson {
     pub release_version: String,
     pub revoked: bool,
     pub document_type: Option<String>,
+    pub license_expr: Option<String>,
 }
 
 #[derive(serde::Serialize)]
 pub struct ReindexResponse {
     pub manifests_indexed: usize,
     pub components_indexed: usize,
+}
+
+/// One manifest in a "blast radius" answer (`GET /components/affected`,
+/// `GET /vulnerabilities/{id}/affected`) — deliberately thinner than
+/// `ComponentSearchResultJson`: the caller already knows which component or
+/// vulnerability it asked about, so only manifest identity/location is
+/// echoed back.
+#[derive(serde::Serialize)]
+pub struct AffectedManifestJson {
+    pub manifest_hash: String,
+    pub domain: String,
+    pub namespace: String,
+    pub release_version: String,
+    pub revoked: bool,
+}
+
+#[derive(serde::Deserialize)]
+pub struct ComponentAffectedQuery {
+    pub purl: Option<String>,
+    pub name: Option<String>,
+    pub version: Option<String>,
+    #[serde(default)]
+    pub current_only: bool,
+    pub tenant_id: Option<Uuid>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct VulnerabilityAffectedQuery {
+    #[serde(default)]
+    pub current_only: bool,
+    pub tenant_id: Option<Uuid>,
 }
 
 #[derive(serde::Serialize)]
@@ -644,13 +779,27 @@ fn validate_sbom_content(data: &[u8], format: &str) -> Result<(), ApiError> {
     magnolia_core::validate_sbom_schema(data, sbom_format).map_err(|e| ApiError::BadRequest(e.to_string()))
 }
 
-/// Rejects an upload at the door when a compliance profile is enforced for
-/// this tenant and the SBOM doesn't meet the configured bar. Runs after
-/// schema validation (so `check()` can assume well-formed JSON) and after
-/// the RBAC upload check (so an unauthorized caller learns nothing about
-/// tenant policy), but before any side effect — storage write, Merkle
-/// mutation, DB insert — so a rejection here leaves nothing to clean up.
-async fn enforce_compliance(state: &AppState, tenant_id: Uuid, format: &str, sbom_bytes: &[u8]) -> Result<(), ApiError> {
+/// One registered compliance profile's report for a tenant, alongside the
+/// `enforce_level` that report was checked under — the input
+/// `enforce_compliance` needs to decide whether to reject, and `/verify`
+/// needs to build its own check rows from, without either duplicating the
+/// "which profiles are enabled, and applicable to this format" logic.
+struct ComplianceEnforcementReport {
+    enforce_level: String,
+    report: CoreComplianceReport,
+}
+
+/// Every compliance profile this tenant has enabled that's applicable to
+/// `format` — a pure read, no side effects, doesn't reject anything. Shared
+/// by `enforce_compliance` (which rejects an upload based on it) and
+/// `/verify` (which reports it directly as check rows).
+async fn compliance_reports_for_tenant(
+    state: &AppState,
+    tenant_id: Uuid,
+    format: &str,
+    sbom_bytes: &[u8],
+) -> Result<Vec<ComplianceEnforcementReport>, ApiError> {
+    let mut out = Vec::new();
     for profile in registered_profiles() {
         let Some(setting) = state.db.get_compliance_setting(tenant_id, profile.id()).await.map_err(db_err)? else {
             continue;
@@ -662,22 +811,144 @@ async fn enforce_compliance(state: &AppState, tenant_id: Uuid, format: &str, sbo
         if !report.applicable {
             continue;
         }
-        if !report.meets_minimum {
+        out.push(ComplianceEnforcementReport { enforce_level: setting.enforce_level, report });
+    }
+    Ok(out)
+}
+
+/// Every registered compliance profile applicable to `format`, each paired
+/// with this tenant's `enforce_level` for it — `"off"` when the tenant has
+/// never enabled that profile at all, same convention
+/// `license_violations_preview_for_tenant` uses for an unconfigured license
+/// policy. Unlike `compliance_reports_for_tenant` (real enforcement, only
+/// what's actually enabled), this always reports every applicable profile:
+/// `/verify`'s preview wants to show what a document would score against
+/// every profile, not just what this tenant currently enforces. Never
+/// rejects anything.
+async fn compliance_reports_preview_for_tenant(
+    state: &AppState,
+    tenant_id: Uuid,
+    format: &str,
+    sbom_bytes: &[u8],
+) -> Result<Vec<ComplianceEnforcementReport>, ApiError> {
+    let mut out = Vec::new();
+    for profile in registered_profiles() {
+        let report = profile.check(format, sbom_bytes);
+        if !report.applicable {
+            continue;
+        }
+        let enforce_level = match state.db.get_compliance_setting(tenant_id, profile.id()).await.map_err(db_err)? {
+            Some(setting) if setting.enabled => setting.enforce_level,
+            _ => "off".to_string(),
+        };
+        out.push(ComplianceEnforcementReport { enforce_level, report });
+    }
+    Ok(out)
+}
+
+/// Rejects an upload at the door when a compliance profile is enforced for
+/// this tenant and the SBOM doesn't meet the configured bar. Runs after
+/// schema validation (so `check()` can assume well-formed JSON) and after
+/// the RBAC upload check (so an unauthorized caller learns nothing about
+/// tenant policy), but before any side effect — storage write, Merkle
+/// mutation, DB insert — so a rejection here leaves nothing to clean up.
+async fn enforce_compliance(state: &AppState, tenant_id: Uuid, format: &str, sbom_bytes: &[u8]) -> Result<(), ApiError> {
+    for r in compliance_reports_for_tenant(state, tenant_id, format, sbom_bytes).await? {
+        if !r.report.meets_minimum {
             return Err(ApiError::BadRequest(format!(
                 "upload rejected: does not meet {} minimum compliance: {}",
-                profile.name(),
-                report.minimum_issues.join("; ")
+                r.report.profile_name,
+                r.report.minimum_issues.join("; ")
             )));
         }
-        if setting.enforce_level == "full" && !report.fully_compliant {
+        if r.enforce_level == "full" && !r.report.fully_compliant {
             return Err(ApiError::BadRequest(format!(
                 "upload rejected: does not meet {} full compliance, missing: {}",
-                profile.name(),
-                report.missing_fields.join("; ")
+                r.report.profile_name,
+                r.report.missing_fields.join("; ")
             )));
         }
     }
     Ok(())
+}
+
+/// This tenant's current license-policy violations for `sbom_bytes`, plus
+/// the policy's `enforce_level` — shared by upload-time enforcement, live
+/// manifest reads (`manifest()`), and `/verify`, so `extract_components` +
+/// `evaluate_license_policy` are wired to a tenant's stored policy in
+/// exactly one place. `enforce_level` is `"off"` (with an empty violations
+/// list) when the tenant has never set a policy — same "always a full
+/// answer" convention `get_tenant_license_policy`'s callers already use.
+async fn license_violations_for_tenant(
+    state: &AppState,
+    tenant_id: Uuid,
+    format: &str,
+    sbom_bytes: &[u8],
+) -> Result<(Vec<CoreLicenseViolation>, String), ApiError> {
+    let Some(policy) = state.db.get_tenant_license_policy(tenant_id).await.map_err(db_err)? else {
+        return Ok((Vec::new(), "off".to_string()));
+    };
+    if policy.enforce_level == "off" {
+        return Ok((Vec::new(), policy.enforce_level));
+    }
+    let components = magnolia_core::extract_components(format, sbom_bytes);
+    let core_policy =
+        magnolia_core::LicensePolicy { denied_licenses: policy.denied_licenses, flag_unknown: policy.flag_unknown };
+    let violations = magnolia_core::evaluate_license_policy(&components, &core_policy);
+    Ok((violations, policy.enforce_level))
+}
+
+/// Same evaluation as `license_violations_for_tenant`, but never gated on
+/// `enforce_level == "off"` — used by `/verify`'s preview, which wants to
+/// show what WOULD flag against this tenant's configured deny-list/
+/// flag_unknown even before enforcement is turned on. A tenant that's
+/// never touched the license policy at all gets an empty deny-list here
+/// (not an error), which naturally yields zero violations.
+async fn license_violations_preview_for_tenant(
+    state: &AppState,
+    tenant_id: Uuid,
+    format: &str,
+    sbom_bytes: &[u8],
+) -> Result<(Vec<CoreLicenseViolation>, String), ApiError> {
+    let policy = state.db.get_tenant_license_policy(tenant_id).await.map_err(db_err)?;
+    let (denied_licenses, flag_unknown, enforce_level) = match policy {
+        Some(p) => (p.denied_licenses, p.flag_unknown, p.enforce_level),
+        None => (Vec::new(), false, "off".to_string()),
+    };
+    let components = magnolia_core::extract_components(format, sbom_bytes);
+    let core_policy = magnolia_core::LicensePolicy { denied_licenses, flag_unknown };
+    let violations = magnolia_core::evaluate_license_policy(&components, &core_policy);
+    Ok((violations, enforce_level))
+}
+
+fn license_violation_detail(v: &CoreLicenseViolation) -> String {
+    match &v.reason {
+        magnolia_core::LicenseViolationReason::Denied { denied } => format!("{} ({})", v.component_name, denied),
+        magnolia_core::LicenseViolationReason::Unknown => format!("{} (no license information)", v.component_name),
+    }
+}
+
+/// Rejects an upload at the door when this tenant's license policy is set to
+/// `block` and the SBOM contains a denied (or, with `flag_unknown` set,
+/// license-less) component. Runs alongside `enforce_compliance`, at the same
+/// point in the pipeline and for the same reason: once
+/// `index_manifest_components` runs below, the SBOM is already stored and
+/// its Merkle leaf/manifest record already committed — nothing past that
+/// point can be un-committed, so `block` enforcement can't be deferred to
+/// that best-effort indexing step and instead re-extracts components here,
+/// before any side effect.
+async fn enforce_license_policy(
+    state: &AppState,
+    tenant_id: Uuid,
+    format: &str,
+    sbom_bytes: &[u8],
+) -> Result<(), ApiError> {
+    let (violations, enforce_level) = license_violations_for_tenant(state, tenant_id, format, sbom_bytes).await?;
+    if enforce_level != "block" || violations.is_empty() {
+        return Ok(());
+    }
+    let details: Vec<String> = violations.iter().map(license_violation_detail).collect();
+    Err(ApiError::BadRequest(format!("upload rejected: license policy violation: {}", details.join("; "))))
 }
 
 /// Extracts and indexes one manifest's components into the reverse-search
@@ -722,6 +993,7 @@ async fn index_manifest_components(
                 is_primary: c.is_primary,
                 ecosystem,
                 registry_name,
+                license_expr: c.license,
             }
         })
         .collect();
@@ -739,11 +1011,28 @@ async fn index_manifest_components(
     // upload-time check still gets picked up by `malicious_sync`'s next
     // pass instead of silently waiting out the full rescan interval.
     if let Some(osv) = &state.osv {
-        let ok = crate::malicious_check::check_and_store_malicious_components(&state.db, osv, manifest_hash, &components)
-            .await;
-        if ok {
+        let result =
+            crate::malicious_check::check_and_store_malicious_components(&state.db, osv, manifest_hash, &components)
+                .await;
+        if let Ok(new_findings) = &result {
             if let Err(e) = state.db.touch_manifest_malicious_checked(manifest_hash).await {
                 tracing::warn!(manifest_hash = %manifest_hash, error = %e, "failed to record malicious_checked_at");
+            }
+            if !new_findings.is_empty() {
+                crate::webhooks::emit_event(
+                    &state.db,
+                    tenant_id,
+                    crate::webhooks::EVENT_MALICIOUS_MATCH_FOUND,
+                    serde_json::json!({
+                        "manifest_hash": manifest_hash,
+                        "matches": new_findings.iter().map(|f| serde_json::json!({
+                            "component_name": f.component_name,
+                            "component_version": f.component_version,
+                            "osv_id": f.osv_id,
+                        })).collect::<Vec<_>>(),
+                    }),
+                )
+                .await;
             }
         }
     }
@@ -870,6 +1159,11 @@ pub struct ConfigJson {
     /// about N minutes" instead of a made-up number.
     pub dtrack_sync_interval_secs: Option<u64>,
     pub reputation_enabled: bool,
+    /// Currently always equal to `reputation_enabled` — freshness checking
+    /// shares deps.dev's presence gate (see `freshness_sync.rs`'s module
+    /// doc comment) — but surfaced as its own field so the frontend doesn't
+    /// have to know that's true today.
+    pub freshness_enabled: bool,
     pub malicious_check_enabled: bool,
 }
 
@@ -886,6 +1180,7 @@ pub async fn config(State(state): State<AppState>, _grant: AuthGrant) -> Json<Co
         dtrack_enabled: state.dtrack.is_some(),
         dtrack_sync_interval_secs: state.dtrack.is_some().then_some(state.dtrack_sync_interval_secs),
         reputation_enabled: state.depsdev.is_some(),
+        freshness_enabled: state.depsdev.is_some(),
         malicious_check_enabled: state.osv.is_some(),
     })
 }
@@ -990,6 +1285,58 @@ pub async fn set_reputation_tenant_setting(
         &state,
         &grant,
         "reputation_tenant_setting",
+        &tenant_id.to_string(),
+        true,
+        Some(format!("disabled={}", body.disabled)),
+    )
+    .await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Serialize)]
+pub struct FreshnessTenantSettingJson {
+    pub disabled: bool,
+}
+
+/// This tenant's opt-out of the "Outdated components" panel appearing on
+/// its own SBOM detail views — same read/write split and reasoning as
+/// `reputation_tenant_setting`.
+pub async fn freshness_tenant_setting(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+) -> Result<Json<FreshnessTenantSettingJson>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    let tenant = state.db.get_tenant(tenant_id).await.map_err(db_err)?.ok_or(ApiError::NotFound)?;
+    Ok(Json(FreshnessTenantSettingJson { disabled: tenant.freshness_disabled }))
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetFreshnessTenantSettingRequest {
+    pub disabled: bool,
+}
+
+/// Toggles this tenant's opt-out of the freshness panel — has no effect on
+/// the background job itself (see the `freshness_disabled` migration
+/// comment), only on display. `Action::ManageSettings`, same gate as
+/// `set_reputation_tenant_setting`.
+pub async fn set_freshness_tenant_setting(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+    Json(body): Json<SetFreshnessTenantSettingRequest>,
+) -> Result<StatusCode, ApiError> {
+    require(&grant, Action::ManageSettings, &grant.namespace_scope)?;
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+
+    state.db.set_tenant_freshness_disabled(tenant_id, body.disabled).await.map_err(db_err)?;
+
+    let _ = record_audit(
+        &state,
+        &grant,
+        "freshness_tenant_setting",
         &tenant_id.to_string(),
         true,
         Some(format!("disabled={}", body.disabled)),
@@ -1368,6 +1715,7 @@ pub async fn upload_sbom(
 
     if format != "document" {
         enforce_compliance(&state, tenant_id, &format, &sbom_bytes).await?;
+        enforce_license_policy(&state, tenant_id, &format, &sbom_bytes).await?;
     }
 
     let tenant_record = state
@@ -1567,6 +1915,19 @@ pub async fn upload_sbom(
         )
         .await
         .map_err(db_err)?;
+
+    crate::webhooks::emit_event(
+        &state.db,
+        tenant_id,
+        crate::webhooks::EVENT_MANIFEST_UPLOADED,
+        serde_json::json!({
+            "manifest_hash": manifest_hash,
+            "namespace": namespace,
+            "version": version,
+            "document_type": document_type_opt,
+        }),
+    )
+    .await;
 
     if format != "document" {
         if let Err(e) = index_manifest_components(&state, tenant_id, &manifest_hash, &format, &sbom_bytes).await {
@@ -1878,6 +2239,32 @@ pub async fn manifest(
         .map(ComponentReputationJson::from)
         .collect();
 
+    let component_freshness: Vec<ComponentFreshnessJson> = state
+        .db
+        .list_freshness_for_manifest(&record.manifest_hash)
+        .await
+        .map_err(db_err)?
+        .into_iter()
+        .map(component_freshness_json)
+        .collect();
+
+    // Live-recomputed, not read back from `sbom_components.license_expr` —
+    // same reasoning as `compliance` above: a policy edit should be
+    // reflected on every existing manifest immediately, not just ones
+    // reindexed since. `document` uploads have no components to extract
+    // (matches `enforce_license_policy`/`index_manifest_components`
+    // skipping them at upload time).
+    let license_violations: Vec<LicenseViolationJson> = if record.document_type.is_none() {
+        license_violations_for_tenant(&state, tenant_id, &record.sbom_format, &sbom_bytes)
+            .await?
+            .0
+            .into_iter()
+            .map(LicenseViolationJson::from)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     Ok(Json(ManifestJson {
         sbom_hex: hex::encode(&sbom_bytes),
         manifest_hash: record.manifest_hash,
@@ -1904,6 +2291,8 @@ pub async fn manifest(
         dtrack_push_error,
         malicious_components,
         component_reputation,
+        license_violations,
+        component_freshness,
     }))
 }
 
@@ -2008,6 +2397,242 @@ pub async fn manifest_vex(
         version: 1,
         statements,
     }))
+}
+
+#[derive(serde::Deserialize)]
+pub struct VexImportQuery {
+    /// When `false` (the default), a statement matching a finding that
+    /// already carries a human ("manual", or unset/legacy) triage is
+    /// skipped rather than overwritten — counted in `skipped_manual`. A
+    /// finding whose current triage is itself a *previous* VEX import is
+    /// always safely refreshed regardless of this flag.
+    #[serde(default)]
+    pub overwrite: bool,
+    pub tenant_id: Option<Uuid>,
+}
+
+#[derive(serde::Serialize)]
+pub struct VexImportUnmatchedJson {
+    pub vuln_id: String,
+    pub reason: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct VexImportResponse {
+    /// Findings whose triage was actually written by this import.
+    pub applied: usize,
+    /// Findings a statement matched but that were left untouched because
+    /// they already carry a human triage and `overwrite` wasn't set.
+    pub skipped_manual: usize,
+    /// Statements that matched zero findings in this manifest at all —
+    /// wrong vulnerability id, a product purl not found in this manifest's
+    /// components, or a status/justification Magnolia doesn't recognize.
+    pub unmatched: Vec<VexImportUnmatchedJson>,
+}
+
+/// Imports a supplier-provided VEX document and applies its statements to
+/// this manifest's cached dtrack findings. OpenVEX only in v1 — CSAF 2.0 is
+/// a documented follow-up (see `magnolia_core::parse_openvex`'s doc
+/// comment). Matching is purely by exact vulnerability id — **no CVE↔GHSA
+/// alias resolution**, a documented v1 gap: a statement about
+/// "CVE-2024-1234" will not match a cached finding dtrack only ever
+/// reported as "GHSA-xxxx" for the same underlying vulnerability, even
+/// though they're the same vulnerability. When a statement names specific
+/// products, matching is further narrowed by purl against this manifest's
+/// indexed `sbom_components` — a statement naming no products applies to
+/// every finding for its vulnerability id in this manifest.
+///
+/// Same `Action::Annotate`/tenant-namespace isolation gate as
+/// `triage_finding`, since this is fundamentally a bulk triage write. The
+/// raw document is stored in object storage next to the SBOM (provenance:
+/// every applied finding gets a comment citing its storage key) before any
+/// triage is applied, so it's preserved even if every statement turns out
+/// unmatched.
+pub async fn import_manifest_vex(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Path(manifest_hash): Path<String>,
+    Query(q): Query<VexImportQuery>,
+    mut multipart: Multipart,
+) -> Result<Json<VexImportResponse>, ApiError> {
+    require(&grant, Action::Annotate, &grant.namespace_scope)?;
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+
+    let record = state.db.get_manifest(&manifest_hash).await.map_err(db_err)?.ok_or(ApiError::NotFound)?;
+    if record.tenant_id != tenant_id
+        || (!cross_tenant && !magnolia_auth::namespace_in_scope(&record.namespace, &grant.namespace_scope))
+    {
+        return Err(ApiError::NotFound);
+    }
+
+    let field = multipart
+        .next_field()
+        .await
+        .map_err(|e| multipart_err("invalid multipart body", e))?
+        .ok_or_else(|| ApiError::BadRequest("missing vex_file field".to_string()))?;
+    let vex_bytes = field.bytes().await.map_err(|e| multipart_err("invalid vex_file field", e))?.to_vec();
+    if vex_bytes.is_empty() {
+        return Err(ApiError::BadRequest("vex_file is empty".to_string()));
+    }
+    if vex_bytes.len() > MAX_SBOM_BYTES {
+        return Err(ApiError::BadRequest("vex_file exceeds 10 MiB limit".to_string()));
+    }
+
+    let statements =
+        magnolia_core::parse_openvex(&vex_bytes).map_err(|e| ApiError::BadRequest(format!("invalid VEX document: {e}")))?;
+
+    // Provenance, written before any triage is applied — same `tenants/{id}/...`
+    // key convention as the SBOM itself (`upload_sbom`'s `s3_key`), content-hash
+    // suffixed so re-importing the identical document twice doesn't collide
+    // with (or overwrite) the first import's stored copy.
+    let doc_hash = hex::encode(Sha256::digest(&vex_bytes));
+    let vex_s3_key = format!("tenants/{}/vex/{}-{}.json", tenant_id, manifest_hash, &doc_hash[..16]);
+    state
+        .storage
+        .put(&vex_s3_key, &vex_bytes)
+        .await
+        .map_err(|e| ApiError::InternalError(format!("storage put failed: {}", e)))?;
+
+    let findings = state.db.list_dtrack_findings(&manifest_hash).await.map_err(db_err)?;
+    let components = state.db.list_sbom_components_for_manifest(&manifest_hash).await.map_err(db_err)?;
+
+    // Resolved once up front, same "don't push to dtrack when sync is off
+    // for this tenant" gate `triage_finding` applies per-call.
+    let dtrack_ready = match &state.dtrack {
+        Some(client) => {
+            let sync_disabled = state
+                .db
+                .get_tenant(tenant_id)
+                .await
+                .map(|t| t.map(|t| t.dtrack_sync_disabled).unwrap_or(true))
+                .unwrap_or(true);
+            (!sync_disabled).then(|| client.clone())
+        }
+        None => None,
+    };
+
+    let mut applied = 0usize;
+    let mut skipped_manual = 0usize;
+    let mut unmatched = Vec::new();
+
+    for stmt in statements {
+        if !["affected", "not_affected", "fixed", "under_investigation"].contains(&stmt.status.as_str()) {
+            unmatched.push(VexImportUnmatchedJson {
+                vuln_id: stmt.vuln_id,
+                reason: format!("unrecognized status '{}'", stmt.status),
+            });
+            continue;
+        }
+        if stmt.status == "not_affected"
+            && !stmt.justification.as_deref().map(|j| VEX_JUSTIFICATIONS.contains(&j)).unwrap_or(false)
+        {
+            unmatched.push(VexImportUnmatchedJson {
+                vuln_id: stmt.vuln_id,
+                reason: "missing or unrecognized justification for a not_affected statement".to_string(),
+            });
+            continue;
+        }
+
+        // Product scoping: `None` means the statement named no products
+        // (applies to every finding for this vuln_id); `Some` is the set of
+        // (component_name, component_version) pairs this manifest's
+        // indexed components resolve the statement's purls to.
+        let scoped_components: Option<std::collections::HashSet<(String, Option<String>)>> = if stmt.purls.is_empty()
+        {
+            None
+        } else {
+            Some(
+                components
+                    .iter()
+                    .filter(|c| c.purl.as_deref().map(|p| stmt.purls.iter().any(|sp| sp == p)).unwrap_or(false))
+                    .map(|c| (c.name.clone(), c.version.clone()))
+                    .collect(),
+            )
+        };
+
+        let matched: Vec<&DtrackFindingRecord> = findings
+            .iter()
+            .filter(|f| f.vulnerability_id == stmt.vuln_id)
+            .filter(|f| match &scoped_components {
+                None => true,
+                Some(set) => set.contains(&(f.component_name.clone(), f.component_version.clone())),
+            })
+            .collect();
+
+        if matched.is_empty() {
+            let reason = if stmt.purls.is_empty() {
+                format!("no cached finding for {} in this manifest", stmt.vuln_id)
+            } else {
+                "no component in this manifest matches the statement's product purl(s)".to_string()
+            };
+            unmatched.push(VexImportUnmatchedJson { vuln_id: stmt.vuln_id, reason });
+            continue;
+        }
+
+        for finding in matched {
+            let has_existing_triage = finding.vex_status.is_some();
+            let human_owned = has_existing_triage && finding.triage_source.as_deref() != Some("vex_import");
+            if human_owned && !q.overwrite {
+                skipped_manual += 1;
+                continue;
+            }
+
+            let Ok(Some(updated)) = state
+                .db
+                .set_finding_triage(
+                    &manifest_hash,
+                    &finding.finding_key,
+                    &stmt.status,
+                    stmt.justification.as_deref(),
+                    stmt.status_notes.as_deref(),
+                    &grant.principal(),
+                    "vex_import",
+                )
+                .await
+            else {
+                continue;
+            };
+            applied += 1;
+
+            let _ = state
+                .db
+                .add_finding_comment(
+                    &manifest_hash,
+                    &finding.finding_key,
+                    &grant.principal(),
+                    &format!("Applied from imported VEX document ({vex_s3_key}): status={}", stmt.status),
+                )
+                .await;
+
+            if let Some(client) = &dtrack_ready {
+                if let (Some(cuuid), Some(vuuid)) = (&updated.component_uuid, &updated.vulnerability_uuid) {
+                    crate::dtrack_sync::push_triage_to_dtrack(
+                        &state.db,
+                        client,
+                        &manifest_hash,
+                        cuuid,
+                        vuuid,
+                        &stmt.status,
+                        stmt.justification.as_deref(),
+                        stmt.status_notes.as_deref(),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    let _ = record_audit(
+        &state,
+        &grant,
+        "vex_import",
+        &manifest_hash,
+        true,
+        Some(format!("applied={applied}; skipped_manual={skipped_manual}; unmatched={}", unmatched.len())),
+    )
+    .await;
+
+    Ok(Json(VexImportResponse { applied, skipped_manual, unmatched }))
 }
 
 #[derive(serde::Deserialize)]
@@ -2400,24 +3025,81 @@ pub async fn list_compliance_profiles(grant: AuthGrant) -> Result<Json<Vec<Compl
 }
 
 #[derive(serde::Serialize)]
-pub struct ComplianceCheckResponse {
-    pub reports: Vec<ComplianceReportJson>,
+pub struct VerifyCheckJson {
+    pub id: String,
+    /// "pass" | "fail" | "warn" | "not_evaluated".
+    pub status: String,
+    /// The enforce level this check ran under — echoes the tenant's own
+    /// configuration (compliance profile's/license policy's enforce_level),
+    /// "warn" for the fixed-informational malicious-package check, or "n/a"
+    /// for the always-`not_evaluated` async signals.
+    pub enforce_level: String,
+    pub details: Vec<String>,
 }
 
-/// Standalone "does this SBOM meet requirements" check — the Tools tab's
-/// compliance checker. Runs the exact same profile `check()` logic
-/// `upload_sbom`/`manifest()` use, but on caller-supplied bytes that are
-/// never stored, indexed, or added to the Merkle log: nothing here
-/// persists, so it's safe to try an SBOM that doesn't belong in the
-/// archive yet (a draft, a "does this even qualify" spot check) without
-/// creating a real, permanent manifest. Every registered profile is
-/// checked regardless of this tenant's own enable/enforce settings — the
-/// point is exploring what a document would score, not tenant policy.
-pub async fn check_compliance(
+/// Per-profile compliance detail behind `VerifyResponse::compliance` —
+/// `checks` only carries a flattened pass/fail/warn status, which collapses
+/// "meets the minimum bar but isn't fully compliant" and "doesn't even meet
+/// the minimum bar" into the same "warn"/"fail" label. This carries
+/// `meets_minimum`/`fully_compliant` explicitly so the UI can show that
+/// distinction directly instead of the caller reverse-engineering it from a
+/// status string.
+#[derive(serde::Serialize)]
+pub struct VerifyComplianceJson {
+    pub profile_id: String,
+    pub profile_name: String,
+    /// This tenant's enforce_level for this profile — "off" when the
+    /// profile isn't enabled at all, same convention `checks` uses.
+    pub enforce_level: String,
+    pub meets_minimum: bool,
+    pub minimum_issues: Vec<String>,
+    pub fully_compliant: bool,
+    pub missing_fields: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct VerifyResponse {
+    /// "pass" | "fail" — "fail" iff at least one check's status is "fail".
+    /// A "warn"-status check never flips this to "fail": CI decides its own
+    /// strictness by reading `checks`, this field alone is "would the
+    /// equivalent upload have been accepted."
+    pub verdict: String,
+    pub checks: Vec<VerifyCheckJson>,
+    /// Same compliance-profile results as the `compliance:*` rows in
+    /// `checks` above, kept there too for CI scripts that just walk
+    /// `checks` generically — this is the richer, UI-friendly view of the
+    /// exact same evaluation.
+    pub compliance: Vec<VerifyComplianceJson>,
+}
+
+fn verify_check(id: &str, status: &str, enforce_level: &str, details: Vec<String>) -> VerifyCheckJson {
+    VerifyCheckJson { id: id.to_string(), status: status.to_string(), enforce_level: enforce_level.to_string(), details }
+}
+
+/// `POST /verify` — the CI policy gate: runs the exact same schema,
+/// compliance-profile, and license-policy checks `upload_sbom` enforces,
+/// plus a synchronous malicious-package check, against caller-supplied
+/// bytes that are never stored, indexed, or added to the Merkle log — no
+/// `sbom_file` reaches `state.storage`, no leaf/manifest row is written, no
+/// namespace or version is even required. A dry run for CI to gate a
+/// pipeline step on before an actual `upload_sbom` call.
+///
+/// Package reputation and Dependency-Track findings are inherently
+/// asynchronous — populated by background jobs on their own schedules, not
+/// computable synchronously from SBOM bytes alone — and are reported
+/// `not_evaluated` rather than making CI wait on external service latency
+/// or giving a false "pass" for something that was never actually checked.
+///
+/// `Action::Upload` — strictly weaker than an actual upload (nothing is
+/// written here), so this reuses that permission rather than inventing a
+/// separate one.
+pub async fn verify_sbom(
+    State(state): State<AppState>,
     grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
     mut multipart: Multipart,
-) -> Result<Json<ComplianceCheckResponse>, ApiError> {
-    require(&grant, Action::Read, &grant.namespace_scope)?;
+) -> Result<Json<VerifyResponse>, ApiError> {
+    require(&grant, Action::Upload, &grant.namespace_scope)?;
 
     let field = multipart
         .next_field()
@@ -2437,11 +3119,7 @@ pub async fn check_compliance(
         .map_err(|e| multipart_err("invalid multipart body", e))?
     {
         if next.name() == Some("format") {
-            format = next
-                .text()
-                .await
-                .map_err(|e| multipart_err("invalid format field", e))?
-                .to_lowercase();
+            format = next.text().await.map_err(|e| multipart_err("invalid format field", e))?.to_lowercase();
         }
     }
 
@@ -2451,16 +3129,239 @@ pub async fn check_compliance(
     if sbom_bytes.len() > MAX_SBOM_BYTES {
         return Err(ApiError::BadRequest("sbom_file exceeds 10 MiB limit".to_string()));
     }
-    validate_sbom_content(&sbom_bytes, &format)?;
+    if !matches!(format.as_str(), "cyclonedx" | "spdx") {
+        return Err(ApiError::BadRequest(format!("unsupported format: {} (use cyclonedx or spdx)", format)));
+    }
 
-    let reports: Vec<ComplianceReportJson> = registered_profiles()
-        .iter()
-        .map(|p| p.check(&format, &sbom_bytes))
-        .filter(|r| r.applicable)
-        .map(ComplianceReportJson::from)
-        .collect();
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
 
-    Ok(Json(ComplianceCheckResponse { reports }))
+    let mut checks = Vec::new();
+    let mut compliance = Vec::new();
+
+    // ---- schema: everything below assumes well-formed JSON matching the
+    // format's spec (same precondition `ComplianceProfile::check` and
+    // `extract_components` document), so a schema failure short-circuits
+    // every other check rather than running them against malformed input.
+    let schema_ok = match validate_sbom_content(&sbom_bytes, &format) {
+        Ok(()) => {
+            checks.push(verify_check("schema", "pass", "block", Vec::new()));
+            true
+        }
+        Err(e) => {
+            checks.push(verify_check("schema", "fail", "block", vec![e.to_string()]));
+            false
+        }
+    };
+
+    if schema_ok {
+        // ---- compliance profiles — previews EVERY registered profile
+        // applicable to this format (BSI TR-03183, NTIA, etc.), not just
+        // the ones this tenant has enabled: this used to be the Tools tab's
+        // separate "Check compliance" tool, folded in here so the policy
+        // gate is the one place that answers "what would this SBOM score."
+        // A profile this tenant hasn't enabled reports under `enforce_level
+        // "off"` and can only ever "pass"/"warn" — it never flips the
+        // verdict, since nothing here is actually being enforced for it.
+        for r in compliance_reports_preview_for_tenant(&state, tenant_id, &format, &sbom_bytes).await? {
+            let mut details = r.report.minimum_issues.clone();
+            details.extend(r.report.missing_fields.clone());
+            let compliant = r.report.meets_minimum && r.report.fully_compliant;
+            let status = if r.enforce_level == "off" {
+                if compliant { "pass" } else { "warn" }
+            } else if !r.report.meets_minimum {
+                "fail"
+            } else if r.enforce_level == "full" && !r.report.fully_compliant {
+                "fail"
+            } else if !r.report.fully_compliant {
+                "warn"
+            } else {
+                "pass"
+            };
+            checks.push(verify_check(&format!("compliance:{}", r.report.profile_id), status, &r.enforce_level, details));
+            compliance.push(VerifyComplianceJson {
+                profile_id: r.report.profile_id.clone(),
+                profile_name: r.report.profile_name.clone(),
+                enforce_level: r.enforce_level.clone(),
+                meets_minimum: r.report.meets_minimum,
+                minimum_issues: r.report.minimum_issues.clone(),
+                fully_compliant: r.report.fully_compliant,
+                missing_fields: r.report.missing_fields.clone(),
+            });
+        }
+
+        // ---- license policy — always previewed against this tenant's
+        // configured deny-list/flag_unknown, even when enforce_level is
+        // "off" or nothing has been configured yet (an empty deny-list
+        // then, not an error). Also folded in from the former Tools
+        // "Check compliance" tool — a tenant drafting a policy wants to
+        // preview its effect before flipping enforcement on. Only actually
+        // fails the verdict when `enforce_level == "block"`.
+        let (violations, license_enforce_level) =
+            license_violations_preview_for_tenant(&state, tenant_id, &format, &sbom_bytes).await?;
+        let status = if violations.is_empty() {
+            "pass"
+        } else if license_enforce_level == "block" {
+            "fail"
+        } else {
+            "warn"
+        };
+        let details = violations.iter().map(license_violation_detail).collect();
+        checks.push(verify_check("license-policy", status, &license_enforce_level, details));
+
+        // ---- malicious packages + general vulnerabilities (synchronous OSV
+        // querybatch — the same shared check `index_manifest_components`
+        // uses at upload time, see `malicious_check::find_malicious_components`).
+        // One querybatch call backs both checks below; neither fails the
+        // verdict on its own (matches real uploads, which are never
+        // rejected for this) — "warn" only.
+        match &state.osv {
+            Some(osv) => {
+                let extracted = magnolia_core::extract_components(&format, &sbom_bytes);
+                let components: Vec<magnolia_db::NewSbomComponent> = extracted
+                    .into_iter()
+                    .map(|c| magnolia_db::NewSbomComponent {
+                        name: c.name,
+                        version: c.version,
+                        purl: c.purl,
+                        cpe: c.cpe,
+                        is_primary: c.is_primary,
+                        ecosystem: None,
+                        registry_name: None,
+                        license_expr: None,
+                    })
+                    .collect();
+                match crate::malicious_check::find_malicious_components(osv, &components).await {
+                    Some(result) => {
+                        let malicious_status = if result.malicious.is_empty() { "pass" } else { "warn" };
+                        let malicious_details =
+                            result.malicious.iter().map(|f| format!("{} ({})", f.component_name, f.osv_id)).collect();
+                        checks.push(verify_check("malicious-packages", malicious_status, "warn", malicious_details));
+
+                        let vuln_status = if result.vulnerabilities.is_empty() { "pass" } else { "warn" };
+                        let vuln_details = result
+                            .vulnerabilities
+                            .iter()
+                            .map(|v| format!("{} ({})", v.component_name, v.vuln_id))
+                            .collect();
+                        checks.push(verify_check("vulnerabilities", vuln_status, "warn", vuln_details));
+                    }
+                    None => {
+                        checks.push(verify_check(
+                            "malicious-packages",
+                            "not_evaluated",
+                            "warn",
+                            vec!["OSV lookup failed".to_string()],
+                        ));
+                        checks.push(verify_check(
+                            "vulnerabilities",
+                            "not_evaluated",
+                            "warn",
+                            vec!["OSV lookup failed".to_string()],
+                        ));
+                    }
+                }
+            }
+            None => {
+                checks.push(verify_check(
+                    "malicious-packages",
+                    "not_evaluated",
+                    "warn",
+                    vec!["malicious-package checking is disabled for this deployment".to_string()],
+                ));
+                checks.push(verify_check(
+                    "vulnerabilities",
+                    "not_evaluated",
+                    "warn",
+                    vec!["OSV-backed vulnerability checking is disabled for this deployment".to_string()],
+                ));
+            }
+        }
+
+        // ---- outdated components (major-version-behind only, warn-only —
+        // a read against the freshness background job's existing cache, no
+        // live deps.dev call in the request path, so this doesn't add to
+        // CI's external latency the way a fresh lookup would).
+        match &state.depsdev {
+            Some(_) => {
+                let extracted = magnolia_core::extract_components(&format, &sbom_bytes);
+                let mut major_behind = Vec::new();
+                for c in &extracted {
+                    let (Some(purl), Some(version)) = (c.purl.as_deref().filter(|p| !p.is_empty()), c.version.as_deref())
+                    else {
+                        continue;
+                    };
+                    let Some((ecosystem, name)) = magnolia_core::purl_to_depsdev_package(purl) else { continue };
+                    if let Ok(Some(latest)) = state.db.get_component_freshness(ecosystem, &name).await {
+                        if magnolia_core::classify_freshness(version, &latest) == magnolia_core::FreshnessStatus::MajorBehind
+                        {
+                            major_behind.push(format!("{} ({version} → {latest})", c.name));
+                        }
+                    }
+                }
+                let status = if major_behind.is_empty() { "pass" } else { "warn" };
+                checks.push(verify_check("outdated-components", status, "warn", major_behind));
+            }
+            None => checks.push(verify_check(
+                "outdated-components",
+                "not_evaluated",
+                "warn",
+                vec!["freshness checking is disabled for this deployment".to_string()],
+            )),
+        }
+    }
+
+    // ---- package reputation (OpenSSF Scorecard, warn-only — a read
+    // against the reputation background job's existing cache, no live
+    // deps.dev call in the request path; same "cache read, not a live
+    // call" shape as `outdated-components` above, and gated on the same
+    // `state.depsdev` since `component_reputation` is populated by the
+    // reputation-sync loop that requires it).
+    match &state.depsdev {
+        Some(_) => {
+            let extracted = magnolia_core::extract_components(&format, &sbom_bytes);
+            let mut low_reputation = Vec::new();
+            for c in &extracted {
+                let Some(purl) = c.purl.as_deref().filter(|p| !p.is_empty()) else { continue };
+                let Some((ecosystem, name)) = magnolia_core::purl_to_depsdev_package(purl) else { continue };
+                if let Ok(Some(score)) = state.db.get_component_reputation(ecosystem, &name).await {
+                    if crate::reputation_bucket::bucket_for_score(score) == crate::reputation_bucket::ReputationBucket::Red {
+                        low_reputation.push(format!("{} (score {score:.1})", c.name));
+                    }
+                }
+            }
+            let status = if low_reputation.is_empty() { "pass" } else { "warn" };
+            checks.push(verify_check("package-reputation", status, "warn", low_reputation));
+        }
+        None => checks.push(verify_check(
+            "package-reputation",
+            "not_evaluated",
+            "warn",
+            vec!["reputation checking is disabled for this deployment".to_string()],
+        )),
+    }
+
+    // ---- async-by-nature signals: never evaluated synchronously, see this
+    // function's doc comment.
+    checks.push(verify_check(
+        "dependency-track",
+        "not_evaluated",
+        "n/a",
+        vec!["Dependency-Track scanning runs asynchronously; not evaluated synchronously".to_string()],
+    ));
+
+    let verdict = if checks.iter().any(|c| c.status == "fail") { "fail" } else { "pass" };
+
+    record_audit(
+        &state,
+        &grant,
+        "verify",
+        &format!("{}:{}", grant.domain, format),
+        verdict == "pass",
+        Some(format!("verdict={}", verdict)),
+    )
+    .await;
+
+    Ok(Json(VerifyResponse { verdict: verdict.to_string(), checks, compliance }))
 }
 
 /// This tenant's setting for every registered profile — always the full
@@ -2514,6 +3415,51 @@ pub async fn set_compliance_setting(
     state
         .db
         .set_compliance_setting(tenant_id, &body.profile_id, body.enabled, &body.enforce_level, &grant.principal())
+        .await
+        .map_err(db_err)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// This tenant's license policy — defaults reported when the tenant has
+/// never set one (`enforce_level: "off"`, empty deny-list), same "always a
+/// full answer, never a 404" convention as `compliance_settings`.
+/// `Action::Read`; only `set_license_policy` requires `ManageSettings`.
+pub async fn license_policy(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+) -> Result<Json<LicensePolicyJson>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    let row = state.db.get_tenant_license_policy(tenant_id).await.map_err(db_err)?;
+    Ok(Json(match row {
+        Some(r) => LicensePolicyJson {
+            denied_licenses: r.denied_licenses,
+            flag_unknown: r.flag_unknown,
+            enforce_level: r.enforce_level,
+        },
+        None => LicensePolicyJson { denied_licenses: Vec::new(), flag_unknown: false, enforce_level: "off".to_string() },
+    }))
+}
+
+/// Sets this tenant's license policy. `Action::ManageSettings` — same gate
+/// as `set_compliance_setting`, since `block` can reject uploads tenant-wide.
+pub async fn set_license_policy(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+    Json(body): Json<SetLicensePolicyRequest>,
+) -> Result<StatusCode, ApiError> {
+    require(&grant, Action::ManageSettings, &grant.namespace_scope)?;
+    if !matches!(body.enforce_level.as_str(), "off" | "warn" | "block") {
+        return Err(ApiError::BadRequest("enforce_level must be one of: off, warn, block".to_string()));
+    }
+    let denied_licenses: Vec<String> =
+        body.denied_licenses.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    state
+        .db
+        .set_tenant_license_policy(tenant_id, &denied_licenses, body.flag_unknown, &body.enforce_level, &grant.principal())
         .await
         .map_err(db_err)?;
     Ok(StatusCode::NO_CONTENT)
@@ -2585,6 +3531,91 @@ pub async fn search_components(
                 release_version: r.release_version,
                 revoked: r.revoked,
                 document_type: r.document_type,
+                license_expr: r.license_expr,
+            })
+            .collect(),
+    ))
+}
+
+/// "Which namespaces/manifests contain component X" — the component side of
+/// blast radius. Same `Action::Read` + namespace-scope honoring as
+/// `search_components`; at least one of `purl`/`name` is required, same
+/// convention as that endpoint.
+pub async fn components_affected(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(query): Query<ComponentAffectedQuery>,
+) -> Result<Json<Vec<AffectedManifestJson>>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, query.tenant_id)?;
+    let scope = if cross_tenant { "/" } else { &grant.namespace_scope };
+
+    let purl = query.purl.as_deref().filter(|s| !s.is_empty());
+    let name = query.name.as_deref().filter(|s| !s.is_empty());
+    let version = query.version.as_deref().filter(|s| !s.is_empty());
+    if purl.is_none() && name.is_none() {
+        return Err(ApiError::BadRequest("provide at least one of purl or name".to_string()));
+    }
+
+    let domain = if cross_tenant {
+        state.db.get_tenant(tenant_id).await.map_err(db_err)?.map(|t| t.domain).unwrap_or_default()
+    } else {
+        grant.domain.clone()
+    };
+
+    let rows = state
+        .db
+        .list_manifests_containing_component(tenant_id, scope, purl, name, version, query.current_only)
+        .await
+        .map_err(db_err)?;
+
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| AffectedManifestJson {
+                manifest_hash: r.manifest_hash,
+                domain: domain.clone(),
+                namespace: r.namespace,
+                release_version: r.release_version,
+                revoked: r.revoked,
+            })
+            .collect(),
+    ))
+}
+
+/// "Which manifests are affected by CVE/advisory Y" — the vulnerability
+/// side of blast radius. Matches both `dtrack_findings` (CVE/GHSA ids) and
+/// `malicious_component_findings` (OSV `MAL-` ids) so one id, from either
+/// signal source, resolves to every manifest it touches.
+pub async fn vulnerability_affected(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Path(vuln_id): Path<String>,
+    Query(query): Query<VulnerabilityAffectedQuery>,
+) -> Result<Json<Vec<AffectedManifestJson>>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, query.tenant_id)?;
+    let scope = if cross_tenant { "/" } else { &grant.namespace_scope };
+
+    let domain = if cross_tenant {
+        state.db.get_tenant(tenant_id).await.map_err(db_err)?.map(|t| t.domain).unwrap_or_default()
+    } else {
+        grant.domain.clone()
+    };
+
+    let rows = state
+        .db
+        .list_manifests_affected_by_vulnerability(tenant_id, scope, &vuln_id, query.current_only)
+        .await
+        .map_err(db_err)?;
+
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| AffectedManifestJson {
+                manifest_hash: r.manifest_hash,
+                domain: domain.clone(),
+                namespace: r.namespace,
+                release_version: r.release_version,
+                revoked: r.revoked,
             })
             .collect(),
     ))
@@ -2748,6 +3779,61 @@ pub async fn reputation_status(
 }
 
 #[derive(serde::Serialize)]
+pub struct FreshnessSyncResponse {
+    pub components_processed: usize,
+}
+
+/// Runs one on-demand batch of the freshness background job (see
+/// `freshness_sync.rs`) — same deployment-global, `Action::ManageSettings`
+/// shape as `force_reputation_sync`. 400 if reputation/freshness scoring
+/// isn't enabled for this deployment (freshness shares `depsdev`'s presence
+/// gate — there is no separate `DISABLE_FRESHNESS_CHECK` flag, see
+/// `freshness_sync.rs`'s module doc comment).
+pub async fn force_freshness_sync(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+) -> Result<Json<FreshnessSyncResponse>, ApiError> {
+    require(&grant, Action::ManageSettings, &grant.namespace_scope)?;
+
+    let client = state
+        .depsdev
+        .as_ref()
+        .ok_or_else(|| ApiError::BadRequest("package freshness checking is disabled for this deployment".to_string()))?;
+
+    let components_processed = crate::freshness_sync::sync_pass(&state.db, client).await;
+
+    let _ = record_audit(
+        &state,
+        &grant,
+        "freshness_force_sync",
+        &format!("components_processed={components_processed}"),
+        true,
+        None,
+    )
+    .await;
+
+    Ok(Json(FreshnessSyncResponse { components_processed }))
+}
+
+#[derive(serde::Serialize)]
+pub struct FreshnessStatusJson {
+    pub pending: i64,
+    pub checked: i64,
+    pub failed: i64,
+}
+
+/// Deployment-wide counts of the freshness background job's progress — same
+/// shape/reasoning as `reputation_status`.
+pub async fn freshness_status(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+) -> Result<Json<FreshnessStatusJson>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let status = state.db.freshness_status(crate::freshness_sync::stale_before_cutoff()).await.map_err(db_err)?;
+    Ok(Json(FreshnessStatusJson { pending: status.pending, checked: status.checked, failed: status.failed }))
+}
+
+#[derive(serde::Serialize)]
 pub struct MaliciousSyncResponse {
     pub manifests_processed: usize,
 }
@@ -2891,6 +3977,18 @@ pub async fn revoke_manifest(
 
     let _ = record_audit(&state, &grant, "manifest_revoke", &manifest_hash, true, None).await;
 
+    crate::webhooks::emit_event(
+        &state.db,
+        tenant_id,
+        crate::webhooks::EVENT_MANIFEST_REVOKED,
+        serde_json::json!({
+            "manifest_hash": manifest_hash,
+            "namespace": record.namespace,
+            "revoked_by": grant.principal(),
+        }),
+    )
+    .await;
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2968,6 +4066,7 @@ pub async fn triage_finding(
             body.justification.as_deref(),
             body.comment.as_deref(),
             &grant.principal(),
+            "manual",
         )
         .await
         .map_err(db_err)?
@@ -3125,6 +4224,248 @@ pub async fn list_finding_comments(
 
     let comments = state.db.list_finding_comments(&manifest_hash, &finding_key).await.map_err(db_err)?;
     Ok(Json(comments.into_iter().map(Into::into).collect()))
+}
+
+// ---------- Webhooks ----------
+
+/// A tenant's webhook endpoint as returned by every read/list/create/update
+/// call — `secret` is deliberately never included here (write-only, shown
+/// once at creation in `CreateWebhookEndpointResponse`, same "shown once"
+/// convention as an API key's secret).
+#[derive(serde::Serialize)]
+pub struct WebhookEndpointJson {
+    pub id: Uuid,
+    pub url: String,
+    pub event_types: Vec<String>,
+    pub enabled: bool,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<magnolia_db::WebhookEndpointRecord> for WebhookEndpointJson {
+    fn from(r: magnolia_db::WebhookEndpointRecord) -> Self {
+        Self {
+            id: r.id,
+            url: r.url,
+            event_types: r.event_types,
+            enabled: r.enabled,
+            created_by: mask_principal(&r.created_by),
+            created_at: r.created_at,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct CreateWebhookEndpointRequest {
+    pub url: String,
+    pub event_types: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct CreateWebhookEndpointResponse {
+    pub id: Uuid,
+    pub url: String,
+    pub event_types: Vec<String>,
+    /// The HMAC-SHA256 signing secret — shown exactly once, here. Lost if
+    /// not copied now; there is no "reveal secret" endpoint, same as an API
+    /// key's secret.
+    pub secret: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct UpdateWebhookEndpointRequest {
+    pub url: String,
+    pub event_types: Vec<String>,
+    pub enabled: bool,
+}
+
+fn validate_webhook_event_types(event_types: &[String]) -> Result<(), ApiError> {
+    if event_types.is_empty() {
+        return Err(ApiError::BadRequest("event_types must not be empty".to_string()));
+    }
+    for et in event_types {
+        if !crate::webhooks::ALL_EVENT_TYPES.contains(&et.as_str()) {
+            return Err(ApiError::BadRequest(format!(
+                "unknown event_type '{et}' (valid: {})",
+                crate::webhooks::ALL_EVENT_TYPES.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Every webhook endpoint registered for this tenant. `Action::Read` — same
+/// gate as browsing any other tenant configuration; only creating/changing
+/// one requires `ManageSettings`.
+pub async fn list_webhooks(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+) -> Result<Json<Vec<WebhookEndpointJson>>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    let rows = state.db.list_webhook_endpoints(tenant_id).await.map_err(db_err)?;
+    Ok(Json(rows.into_iter().map(WebhookEndpointJson::from).collect()))
+}
+
+/// Registers a new webhook endpoint. `Action::ManageSettings` — this is
+/// tenant-wide infrastructure (any subscribed event fires to this URL for
+/// every uploader), same gate as compliance-profile enforcement.
+pub async fn create_webhook(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+    Json(body): Json<CreateWebhookEndpointRequest>,
+) -> Result<Json<CreateWebhookEndpointResponse>, ApiError> {
+    require(&grant, Action::ManageSettings, &grant.namespace_scope)?;
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+
+    let url = body.url.trim().to_string();
+    if url.is_empty() {
+        return Err(ApiError::BadRequest("url must not be empty".to_string()));
+    }
+    crate::webhooks::check_webhook_url(&url, state.dev_mode).map_err(ApiError::BadRequest)?;
+    validate_webhook_event_types(&body.event_types)?;
+
+    let id = Uuid::new_v4();
+    // Same "two concatenated UUIDs" idiom `generate_server_key` uses for an
+    // API key's secret — plenty of entropy for an HMAC key, no extra `rand`
+    // dependency needed.
+    let secret = format!("{}{}", Uuid::new_v4(), Uuid::new_v4());
+    state
+        .db
+        .insert_webhook_endpoint(id, tenant_id, &url, &secret, &body.event_types, &grant.principal())
+        .await
+        .map_err(db_err)?;
+
+    let _ = record_audit(&state, &grant, "webhook_create", &id.to_string(), true, None).await;
+
+    Ok(Json(CreateWebhookEndpointResponse { id, url, event_types: body.event_types, secret }))
+}
+
+/// Updates an existing endpoint's URL/subscriptions/enabled state.
+/// `Action::ManageSettings`, tenant-scoped via the `WHERE` clause inside
+/// `update_webhook_endpoint` — a 404 (not 403) either way an id doesn't
+/// resolve within this tenant, same "don't confirm existence of another
+/// tenant's resource" convention used elsewhere.
+pub async fn update_webhook(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Path(id): Path<Uuid>,
+    Query(q): Query<TenantOverrideQuery>,
+    Json(body): Json<UpdateWebhookEndpointRequest>,
+) -> Result<StatusCode, ApiError> {
+    require(&grant, Action::ManageSettings, &grant.namespace_scope)?;
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+
+    let url = body.url.trim().to_string();
+    if url.is_empty() {
+        return Err(ApiError::BadRequest("url must not be empty".to_string()));
+    }
+    crate::webhooks::check_webhook_url(&url, state.dev_mode).map_err(ApiError::BadRequest)?;
+    validate_webhook_event_types(&body.event_types)?;
+
+    let updated =
+        state.db.update_webhook_endpoint(tenant_id, id, &url, &body.event_types, body.enabled).await.map_err(db_err)?;
+    if !updated {
+        return Err(ApiError::NotFound);
+    }
+    let _ = record_audit(&state, &grant, "webhook_update", &id.to_string(), true, None).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn delete_webhook(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Path(id): Path<Uuid>,
+    Query(q): Query<TenantOverrideQuery>,
+) -> Result<StatusCode, ApiError> {
+    require(&grant, Action::ManageSettings, &grant.namespace_scope)?;
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    let deleted = state.db.delete_webhook_endpoint(tenant_id, id).await.map_err(db_err)?;
+    if !deleted {
+        return Err(ApiError::NotFound);
+    }
+    let _ = record_audit(&state, &grant, "webhook_delete", &id.to_string(), true, None).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Serialize)]
+pub struct WebhookTestResponse {
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+/// Sends a one-off `webhook.test` event to this endpoint right now,
+/// bypassing the outbox's polling delay — the "Send test event" button.
+/// `Action::ManageSettings`, same gate as create/update: this makes an
+/// outbound HTTP call to a URL an operator controls, which is the same
+/// class of action as registering that URL in the first place.
+pub async fn test_webhook(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Path(id): Path<Uuid>,
+    Query(q): Query<TenantOverrideQuery>,
+) -> Result<Json<WebhookTestResponse>, ApiError> {
+    require(&grant, Action::ManageSettings, &grant.namespace_scope)?;
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    let endpoint = state.db.get_webhook_endpoint(tenant_id, id).await.map_err(db_err)?.ok_or(ApiError::NotFound)?;
+
+    let http = reqwest::Client::new();
+    match crate::webhooks::send_test_event(&state.db, &http, &endpoint, state.dev_mode).await {
+        Ok(()) => Ok(Json(WebhookTestResponse { ok: true, error: None })),
+        Err(e) => Ok(Json(WebhookTestResponse { ok: false, error: Some(e) })),
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct WebhookDeliveryJson {
+    pub id: i64,
+    pub event_type: String,
+    pub status: String,
+    pub attempts: i32,
+    pub next_attempt_at: DateTime<Utc>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub delivered_at: Option<DateTime<Utc>>,
+}
+
+impl From<magnolia_db::WebhookDeliveryRecord> for WebhookDeliveryJson {
+    fn from(r: magnolia_db::WebhookDeliveryRecord) -> Self {
+        Self {
+            id: r.id,
+            event_type: r.event_type,
+            status: r.status,
+            attempts: r.attempts,
+            next_attempt_at: r.next_attempt_at,
+            last_error: r.last_error,
+            created_at: r.created_at,
+            delivered_at: r.delivered_at,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct WebhookDeliveriesQuery {
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+    pub tenant_id: Option<Uuid>,
+}
+
+/// One endpoint's recent delivery history, newest first — what the
+/// Settings page's "recent deliveries" table reads.
+pub async fn webhook_deliveries(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Path(id): Path<Uuid>,
+    Query(q): Query<WebhookDeliveriesQuery>,
+) -> Result<Json<Vec<WebhookDeliveryJson>>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    state.db.get_webhook_endpoint(tenant_id, id).await.map_err(db_err)?.ok_or(ApiError::NotFound)?;
+    let limit = q.limit.clamp(1, 200);
+    let rows = state.db.list_webhook_deliveries_for_endpoint(tenant_id, id, limit).await.map_err(db_err)?;
+    Ok(Json(rows.into_iter().map(WebhookDeliveryJson::from).collect()))
 }
 
 /// Mints a key for `tenant_id`/`domain`. Shared by `create_key` (caller

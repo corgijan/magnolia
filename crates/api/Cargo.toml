@@ -24,6 +24,8 @@ semver.workspace = true
 async-trait = "0.1"
 sqlx = { version = "0.7", features = ["postgres", "runtime-tokio", "migrate"] }
 tar = "0.4"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+hmac = "0.12"
 
 magnolia-core = { path = "../core" }
 magnolia-auth = { path = "../auth" }

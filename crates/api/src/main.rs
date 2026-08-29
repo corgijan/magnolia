@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use magnolia_api::{create_router, run_malicious_sync_loop, run_reputation_sync_loop, run_sync_loop, AppState};
+use magnolia_api::{
+    create_router, run_freshness_sync_loop, run_malicious_sync_loop, run_reputation_sync_loop,
+    run_sync_loop, run_webhook_delivery_loop, AppState,
+};
 use magnolia_audit::AuditLogger;
 use magnolia_core::MerkleTree;
 use magnolia_db::Database;
@@ -134,6 +137,14 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(3600);
+    // Shares `depsdev`'s presence gate -- both jobs hit the same client and
+    // the same `sbom_components.ecosystem`/`registry_name` backfill (see
+    // `freshness_sync.rs`'s module doc comment), so there's no separate
+    // `DISABLE_FRESHNESS_CHECK` flag.
+    let freshness_sync_interval_secs = std::env::var("FRESHNESS_SYNC_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(3600);
     let depsdev = if std::env::var("DISABLE_REPUTATION_CHECK").is_ok() {
         tracing::info!("DISABLE_REPUTATION_CHECK set — package reputation scoring disabled");
         None
@@ -141,13 +152,51 @@ async fn main() {
         Some(Arc::new(DepsDevClient::default()))
     };
 
+    // Outbox delivery worker for `POST /webhooks` — polls frequently (unlike
+    // the other sync loops, this isn't waiting on a slow external API, so a
+    // short default keeps the backoff schedule's 1-minute first retry
+    // actually meaningful rather than rounded up to the next tick).
+    let webhook_delivery_interval_secs = std::env::var("WEBHOOK_DELIVERY_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30);
+
+    // Shared by every dtrack/reputation/malicious/freshness sync loop (see
+    // `sync_loop::run_burst_loop`): while a batch is finding pending work,
+    // the next batch is tried after this short interval instead of waiting
+    // out the full per-job `*_SYNC_INTERVAL_SECS` — lets a large backlog
+    // (a bulk import, or the first run after a deployment's existing
+    // archive predates one of these jobs) drain in minutes instead of one
+    // bounded batch per hour. One knob for all four, not four separate
+    // ones, since there's no reason they'd ever want different burst
+    // cadences.
+    let sync_burst_interval_secs = std::env::var("SYNC_BURST_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30);
+
     let db = Arc::new(db);
+
+    tokio::spawn(run_webhook_delivery_loop(
+        Arc::clone(&db),
+        std::time::Duration::from_secs(webhook_delivery_interval_secs),
+        dev_mode,
+    ));
+
+    let sync_burst_interval = std::time::Duration::from_secs(sync_burst_interval_secs);
 
     if let Some(client) = depsdev.clone() {
         tokio::spawn(run_reputation_sync_loop(
             Arc::clone(&db),
-            client,
+            client.clone(),
             std::time::Duration::from_secs(reputation_sync_interval_secs),
+            sync_burst_interval,
+        ));
+        tokio::spawn(run_freshness_sync_loop(
+            Arc::clone(&db),
+            client,
+            std::time::Duration::from_secs(freshness_sync_interval_secs),
+            sync_burst_interval,
         ));
     }
     if let Some(client) = osv.clone() {
@@ -155,6 +204,7 @@ async fn main() {
             Arc::clone(&db),
             client,
             std::time::Duration::from_secs(malicious_sync_interval_secs),
+            sync_burst_interval,
         ));
     }
     let state = AppState {
@@ -177,6 +227,7 @@ async fn main() {
             storage,
             client,
             std::time::Duration::from_secs(dtrack_sync_interval_secs),
+            sync_burst_interval,
         ));
     }
 

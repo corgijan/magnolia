@@ -2,13 +2,15 @@ mod models;
 mod errors;
 
 pub use models::{
-    ApiKeyRecord, AuditLogRecord, ComplianceSettingRecord, ComponentIdentity,
+    AffectedManifestRow, ApiKeyRecord, AuditLogRecord, ComplianceSettingRecord, ComponentFreshnessRecord,
+    ComponentFreshnessStatus, ComponentIdentity,
     ComponentReputationRecord, DtrackFindingRecord, DtrackFindingWithContextRecord,
-    DtrackProjectRecord, DtrackPushFailureRecord, FindingCommentRecord, ManifestRecord,
+    DtrackProjectRecord, DtrackPushFailureRecord, DueWebhookDelivery, FindingCommentRecord, ManifestRecord,
     MaliciousCheckStatus, MaliciousFindingRecord, MerkleLeafRecord, MerkleNodeRecord, NewDtrackFinding,
     ManifestVersionRow, NewMaliciousFinding, NewSbomComponent, RegisteredNamespaceRecord,
     ComponentReputationSummaryRow, ReputationStatus, SbomComponentRow, SbomComponentSearchRow,
-    SignedTreeHeadRecord, TenantRecord,
+    SignedTreeHeadRecord, TenantLicensePolicyRecord, TenantRecord, WebhookDeliveryRecord,
+    WebhookEndpointRecord,
 };
 pub use errors::DbError;
 
@@ -92,7 +94,7 @@ impl Database {
 
     pub async fn get_tenant(&self, id: Uuid) -> Result<Option<TenantRecord>, DbError> {
         sqlx::query_as::<_, TenantRecord>(
-            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled, require_semver_version, reputation_disabled, require_namespace_registration, malicious_check_disabled FROM tenants WHERE id = $1",
+            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled, require_semver_version, reputation_disabled, require_namespace_registration, malicious_check_disabled, freshness_disabled FROM tenants WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -105,7 +107,7 @@ impl Database {
         domain: &str,
     ) -> Result<Option<TenantRecord>, DbError> {
         sqlx::query_as::<_, TenantRecord>(
-            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled, require_semver_version, reputation_disabled, require_namespace_registration, malicious_check_disabled FROM tenants WHERE domain = $1",
+            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled, require_semver_version, reputation_disabled, require_namespace_registration, malicious_check_disabled, freshness_disabled FROM tenants WHERE domain = $1",
         )
         .bind(domain)
         .fetch_optional(&self.pool)
@@ -119,7 +121,7 @@ impl Database {
     /// reachable directly (e.g. `?tenant_id=` override), just not listed.
     pub async fn list_tenants(&self) -> Result<Vec<TenantRecord>, DbError> {
         sqlx::query_as::<_, TenantRecord>(
-            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled, require_semver_version, reputation_disabled, require_namespace_registration, malicious_check_disabled FROM tenants WHERE hidden = FALSE ORDER BY created_at DESC",
+            "SELECT id, domain, name, created_by, created_at, is_platform, hidden, dtrack_sync_disabled, require_semver_version, reputation_disabled, require_namespace_registration, malicious_check_disabled, freshness_disabled FROM tenants WHERE hidden = FALSE ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
         .await
@@ -174,6 +176,21 @@ impl Database {
     /// untouched either way.
     pub async fn set_tenant_malicious_check_disabled(&self, tenant_id: Uuid, disabled: bool) -> Result<(), DbError> {
         sqlx::query("UPDATE tenants SET malicious_check_disabled = $1 WHERE id = $2")
+            .bind(disabled)
+            .bind(tenant_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DbError::QueryError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Per-tenant opt-out of the "Outdated components" panel appearing on
+    /// this tenant's SBOM detail views (see the `freshness_disabled`
+    /// migration comment) — same display-only shape as
+    /// `set_tenant_reputation_disabled`: the background freshness job is
+    /// untouched either way.
+    pub async fn set_tenant_freshness_disabled(&self, tenant_id: Uuid, disabled: bool) -> Result<(), DbError> {
+        sqlx::query("UPDATE tenants SET freshness_disabled = $1 WHERE id = $2")
             .bind(disabled)
             .bind(tenant_id)
             .execute(&self.pool)
@@ -916,6 +933,60 @@ impl Database {
         Ok(())
     }
 
+    /// `None` when this tenant has never set a policy — callers treat that
+    /// the same as an explicit `enforce_level = 'off'`, empty deny-list.
+    pub async fn get_tenant_license_policy(
+        &self,
+        tenant_id: Uuid,
+    ) -> Result<Option<TenantLicensePolicyRecord>, DbError> {
+        sqlx::query_as::<_, TenantLicensePolicyRecord>(
+            r#"
+            SELECT tenant_id, denied_licenses, flag_unknown, enforce_level, updated_by, updated_at
+            FROM tenant_license_policies
+            WHERE tenant_id = $1
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// Upserts a tenant's license policy — always writes a row, same
+    /// "off is a persisted state, not an absence" convention as
+    /// `set_compliance_setting`.
+    pub async fn set_tenant_license_policy(
+        &self,
+        tenant_id: Uuid,
+        denied_licenses: &[String],
+        flag_unknown: bool,
+        enforce_level: &str,
+        updated_by: &str,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            r#"
+            INSERT INTO tenant_license_policies
+                (tenant_id, denied_licenses, flag_unknown, enforce_level, updated_by, updated_at)
+            VALUES ($1, $2, $3, $4, $5, now())
+            ON CONFLICT (tenant_id)
+            DO UPDATE SET denied_licenses = EXCLUDED.denied_licenses,
+                           flag_unknown = EXCLUDED.flag_unknown,
+                           enforce_level = EXCLUDED.enforce_level,
+                           updated_by = EXCLUDED.updated_by,
+                           updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(denied_licenses)
+        .bind(flag_unknown)
+        .bind(enforce_level)
+        .bind(updated_by)
+        .execute(&self.pool)
+        .await
+        .map_err(map_query_error)?;
+        Ok(())
+    }
+
     // ---- Component reverse-search index ----
 
     /// Batched — a single INSERT for the whole component list of one SBOM,
@@ -932,20 +1003,21 @@ impl Database {
         }
         let mut sql = String::from(
             "INSERT INTO sbom_components \
-             (manifest_hash, tenant_id, name, version, purl, cpe, is_primary, ecosystem, registry_name) VALUES ",
+             (manifest_hash, tenant_id, name, version, purl, cpe, is_primary, ecosystem, registry_name, license_expr) VALUES ",
         );
         let mut placeholders = Vec::with_capacity(components.len());
         for i in 0..components.len() {
-            let base = i * 7;
+            let base = i * 8;
             placeholders.push(format!(
-                "($1, $2, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                "($1, $2, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
                 base + 3,
                 base + 4,
                 base + 5,
                 base + 6,
                 base + 7,
                 base + 8,
-                base + 9
+                base + 9,
+                base + 10
             ));
         }
         sql.push_str(&placeholders.join(", "));
@@ -959,7 +1031,8 @@ impl Database {
                 .bind(&c.cpe)
                 .bind(c.is_primary)
                 .bind(&c.ecosystem)
-                .bind(&c.registry_name);
+                .bind(&c.registry_name)
+                .bind(&c.license_expr);
         }
         q.execute(&self.pool).await.map_err(map_query_error)?;
         Ok(())
@@ -985,13 +1058,18 @@ impl Database {
     /// OSV batched query run at upload time (see `SUPPLY_CHAIN_SIGNALS_PLAN.md`).
     /// A no-op for an empty list — most manifests will have zero hits, and
     /// callers pass whatever they found without checking emptiness first.
+    /// Returns only the findings genuinely new in this call (the
+    /// `ON CONFLICT DO NOTHING ... RETURNING` rows) — a manifest re-checked
+    /// by `malicious_sync`'s periodic rescan re-submits already-known
+    /// matches every pass, and callers emitting a `malicious.match_found`
+    /// webhook event need to fire on a first sighting, not every rescan.
     pub async fn insert_malicious_findings(
         &self,
         manifest_hash: &str,
         findings: &[NewMaliciousFinding],
-    ) -> Result<(), DbError> {
+    ) -> Result<Vec<MaliciousFindingRecord>, DbError> {
         if findings.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let mut sql = String::from(
             "INSERT INTO malicious_component_findings \
@@ -1010,14 +1088,16 @@ impl Database {
             ));
         }
         sql.push_str(&placeholders.join(", "));
-        sql.push_str(" ON CONFLICT (manifest_hash, component_name, component_version, osv_id) DO NOTHING");
+        sql.push_str(
+            " ON CONFLICT (manifest_hash, component_name, component_version, osv_id) DO NOTHING \
+             RETURNING component_name, component_version, purl, osv_id, summary, detected_at",
+        );
 
-        let mut q = sqlx::query(&sql).bind(manifest_hash);
+        let mut q = sqlx::query_as::<_, MaliciousFindingRecord>(&sql).bind(manifest_hash);
         for f in findings {
             q = q.bind(&f.component_name).bind(&f.component_version).bind(&f.purl).bind(&f.osv_id).bind(&f.summary);
         }
-        q.execute(&self.pool).await.map_err(map_query_error)?;
-        Ok(())
+        q.fetch_all(&self.pool).await.map_err(map_query_error)
     }
 
     pub async fn list_malicious_findings(&self, manifest_hash: &str) -> Result<Vec<MaliciousFindingRecord>, DbError> {
@@ -1302,6 +1382,166 @@ impl Database {
         .map_err(map_query_error)
     }
 
+    // ---- Component freshness (EOL/staleness) ----
+
+    /// Distinct (ecosystem, registry_name) pairs across the whole
+    /// deployment's `sbom_components` that need a freshness (re)check —
+    /// identical shape and staleness/failure-retry rules to
+    /// `list_components_needing_reputation`, just against
+    /// `component_freshness` instead of `component_reputation`.
+    /// Deployment-global for the same reason: a package's latest version
+    /// doesn't depend on which tenant uploaded it.
+    pub async fn list_components_needing_freshness(
+        &self,
+        stale_before: chrono::DateTime<chrono::Utc>,
+        limit: i64,
+    ) -> Result<Vec<ComponentIdentity>, DbError> {
+        sqlx::query_as::<_, ComponentIdentity>(
+            r#"
+            SELECT DISTINCT ON (sc.ecosystem, sc.registry_name)
+                   sc.ecosystem, sc.registry_name, sc.version AS sample_version
+            FROM sbom_components sc
+            LEFT JOIN component_freshness cf
+                ON cf.ecosystem = sc.ecosystem AND cf.name = sc.registry_name
+            WHERE sc.ecosystem IS NOT NULL
+              AND sc.registry_name IS NOT NULL
+              AND sc.version IS NOT NULL
+              AND (cf.ecosystem IS NULL OR cf.checked_at < $1 OR cf.fetch_error IS NOT NULL)
+            ORDER BY sc.ecosystem, sc.registry_name, sc.version DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(stale_before)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// Deployment-wide counts for the Settings UI's freshness status
+    /// display — the `pending` subquery mirrors
+    /// `list_components_needing_freshness`'s definition exactly (minus the
+    /// `LIMIT`), same "never disagree about what still needs checking"
+    /// reasoning as `reputation_status`.
+    pub async fn freshness_status(
+        &self,
+        stale_before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<ComponentFreshnessStatus, DbError> {
+        sqlx::query_as::<_, ComponentFreshnessStatus>(
+            r#"
+            SELECT
+                (SELECT COUNT(*) FROM (
+                    SELECT DISTINCT sc.ecosystem, sc.registry_name
+                    FROM sbom_components sc
+                    LEFT JOIN component_freshness cf
+                        ON cf.ecosystem = sc.ecosystem AND cf.name = sc.registry_name
+                    WHERE sc.ecosystem IS NOT NULL
+                      AND sc.registry_name IS NOT NULL
+                      AND (cf.ecosystem IS NULL OR cf.checked_at < $1 OR cf.fetch_error IS NOT NULL)
+                ) pending_rows) AS pending,
+                (SELECT COUNT(*) FROM component_freshness WHERE fetch_error IS NULL) AS checked,
+                (SELECT COUNT(*) FROM component_freshness WHERE fetch_error IS NOT NULL) AS failed
+            "#,
+        )
+        .bind(stale_before)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// Records (or refreshes) one package's cached latest-version result —
+    /// same `None`-on-failure/`fetch_error`-set convention as
+    /// `upsert_component_reputation`.
+    pub async fn upsert_component_freshness(
+        &self,
+        ecosystem: &str,
+        name: &str,
+        latest_version: Option<&str>,
+        fetch_error: Option<&str>,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            r#"
+            INSERT INTO component_freshness (ecosystem, name, latest_version, checked_at, fetch_error)
+            VALUES ($1, $2, $3, now(), $4)
+            ON CONFLICT (ecosystem, name)
+            DO UPDATE SET latest_version = EXCLUDED.latest_version,
+                           checked_at = EXCLUDED.checked_at,
+                           fetch_error = EXCLUDED.fetch_error
+            "#,
+        )
+        .bind(ecosystem)
+        .bind(name)
+        .bind(latest_version)
+        .bind(fetch_error)
+        .execute(&self.pool)
+        .await
+        .map_err(map_query_error)?;
+        Ok(())
+    }
+
+    /// One manifest's components joined against their cached freshness
+    /// result, for `manifest()`'s response — same `LEFT JOIN`/"absent means
+    /// not checkable at all, present-with-NULLs means pending" shape as
+    /// `list_reputation_for_manifest`.
+    pub async fn list_freshness_for_manifest(
+        &self,
+        manifest_hash: &str,
+    ) -> Result<Vec<ComponentFreshnessRecord>, DbError> {
+        sqlx::query_as::<_, ComponentFreshnessRecord>(
+            r#"
+            SELECT sc.name AS component_name, sc.version AS component_version,
+                   sc.ecosystem, sc.registry_name, cf.latest_version,
+                   cf.checked_at, cf.fetch_error
+            FROM sbom_components sc
+            LEFT JOIN component_freshness cf
+                ON cf.ecosystem = sc.ecosystem AND cf.name = sc.registry_name
+            WHERE sc.manifest_hash = $1
+              AND sc.ecosystem IS NOT NULL
+              AND sc.registry_name IS NOT NULL
+            ORDER BY sc.name
+            "#,
+        )
+        .bind(manifest_hash)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// A single package's cached latest-version, if any — a plain point
+    /// lookup against the same `component_freshness` cache
+    /// `list_freshness_for_manifest` joins against, used by `/verify`'s
+    /// dry-run gate (no live deps.dev call in the request path, just
+    /// reading whatever the background job already knows). `None` covers
+    /// both "no row yet" and "row exists but deps.dev had no version info" —
+    /// `/verify` doesn't need to tell those apart.
+    pub async fn get_component_freshness(&self, ecosystem: &str, name: &str) -> Result<Option<String>, DbError> {
+        let row: Option<Option<String>> =
+            sqlx::query_scalar("SELECT latest_version FROM component_freshness WHERE ecosystem = $1 AND name = $2")
+                .bind(ecosystem)
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_query_error)?;
+        Ok(row.flatten())
+    }
+
+    /// A single package's cached OpenSSF Scorecard score, if any — same
+    /// point-lookup shape as `get_component_freshness`, used by `/verify`'s
+    /// dry-run gate (no live deps.dev call in the request path, just
+    /// reading whatever the reputation background job already knows).
+    /// `None` covers both "no row yet" and "row exists but deps.dev had no
+    /// scorecard for it" — `/verify` doesn't need to tell those apart.
+    pub async fn get_component_reputation(&self, ecosystem: &str, name: &str) -> Result<Option<f32>, DbError> {
+        let row: Option<Option<f32>> =
+            sqlx::query_scalar("SELECT scorecard_score FROM component_reputation WHERE ecosystem = $1 AND name = $2")
+                .bind(ecosystem)
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_query_error)?;
+        Ok(row.flatten())
+    }
+
     /// Component-name prefix (case-insensitive) and/or exact-purl reverse
     /// search, scoped to `namespace_scope` the same way every other
     /// tenant-scoped listing already is. At least one of `name_prefix`/
@@ -1330,7 +1570,8 @@ impl Database {
         sqlx::query_as::<_, SbomComponentSearchRow>(
             r#"
             SELECT sc.name, sc.version, sc.purl, sc.cpe, sc.is_primary,
-                   m.manifest_hash, m.namespace, m.version AS release_version, m.revoked, m.document_type
+                   m.manifest_hash, m.namespace, m.version AS release_version, m.revoked, m.document_type,
+                   sc.license_expr
             FROM sbom_components sc
             JOIN manifests m ON m.manifest_hash = sc.manifest_hash
             WHERE sc.tenant_id = $1
@@ -1367,6 +1608,120 @@ impl Database {
         .bind(current_only)
         .bind(limit)
         .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// Every manifest containing a component, identified by exact `purl`
+    /// or by `name` (optionally narrowed further by `component_version`) —
+    /// the "which namespaces/manifests contain component X" side of
+    /// blast-radius. `current_only` reuses the same "latest non-revoked
+    /// upload per namespace, respecting namespace visibility" definition as
+    /// `search_sbom_components`. Revoked manifests are still returned
+    /// (flagged via `revoked`) even with `current_only` off — a revoked
+    /// manifest having shipped a vulnerable component is exactly the kind
+    /// of history incident response needs to see, not hide.
+    pub async fn list_manifests_containing_component(
+        &self,
+        tenant_id: Uuid,
+        namespace_scope: &str,
+        purl: Option<&str>,
+        name: Option<&str>,
+        component_version: Option<&str>,
+        current_only: bool,
+    ) -> Result<Vec<AffectedManifestRow>, DbError> {
+        sqlx::query_as::<_, AffectedManifestRow>(
+            r#"
+            SELECT DISTINCT m.manifest_hash, m.namespace, m.version AS release_version, m.revoked, m.created_at
+            FROM sbom_components sc
+            JOIN manifests m ON m.manifest_hash = sc.manifest_hash
+            WHERE sc.tenant_id = $1
+              AND ($2 = '/' OR m.namespace = $2 OR starts_with(m.namespace, $2 || '/'))
+              AND ($3::text IS NULL OR sc.purl = $3)
+              AND ($4::text IS NULL OR sc.name = $4)
+              AND ($5::text IS NULL OR sc.version = $5)
+              AND (
+                $6::bool IS NOT TRUE
+                OR m.manifest_hash IN (
+                  SELECT DISTINCT ON (namespace) manifest_hash
+                  FROM manifests
+                  WHERE tenant_id = $1
+                    AND revoked = FALSE
+                    AND document_type IS NULL
+                    AND NOT EXISTS (
+                      SELECT 1 FROM namespace_current_hidden h
+                      WHERE h.tenant_id = manifests.tenant_id AND h.namespace = manifests.namespace
+                    )
+                  ORDER BY namespace, created_at DESC, leaf_seq_id DESC
+                )
+              )
+            ORDER BY m.namespace, m.created_at DESC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(namespace_scope)
+        .bind(purl)
+        .bind(name)
+        .bind(component_version)
+        .bind(current_only)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// Every manifest affected by a vulnerability or malicious-package
+    /// advisory id — matched against `dtrack_findings.vulnerability_id`
+    /// (e.g. a CVE/GHSA id) as well as `malicious_component_findings.osv_id`
+    /// (e.g. an OSV `MAL-` id), so both signal sources answer the same
+    /// "which manifests does CVE/advisory Y affect" question through one
+    /// endpoint. Same `current_only` and revoked-manifest semantics as
+    /// `list_manifests_containing_component`.
+    pub async fn list_manifests_affected_by_vulnerability(
+        &self,
+        tenant_id: Uuid,
+        namespace_scope: &str,
+        vuln_id: &str,
+        current_only: bool,
+    ) -> Result<Vec<AffectedManifestRow>, DbError> {
+        sqlx::query_as::<_, AffectedManifestRow>(
+            r#"
+            SELECT DISTINCT m.manifest_hash, m.namespace, m.version AS release_version, m.revoked, m.created_at
+            FROM manifests m
+            WHERE m.tenant_id = $1
+              AND ($2 = '/' OR m.namespace = $2 OR starts_with(m.namespace, $2 || '/'))
+              AND (
+                EXISTS (
+                  SELECT 1 FROM dtrack_findings df
+                  WHERE df.manifest_hash = m.manifest_hash AND df.vulnerability_id = $3
+                )
+                OR EXISTS (
+                  SELECT 1 FROM malicious_component_findings mf
+                  WHERE mf.manifest_hash = m.manifest_hash AND mf.osv_id = $3
+                )
+              )
+              AND (
+                $4::bool IS NOT TRUE
+                OR m.manifest_hash IN (
+                  SELECT DISTINCT ON (namespace) manifest_hash
+                  FROM manifests
+                  WHERE tenant_id = $1
+                    AND revoked = FALSE
+                    AND document_type IS NULL
+                    AND NOT EXISTS (
+                      SELECT 1 FROM namespace_current_hidden h
+                      WHERE h.tenant_id = manifests.tenant_id AND h.namespace = manifests.namespace
+                    )
+                  ORDER BY namespace, created_at DESC, leaf_seq_id DESC
+                )
+              )
+            ORDER BY m.namespace, m.created_at DESC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(namespace_scope)
+        .bind(vuln_id)
+        .bind(current_only)
         .fetch_all(&self.pool)
         .await
         .map_err(map_query_error)
@@ -1661,7 +2016,7 @@ impl Database {
             SELECT manifest_hash, finding_key, component_name, component_version,
                    vulnerability_id, severity, description, analysis_state, synced_at,
                    vex_status, vex_justification, vex_comment, triaged_by, triaged_at,
-                   component_uuid, vulnerability_uuid
+                   component_uuid, vulnerability_uuid, triage_source
             FROM dtrack_findings
             WHERE manifest_hash = $1
             ORDER BY severity, vulnerability_id
@@ -1722,7 +2077,7 @@ impl Database {
             SELECT df.manifest_hash, df.finding_key, df.component_name, df.component_version,
                    df.vulnerability_id, df.severity, df.description, df.analysis_state, df.synced_at,
                    df.vex_status, df.vex_justification, df.vex_comment, df.triaged_by, df.triaged_at,
-                   m.namespace, m.version AS release_version, m.revoked,
+                   df.triage_source, m.namespace, m.version AS release_version, m.revoked,
                    (SELECT count(*) FROM finding_comments fc
                     WHERE fc.manifest_hash = df.manifest_hash AND fc.finding_key = df.finding_key) AS comment_count
             FROM dtrack_findings df
@@ -1850,6 +2205,9 @@ impl Database {
     /// Sets this tenant's VEX-style triage on one finding. `None` if the
     /// finding no longer exists (e.g. resolved by a later dtrack sync) —
     /// resolved to `ApiError::NotFound` at the handler layer.
+    /// `triage_source` is `"manual"` (the `triage_finding` handler) or
+    /// `"vex_import"` (an imported VEX document) — see the column's
+    /// migration comment.
     pub async fn set_finding_triage(
         &self,
         manifest_hash: &str,
@@ -1858,16 +2216,18 @@ impl Database {
         justification: Option<&str>,
         comment: Option<&str>,
         triaged_by: &str,
+        triage_source: &str,
     ) -> Result<Option<DtrackFindingRecord>, DbError> {
         sqlx::query_as::<_, DtrackFindingRecord>(
             r#"
             UPDATE dtrack_findings
-            SET vex_status = $1, vex_justification = $2, vex_comment = $3, triaged_by = $4, triaged_at = now()
+            SET vex_status = $1, vex_justification = $2, vex_comment = $3, triaged_by = $4, triaged_at = now(),
+                triage_source = $7
             WHERE manifest_hash = $5 AND finding_key = $6
             RETURNING manifest_hash, finding_key, component_name, component_version,
                       vulnerability_id, severity, description, analysis_state, synced_at,
                       vex_status, vex_justification, vex_comment, triaged_by, triaged_at,
-                      component_uuid, vulnerability_uuid
+                      component_uuid, vulnerability_uuid, triage_source
             "#,
         )
         .bind(vex_status)
@@ -1876,7 +2236,226 @@ impl Database {
         .bind(triaged_by)
         .bind(manifest_hash)
         .bind(finding_key)
+        .bind(triage_source)
         .fetch_optional(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    // ---- Webhooks ----
+
+    pub async fn insert_webhook_endpoint(
+        &self,
+        id: Uuid,
+        tenant_id: Uuid,
+        url: &str,
+        secret: &str,
+        event_types: &[String],
+        created_by: &str,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            r#"
+            INSERT INTO webhook_endpoints (id, tenant_id, url, secret, event_types, enabled, created_by, created_at)
+            VALUES ($1, $2, $3, $4, $5, TRUE, $6, now())
+            "#,
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(url)
+        .bind(secret)
+        .bind(event_types)
+        .bind(created_by)
+        .execute(&self.pool)
+        .await
+        .map_err(map_query_error)?;
+        Ok(())
+    }
+
+    pub async fn list_webhook_endpoints(&self, tenant_id: Uuid) -> Result<Vec<WebhookEndpointRecord>, DbError> {
+        sqlx::query_as::<_, WebhookEndpointRecord>(
+            "SELECT id, tenant_id, url, secret, event_types, enabled, created_by, created_at \
+             FROM webhook_endpoints WHERE tenant_id = $1 ORDER BY created_at",
+        )
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    pub async fn get_webhook_endpoint(
+        &self,
+        tenant_id: Uuid,
+        id: Uuid,
+    ) -> Result<Option<WebhookEndpointRecord>, DbError> {
+        sqlx::query_as::<_, WebhookEndpointRecord>(
+            "SELECT id, tenant_id, url, secret, event_types, enabled, created_by, created_at \
+             FROM webhook_endpoints WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// Returns `true` iff a row belonging to this tenant was updated — the
+    /// tenant scope in the `WHERE` clause is load-bearing, not just a
+    /// filter: it's what stops one tenant from updating another's endpoint
+    /// by guessing/reusing a UUID.
+    pub async fn update_webhook_endpoint(
+        &self,
+        tenant_id: Uuid,
+        id: Uuid,
+        url: &str,
+        event_types: &[String],
+        enabled: bool,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE webhook_endpoints SET url = $3, event_types = $4, enabled = $5 \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(url)
+        .bind(event_types)
+        .bind(enabled)
+        .execute(&self.pool)
+        .await
+        .map_err(map_query_error)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn delete_webhook_endpoint(&self, tenant_id: Uuid, id: Uuid) -> Result<bool, DbError> {
+        let result = sqlx::query("DELETE FROM webhook_endpoints WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(map_query_error)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// This tenant's enabled endpoints subscribed to `event_type` — what
+    /// `webhooks::emit_event` fans a new event out to. Not tenant-scoped by
+    /// the *caller's* namespace scope (events already carry the whole
+    /// tenant's data, same "webhooks are tenant-wide infrastructure, not
+    /// per-namespace" scope compliance settings/dtrack sync already use).
+    pub async fn list_enabled_webhook_endpoints_for_event(
+        &self,
+        tenant_id: Uuid,
+        event_type: &str,
+    ) -> Result<Vec<WebhookEndpointRecord>, DbError> {
+        sqlx::query_as::<_, WebhookEndpointRecord>(
+            "SELECT id, tenant_id, url, secret, event_types, enabled, created_by, created_at \
+             FROM webhook_endpoints WHERE tenant_id = $1 AND enabled = TRUE AND $2 = ANY(event_types)",
+        )
+        .bind(tenant_id)
+        .bind(event_type)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    pub async fn insert_webhook_delivery(
+        &self,
+        endpoint_id: Uuid,
+        event_type: &str,
+        payload: &serde_json::Value,
+    ) -> Result<i64, DbError> {
+        sqlx::query_scalar(
+            "INSERT INTO webhook_deliveries (endpoint_id, event_type, payload, status, attempts, next_attempt_at) \
+             VALUES ($1, $2, $3, 'pending', 0, now()) RETURNING id",
+        )
+        .bind(endpoint_id)
+        .bind(event_type)
+        .bind(payload)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// Outbox rows due for (re)delivery — `pending`, past their
+    /// `next_attempt_at`, joined with their endpoint's current
+    /// `url`/`secret`. Joining on `enabled = TRUE` here (rather than a
+    /// separate cleanup pass) means disabling an endpoint immediately stops
+    /// its pending deliveries from being attempted, without deleting the
+    /// outbox rows themselves — they resume if the endpoint is re-enabled.
+    pub async fn list_due_webhook_deliveries(&self, limit: i64) -> Result<Vec<DueWebhookDelivery>, DbError> {
+        sqlx::query_as::<_, DueWebhookDelivery>(
+            r#"
+            SELECT wd.id, wd.endpoint_id, we.url, we.secret, wd.event_type, wd.payload, wd.attempts
+            FROM webhook_deliveries wd
+            JOIN webhook_endpoints we ON we.id = wd.endpoint_id
+            WHERE wd.status = 'pending' AND wd.next_attempt_at <= now() AND we.enabled = TRUE
+            ORDER BY wd.next_attempt_at
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    pub async fn mark_webhook_delivery_delivered(&self, id: i64) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE webhook_deliveries SET status = 'delivered', delivered_at = now(), last_error = NULL WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(map_query_error)?;
+        Ok(())
+    }
+
+    /// Records one failed delivery attempt. `next_status` is `"pending"`
+    /// (the backoff schedule has another attempt left — `next_attempt_at`
+    /// is when) or `"failed"` (attempts exhausted, given up for good) —
+    /// decided by the caller (`webhooks::next_backoff`), not here.
+    pub async fn record_webhook_delivery_failure(
+        &self,
+        id: i64,
+        attempts: i32,
+        next_attempt_at: chrono::DateTime<chrono::Utc>,
+        next_status: &str,
+        error: &str,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE webhook_deliveries SET attempts = $2, next_attempt_at = $3, status = $4, last_error = $5 \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(attempts)
+        .bind(next_attempt_at)
+        .bind(next_status)
+        .bind(error)
+        .execute(&self.pool)
+        .await
+        .map_err(map_query_error)?;
+        Ok(())
+    }
+
+    pub async fn list_webhook_deliveries_for_endpoint(
+        &self,
+        tenant_id: Uuid,
+        endpoint_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<WebhookDeliveryRecord>, DbError> {
+        sqlx::query_as::<_, WebhookDeliveryRecord>(
+            r#"
+            SELECT wd.id, wd.endpoint_id, wd.event_type, wd.payload, wd.status, wd.attempts,
+                   wd.next_attempt_at, wd.last_error, wd.created_at, wd.delivered_at
+            FROM webhook_deliveries wd
+            JOIN webhook_endpoints we ON we.id = wd.endpoint_id
+            WHERE we.tenant_id = $1 AND wd.endpoint_id = $2
+            ORDER BY wd.created_at DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(endpoint_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
         .await
         .map_err(map_query_error)
     }

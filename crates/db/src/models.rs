@@ -42,6 +42,7 @@ pub struct TenantRecord {
     pub reputation_disabled: bool,
     pub require_namespace_registration: bool,
     pub malicious_check_disabled: bool,
+    pub freshness_disabled: bool,
 }
 
 /// One registered namespace — the output of `list_registered_namespaces`,
@@ -92,6 +93,9 @@ pub struct NewSbomComponent {
     /// reputation background job can join on it in SQL.
     pub ecosystem: Option<String>,
     pub registry_name: Option<String>,
+    /// Raw license expression as extracted (`ExtractedComponent::license`)
+    /// — see `sbom_components.license_expr`'s migration comment.
+    pub license_expr: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -106,6 +110,7 @@ pub struct SbomComponentSearchRow {
     pub release_version: String,
     pub revoked: bool,
     pub document_type: Option<String>,
+    pub license_expr: Option<String>,
 }
 
 /// One manifest in one namespace's upload history — the output of
@@ -130,6 +135,21 @@ pub struct SbomComponentRow {
     pub purl: Option<String>,
     pub cpe: Option<String>,
     pub is_primary: bool,
+}
+
+/// One manifest that contains a given component, or is affected by a given
+/// vulnerability/malicious-package advisory id — the output of
+/// `list_manifests_containing_component` / `list_manifests_affected_by_vulnerability`,
+/// backing the "blast radius" endpoints. Deliberately thinner than
+/// `SbomComponentSearchRow`/`DtrackFindingWithContextRecord` (no
+/// name/purl/severity echoed back) since the caller already knows which
+/// component or vulnerability it asked about.
+#[derive(Debug, Clone, FromRow)]
+pub struct AffectedManifestRow {
+    pub manifest_hash: String,
+    pub namespace: String,
+    pub release_version: String,
+    pub revoked: bool,
 }
 
 /// A distinct (ecosystem, registry_name) pair from `sbom_components` that
@@ -168,6 +188,15 @@ pub struct ReputationStatus {
     pub failed: i64,
 }
 
+/// Deployment-wide freshness-check summary — same shape/reasoning as
+/// `ReputationStatus`, for the "Outdated components" background job.
+#[derive(Debug, Clone, FromRow)]
+pub struct ComponentFreshnessStatus {
+    pub pending: i64,
+    pub checked: i64,
+    pub failed: i64,
+}
+
 /// Deployment-wide counts for the Settings UI's malicious-check background
 /// job status — same shape as `ReputationStatus`, minus `failed`: a failed
 /// upload-time or rescan attempt leaves `malicious_checked_at` untouched
@@ -193,6 +222,28 @@ pub struct ComponentReputationRecord {
     /// component yet ("pending"), not an error — distinct from a fetch that
     /// ran and found nothing (`checked_at: Some`, `scorecard_score: None`,
     /// `fetch_error: None`) or one that failed (`fetch_error: Some`).
+    pub checked_at: Option<DateTime<Utc>>,
+    pub fetch_error: Option<String>,
+}
+
+/// One manifest's component joined against its cached deps.dev
+/// latest-version lookup — the output of `list_freshness_for_manifest`,
+/// same "LEFT JOIN, pending means no row yet" shape as
+/// `ComponentReputationRecord`. `latest_version` is deps.dev's own pick
+/// (`versions[].isDefault`), not necessarily the highest published version
+/// number — see `freshness_sync.rs`'s doc comment. Staleness itself
+/// (current/behind/major_behind/unknown) is computed at read time in the
+/// API layer via `magnolia_core::classify_freshness`, not stored here.
+#[derive(Debug, Clone, FromRow)]
+pub struct ComponentFreshnessRecord {
+    pub component_name: String,
+    pub component_version: Option<String>,
+    pub ecosystem: String,
+    pub registry_name: String,
+    pub latest_version: Option<String>,
+    /// `None` means the freshness background job hasn't reached this
+    /// component yet ("pending") — same convention as
+    /// `ComponentReputationRecord::checked_at`.
     pub checked_at: Option<DateTime<Utc>>,
     pub fetch_error: Option<String>,
 }
@@ -229,6 +280,20 @@ pub struct MaliciousFindingRecord {
     pub osv_id: String,
     pub summary: Option<String>,
     pub detected_at: DateTime<Utc>,
+}
+
+/// One tenant's license policy — always exactly one row per tenant once set
+/// (see `tenant_license_policies`'s migration comment), the output of
+/// `get_tenant_license_policy` and input shape (minus `updated_by`/`_at`,
+/// filled by the DB) of `set_tenant_license_policy`.
+#[derive(Debug, Clone, FromRow)]
+pub struct TenantLicensePolicyRecord {
+    pub tenant_id: uuid::Uuid,
+    pub denied_licenses: Vec<String>,
+    pub flag_unknown: bool,
+    pub enforce_level: String,
+    pub updated_by: String,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -326,6 +391,10 @@ pub struct DtrackFindingRecord {
     /// skips a finding without these rather than erroring.
     pub component_uuid: Option<String>,
     pub vulnerability_uuid: Option<String>,
+    /// `"manual"` | `"vex_import"` | `None` (never triaged, or triaged
+    /// before this column existed) — see the `triage_source` migration
+    /// comment. Used by VEX import's overwrite guard.
+    pub triage_source: Option<String>,
 }
 
 /// A finding plus enough manifest context (namespace/version/revoked) to
@@ -348,6 +417,7 @@ pub struct DtrackFindingWithContextRecord {
     pub vex_comment: Option<String>,
     pub triaged_by: Option<String>,
     pub triaged_at: Option<DateTime<Utc>>,
+    pub triage_source: Option<String>,
     pub namespace: String,
     pub release_version: String,
     pub revoked: bool,
@@ -366,6 +436,55 @@ pub struct FindingCommentRecord {
     pub author: String,
     pub body: String,
     pub created_at: DateTime<Utc>,
+}
+
+/// One tenant's webhook subscription — the output of `list_webhook_endpoints`/
+/// `get_webhook_endpoint`, and (minus `id`/`created_at`, filled by the DB)
+/// the input side of `insert_webhook_endpoint`. `secret` is returned
+/// verbatim here — callers decide whether to actually expose it (the API
+/// layer only echoes it back once, at creation).
+#[derive(Debug, Clone, FromRow)]
+pub struct WebhookEndpointRecord {
+    pub id: uuid::Uuid,
+    pub tenant_id: uuid::Uuid,
+    pub url: String,
+    pub secret: String,
+    pub event_types: Vec<String>,
+    pub enabled: bool,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// One outbox row's full history entry — the output of
+/// `list_webhook_deliveries_for_endpoint`, backing `GET
+/// /webhooks/{id}/deliveries`.
+#[derive(Debug, Clone, FromRow)]
+pub struct WebhookDeliveryRecord {
+    pub id: i64,
+    pub endpoint_id: uuid::Uuid,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+    pub status: String,
+    pub attempts: i32,
+    pub next_attempt_at: DateTime<Utc>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub delivered_at: Option<DateTime<Utc>>,
+}
+
+/// One outbox row due for (re)delivery, already joined with its endpoint's
+/// current `url`/`secret` — the output of `list_due_webhook_deliveries`,
+/// consumed directly by the delivery worker so it never needs a second
+/// query per row to find out where/how to send it.
+#[derive(Debug, Clone, FromRow)]
+pub struct DueWebhookDelivery {
+    pub id: i64,
+    pub endpoint_id: uuid::Uuid,
+    pub url: String,
+    pub secret: String,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+    pub attempts: i32,
 }
 
 /// The most recent reason a manifest's push to dtrack failed — only

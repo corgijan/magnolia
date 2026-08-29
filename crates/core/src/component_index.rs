@@ -7,6 +7,13 @@ pub struct ExtractedComponent {
     pub purl: Option<String>,
     pub cpe: Option<String>,
     pub is_primary: bool,
+    /// Raw license expression/identifier as declared in the SBOM, not yet
+    /// normalized — see `magnolia_core::license::normalize_license_expr` for
+    /// resolving this into individual SPDX identifiers. `None` when the
+    /// component carries no usable license info at all (CycloneDX: no
+    /// `licenses[]`; SPDX: `licenseConcluded`/`licenseDeclared` both absent
+    /// or `NOASSERTION`).
+    pub license: Option<String>,
 }
 
 /// Infallible by design — extraction is best-effort and must never be the
@@ -55,7 +62,31 @@ fn component_from_cyclonedx_value(v: &Value, is_primary: bool) -> Option<Extract
         purl: non_empty(&v["purl"]),
         cpe: non_empty(&v["cpe"]),
         is_primary,
+        license: license_from_cyclonedx_value(v),
     })
+}
+
+/// Resolves one component's `licenses[]` into a single license
+/// expression/identifier string. A top-level `expression` entry (an
+/// already-normalized SPDX expression, e.g. `"MIT OR Apache-2.0"`) is
+/// preferred whenever present; otherwise every discrete `license.id`/
+/// `license.name` entry present is joined with `AND` — CycloneDX's own
+/// convention for "all of these apply" when no single normalized
+/// expression was supplied.
+fn license_from_cyclonedx_value(v: &Value) -> Option<String> {
+    let licenses = v["licenses"].as_array()?;
+    if let Some(expr) = licenses.iter().find_map(|l| non_empty(&l["expression"])) {
+        return Some(expr);
+    }
+    let ids: Vec<String> = licenses
+        .iter()
+        .filter_map(|l| non_empty(&l["license"]["id"]).or_else(|| non_empty(&l["license"]["name"])))
+        .collect();
+    if ids.is_empty() {
+        None
+    } else {
+        Some(ids.join(" AND "))
+    }
 }
 
 fn extract_spdx(sbom_bytes: &[u8]) -> Vec<ExtractedComponent> {
@@ -94,9 +125,21 @@ fn extract_spdx(sbom_bytes: &[u8]) -> Vec<ExtractedComponent> {
                 // as CycloneDX's metadata.component — treat every package
                 // the same rather than guessing which one is the root.
                 is_primary: false,
+                // `licenseConcluded` (the analysis tool's actual finding)
+                // takes precedence over `licenseDeclared` (what the package
+                // itself claims) — same "concluded over declared" priority
+                // NTIA's own compliance profile checks use.
+                license: non_noassertion(&pkg["licenseConcluded"]).or_else(|| non_noassertion(&pkg["licenseDeclared"])),
             })
         })
         .collect()
+}
+
+/// SPDX's own convention for "value intentionally not asserted" — a naive
+/// non-empty check would trivially treat `"NOASSERTION"` as real license
+/// information, the opposite of what it means.
+fn non_noassertion(v: &Value) -> Option<String> {
+    v.as_str().filter(|s| !s.is_empty() && *s != "NOASSERTION").map(str::to_string)
 }
 
 #[cfg(test)]
@@ -148,6 +191,85 @@ mod tests {
         assert_eq!(components[0].version.as_deref(), Some("2.31.0"));
         assert_eq!(components[0].purl.as_deref(), Some("pkg:pypi/requests@2.31.0"));
         assert!(!components[0].is_primary);
+    }
+
+    #[test]
+    fn cyclonedx_license_prefers_expression_over_discrete_entries() {
+        let doc = json!({
+            "components": [{
+                "name": "lib-a",
+                "licenses": [
+                    { "license": { "id": "MIT" } },
+                    { "expression": "MIT OR Apache-2.0" }
+                ]
+            }]
+        });
+        let bytes = serde_json::to_vec(&doc).unwrap();
+        let components = extract_components("cyclonedx", &bytes);
+        assert_eq!(components[0].license.as_deref(), Some("MIT OR Apache-2.0"));
+    }
+
+    #[test]
+    fn cyclonedx_license_joins_discrete_entries_with_and() {
+        let doc = json!({
+            "components": [{
+                "name": "lib-a",
+                "licenses": [
+                    { "license": { "id": "MIT" } },
+                    { "license": { "name": "Custom License" } }
+                ]
+            }]
+        });
+        let bytes = serde_json::to_vec(&doc).unwrap();
+        let components = extract_components("cyclonedx", &bytes);
+        assert_eq!(components[0].license.as_deref(), Some("MIT AND Custom License"));
+    }
+
+    #[test]
+    fn cyclonedx_component_without_licenses_has_no_license() {
+        let doc = json!({ "components": [{ "name": "lib-a" }] });
+        let bytes = serde_json::to_vec(&doc).unwrap();
+        let components = extract_components("cyclonedx", &bytes);
+        assert_eq!(components[0].license, None);
+    }
+
+    #[test]
+    fn spdx_license_concluded_takes_priority_over_declared() {
+        let doc = json!({
+            "packages": [{
+                "name": "requests",
+                "licenseConcluded": "Apache-2.0",
+                "licenseDeclared": "MIT"
+            }]
+        });
+        let bytes = serde_json::to_vec(&doc).unwrap();
+        let components = extract_components("spdx", &bytes);
+        assert_eq!(components[0].license.as_deref(), Some("Apache-2.0"));
+    }
+
+    #[test]
+    fn spdx_noassertion_license_falls_back_and_then_to_none() {
+        let doc = json!({
+            "packages": [{
+                "name": "requests",
+                "licenseConcluded": "NOASSERTION",
+                "licenseDeclared": "MIT"
+            }]
+        });
+        let bytes = serde_json::to_vec(&doc).unwrap();
+        let components = extract_components("spdx", &bytes);
+        assert_eq!(components[0].license.as_deref(), Some("MIT"));
+
+        let doc2 = json!({
+            "packages": [{
+                "name": "requests",
+                "licenseConcluded": "NOASSERTION",
+                "licenseDeclared": "NOASSERTION"
+            }]
+        });
+        let bytes2 = serde_json::to_vec(&doc2).unwrap();
+        let components2 = extract_components("spdx", &bytes2);
+        assert_eq!(components2[0].license, None);
     }
 
     #[test]

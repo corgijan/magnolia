@@ -18,19 +18,27 @@ use uuid::Uuid;
 /// narrow exception: it's called synchronously from `triage_finding`, since
 /// a human triage action is rare (not a hot path) and the whole point is
 /// dtrack reflecting it immediately rather than waiting for the next
-/// periodic pass.
+/// periodic pass. Bursts through a large backlog at `burst_interval`
+/// spacing rather than waiting a full `interval` between every batch — see
+/// `sync_loop::run_burst_loop`.
 pub async fn run_sync_loop(
     db: Arc<Database>,
     storage: Arc<dyn ObjectStore>,
     client: Arc<DtrackClient>,
     interval: Duration,
+    burst_interval: Duration,
 ) {
-    let mut ticker = tokio::time::interval(interval);
-    loop {
-        ticker.tick().await;
-        push_phase(&db, &storage, &client, None).await;
-        refresh_phase(&db, &client, None).await;
-    }
+    crate::sync_loop::run_burst_loop(interval, burst_interval, move || {
+        let db = db.clone();
+        let storage = storage.clone();
+        let client = client.clone();
+        async move {
+            let pushed = push_phase(&db, &storage, &client, None).await;
+            let refreshed = refresh_phase(&db, &client, None).await;
+            pushed + refreshed
+        }
+    })
+    .await;
 }
 
 /// One-shot sync pass for a single tenant, run synchronously from the
@@ -103,6 +111,17 @@ async fn push_phase(
             if let Err(e2) = db.record_dtrack_push_failure(&m.manifest_hash, &e.to_string()).await {
                 tracing::warn!(manifest_hash = %m.manifest_hash, error = %e2, "dtrack sync: failed to record push failure");
             }
+            crate::webhooks::emit_event(
+                db,
+                m.tenant_id,
+                crate::webhooks::EVENT_DTRACK_PUSH_FAILED,
+                serde_json::json!({
+                    "manifest_hash": m.manifest_hash,
+                    "namespace": m.namespace,
+                    "error": e.to_string(),
+                }),
+            )
+            .await;
             continue;
         }
         if let Err(e) = db.clear_dtrack_push_failure(&m.manifest_hash).await {
@@ -171,6 +190,23 @@ async fn refresh_phase(db: &Database, client: &DtrackClient, tenant_id: Option<U
             })
             .collect();
 
+        // Delta detection for `finding.new_critical`: read what was
+        // cached *before* this refresh overwrites it, so a finding already
+        // known as CRITICAL from a previous sync doesn't re-fire the event
+        // on every subsequent pass — only a finding_key that is newly
+        // CRITICAL (either brand new, or just re-severitized by dtrack)
+        // counts. Best-effort: a failure here just means this pass can't
+        // tell what's new, not a reason to skip storing the refreshed
+        // findings themselves.
+        let previously_critical: std::collections::HashSet<String> = db
+            .list_dtrack_findings(&p.manifest_hash)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|f| f.severity.eq_ignore_ascii_case("critical"))
+            .map(|f| f.finding_key)
+            .collect();
+
         if let Err(e) = db.replace_dtrack_findings(&p.manifest_hash, &new_findings).await {
             tracing::warn!(manifest_hash = %p.manifest_hash, error = %e, "dtrack sync: failed to store findings");
             continue;
@@ -178,6 +214,38 @@ async fn refresh_phase(db: &Database, client: &DtrackClient, tenant_id: Option<U
         if let Err(e) = db.touch_dtrack_project_synced(&p.manifest_hash).await {
             tracing::warn!(manifest_hash = %p.manifest_hash, error = %e, "dtrack sync: failed to update last_synced_at");
         }
+
+        let newly_critical: Vec<&NewDtrackFinding> = new_findings
+            .iter()
+            .filter(|f| f.severity.eq_ignore_ascii_case("critical") && !previously_critical.contains(&f.finding_key))
+            .collect();
+        if !newly_critical.is_empty() {
+            match db.get_manifest(&p.manifest_hash).await {
+                Ok(Some(m)) => {
+                    crate::webhooks::emit_event(
+                        db,
+                        m.tenant_id,
+                        crate::webhooks::EVENT_FINDING_NEW_CRITICAL,
+                        serde_json::json!({
+                            "manifest_hash": p.manifest_hash,
+                            "namespace": m.namespace,
+                            "findings": newly_critical.iter().map(|f| serde_json::json!({
+                                "finding_key": f.finding_key,
+                                "component_name": f.component_name,
+                                "component_version": f.component_version,
+                                "vulnerability_id": f.vulnerability_id,
+                            })).collect::<Vec<_>>(),
+                        }),
+                    )
+                    .await;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(manifest_hash = %p.manifest_hash, error = %e, "dtrack sync: failed to look up tenant for webhook event");
+                }
+            }
+        }
+
         refreshed += 1;
     }
     refreshed

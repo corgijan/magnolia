@@ -6,7 +6,10 @@ mod dsse;
 mod keys;
 mod compliance;
 mod component_index;
+mod freshness;
+mod license;
 mod purl;
+mod vex_import;
 
 pub use merkle::{
     ConsistencyProof, InclusionProof, MerkleNode, MerkleTree, PeakProof, ProofStep,
@@ -18,7 +21,10 @@ pub use compliance::{
     profile_by_id, registered_profiles, ComplianceProfile, ComplianceReport,
 };
 pub use component_index::{extract_components, ExtractedComponent};
+pub use license::{evaluate_license_policy, normalize_license_expr, LicensePolicy, LicenseViolation, LicenseViolationReason};
+pub use freshness::{classify_freshness, FreshnessStatus};
 pub use purl::{purl_to_depsdev_package, purl_to_osv_ecosystem};
+pub use vex_import::{parse_openvex, VexStatement};
 pub use dsse::{
     build_envelope, pae, DocumentPredicate, DocumentStatement, DsseEnvelope, DsseSignature,
     ManifestPredicate, ManifestStatement, SnapshotPredicate, SnapshotStatement, Statement,

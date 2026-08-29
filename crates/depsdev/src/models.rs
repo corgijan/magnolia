@@ -42,3 +42,29 @@ pub struct Scorecard {
 pub struct ScorecardRepository {
     pub name: Option<String>,
 }
+
+/// Only the fields this crate's callers actually use — deps.dev's real
+/// `GetPackage` response (docs.deps.dev/api/v3) carries per-version
+/// publish timestamps, advisory keys, and more; not modeled here.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageDetail {
+    #[serde(default)]
+    pub versions: Vec<PackageVersionSummary>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageVersionSummary {
+    pub version_key: PackageVersionKey,
+    /// deps.dev's own pick of the package's "current" version — see
+    /// `get_package`'s doc comment for why this, not the numerically
+    /// highest version, is what freshness checks against.
+    #[serde(default)]
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PackageVersionKey {
+    pub version: String,
+}

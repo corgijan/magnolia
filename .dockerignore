@@ -1,0 +1,14 @@
+# Keeps the build context small and, more importantly, keeps unrelated
+# local state from ever reaching the daemon in the first place -- `target`
+# alone can be 10+ GB of local cargo build artifacts that have no business
+# being uploaded on every `docker build`.
+target
+.git
+frontend/node_modules
+frontend/build
+.aidex
+*.db
+*.db-shm
+*.db-wal
+.env
+.DS_Store

@@ -1,5 +1,5 @@
 use crate::errors::DepsDevError;
-use crate::models::{ProjectDetail, VersionDetail};
+use crate::models::{PackageDetail, ProjectDetail, VersionDetail};
 
 /// Thin typed wrapper around deps.dev's public REST API — mirrors the
 /// `magnolia-osv`/`magnolia-dtrack` pattern of one narrow crate per external
@@ -37,6 +37,28 @@ impl DepsDevClient {
         let resp = self.http.get(url).send().await.map_err(|e| DepsDevError::Request(e.to_string()))?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(VersionDetail::default());
+        }
+        let resp = Self::check_status(resp).await?;
+        resp.json().await.map_err(|e| DepsDevError::UnexpectedResponse(e.to_string()))
+    }
+
+    /// `GET /v3/systems/{system}/packages/{name}` — every known version of
+    /// a package. `versions[].isDefault` is deps.dev's own pick of the
+    /// package's "current" version — the closest thing this API exposes to
+    /// "latest version" (there's no separate field for it, and the
+    /// numerically highest published version isn't always the intended
+    /// latest — e.g. a `0.x` line still receiving patches after a `1.x`
+    /// pre-release tag was cut). `freshness_sync.rs` reads it as such,
+    /// falling back to the highest parseable SemVer among `versions[]` when
+    /// none is flagged default. A 404 (package not known to deps.dev at
+    /// all) comes back as `PackageDetail { versions: vec![] }`, same
+    /// "unknown == nothing to report, not an error" convention as
+    /// `get_version`/`get_project`.
+    pub async fn get_package(&self, system: &str, name: &str) -> Result<PackageDetail, DepsDevError> {
+        let url = self.build_url(&["v3", "systems", system, "packages", name])?;
+        let resp = self.http.get(url).send().await.map_err(|e| DepsDevError::Request(e.to_string()))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(PackageDetail::default());
         }
         let resp = Self::check_status(resp).await?;
         resp.json().await.map_err(|e| DepsDevError::UnexpectedResponse(e.to_string()))

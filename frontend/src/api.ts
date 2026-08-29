@@ -121,6 +121,28 @@ export interface Manifest {
   // job — a freshly-uploaded manifest's components simply won't appear here
   // yet (not an error, just "not checked yet").
   component_reputation: ComponentReputation[];
+  // This tenant's license-policy violations, recomputed live on every
+  // fetch (not a stale snapshot from upload time) — empty whenever the
+  // tenant's license policy enforce_level is "off".
+  license_violations: LicenseViolation[];
+  // Cached deps.dev latest-version results, filled in by a background job —
+  // a freshly-uploaded manifest's components simply won't appear here yet.
+  component_freshness: ComponentFreshness[];
+}
+
+export interface LicenseViolation {
+  component_name: string;
+  component_version: string | null;
+  license_expr: string | null;
+  reason: 'denied' | 'unknown';
+  // The specific denied identifier matched — null for reason "unknown".
+  denied_license: string | null;
+}
+
+export interface LicensePolicy {
+  denied_licenses: string[];
+  flag_unknown: boolean;
+  enforce_level: 'off' | 'warn' | 'block';
 }
 
 export interface MaliciousComponent {
@@ -270,6 +292,86 @@ export interface ComplianceReport {
   missing_fields: string[];
 }
 
+// Mirrors the backend's `webhooks::ALL_EVENT_TYPES` (crates/api/src/webhooks.rs)
+// — kept as a plain list here rather than fetched from the server since it
+// almost never changes and the settings page needs it synchronously to
+// render checkboxes.
+export const WEBHOOK_EVENT_TYPES = [
+  'manifest.uploaded',
+  'manifest.revoked',
+  'finding.new_critical',
+  'malicious.match_found',
+  'dtrack.push_failed',
+] as const;
+
+export interface WebhookEndpoint {
+  id: string;
+  url: string;
+  event_types: string[];
+  enabled: boolean;
+  created_by: string;
+  created_at: string;
+}
+
+export interface CreateWebhookResult {
+  id: string;
+  url: string;
+  event_types: string[];
+  /** Shown exactly once, in this creation response — there is no "reveal
+   * secret" endpoint afterward. */
+  secret: string;
+}
+
+export interface WebhookTestResult {
+  ok: boolean;
+  error: string | null;
+}
+
+export interface WebhookDelivery {
+  id: number;
+  event_type: string;
+  status: 'pending' | 'delivered' | 'failed';
+  attempts: number;
+  next_attempt_at: string;
+  last_error: string | null;
+  created_at: string;
+  delivered_at: string | null;
+}
+
+export interface VexImportUnmatched {
+  vuln_id: string;
+  reason: string;
+}
+
+export interface VexImportResult {
+  applied: number;
+  skipped_manual: number;
+  unmatched: VexImportUnmatched[];
+}
+
+export interface VerifyCheck {
+  id: string;
+  status: 'pass' | 'fail' | 'warn' | 'not_evaluated';
+  enforce_level: string;
+  details: string[];
+}
+
+export interface VerifyCompliance {
+  profile_id: string;
+  profile_name: string;
+  enforce_level: string;
+  meets_minimum: boolean;
+  minimum_issues: string[];
+  fully_compliant: boolean;
+  missing_fields: string[];
+}
+
+export interface VerifyResult {
+  verdict: 'pass' | 'fail';
+  checks: VerifyCheck[];
+  compliance: VerifyCompliance[];
+}
+
 export interface ComponentSearchResult {
   name: string;
   version: string | null;
@@ -282,11 +384,22 @@ export interface ComponentSearchResult {
   release_version: string;
   revoked: boolean;
   document_type: string | null;
+  license_expr: string | null;
 }
 
 export interface ReindexResult {
   manifests_indexed: number;
   components_indexed: number;
+}
+
+/** One manifest in a "blast radius" answer — which manifests contain a
+ * given component, or are affected by a given vulnerability/advisory id. */
+export interface AffectedManifest {
+  manifest_hash: string;
+  domain: string;
+  namespace: string;
+  release_version: string;
+  revoked: boolean;
 }
 
 export interface CurrentManifest {
@@ -351,11 +464,37 @@ export interface BackendConfig {
   // Present only when dtrack_enabled.
   dtrack_sync_interval_secs: number | null;
   reputation_enabled: boolean;
+  // Currently always equal to reputation_enabled — see the backend's
+  // ConfigJson.freshness_enabled doc comment.
+  freshness_enabled: boolean;
   malicious_check_enabled: boolean;
 }
 
 export interface ReputationSyncResult {
   components_processed: number;
+}
+
+export type FreshnessStatusValue = 'current' | 'behind' | 'major_behind' | 'unknown';
+
+export interface ComponentFreshness {
+  component_name: string;
+  component_version: string | null;
+  latest_version: string | null;
+  // null means the freshness background job hasn't reached this component
+  // yet — render as "pending", not an error.
+  status: FreshnessStatusValue | null;
+  checked_at: string | null;
+  fetch_error: string | null;
+}
+
+export interface FreshnessSyncResult {
+  components_processed: number;
+}
+
+export interface FreshnessStatus {
+  pending: number;
+  checked: number;
+  failed: number;
 }
 
 export interface ReputationStatus {
@@ -512,17 +651,18 @@ export const api = {
     return request(`/api/v1/upload${tenantQs(tenantId)}`, { method: 'POST', body: form });
   },
 
-  // Standalone compliance check — never archived, never touches the
-  // Merkle log or any tenant's manifests. Runs every registered profile
-  // regardless of this tenant's own enable/enforce settings.
-  checkCompliance: (file: File, format: 'cyclonedx' | 'spdx'): Promise<ComplianceReport[]> => {
+  // CI policy gate — the dry-run version of upload: same schema/compliance/
+  // license-policy/malicious-package checks, but nothing is stored,
+  // indexed, or added to the Merkle log. Every registered compliance
+  // profile and this tenant's configured license policy are always
+  // previewed here, even when a profile isn't enabled or a policy's
+  // enforce_level is "off" — a check that isn't actually enforced can
+  // still "warn" from real findings but never flips the verdict to "fail".
+  verifySbom: (file: File, format: 'cyclonedx' | 'spdx', tenantId?: string): Promise<VerifyResult> => {
     const form = new FormData();
     form.append('sbom_file', file);
     form.append('format', format);
-    return request<{ reports: ComplianceReport[] }>('/api/v1/tools/compliance-check', {
-      method: 'POST',
-      body: form,
-    }).then((r) => r.reports);
+    return request(`/api/v1/verify${tenantQs(tenantId)}`, { method: 'POST', body: form });
   },
 
   leaves: (limit = 50, offset = 0, tenantId?: string): Promise<Leaf[]> =>
@@ -560,6 +700,20 @@ export const api = {
 
   manifestVex: (manifestHash: string, tenantId?: string): Promise<Record<string, unknown>> =>
     request(`/api/v1/manifest/${manifestHash}/vex${tenantQs(tenantId)}`),
+
+  importVex: (
+    manifestHash: string,
+    file: File,
+    overwrite: boolean,
+    tenantId?: string
+  ): Promise<VexImportResult> => {
+    const form = new FormData();
+    form.append('vex_file', file);
+    return request(
+      `/api/v1/manifest/${manifestHash}/vex/import${tenantQs(tenantId, overwrite ? { overwrite: 'true' } : {})}`,
+      { method: 'POST', body: form }
+    );
+  },
 
   manifestDiff: (manifestHash: string, against: string | undefined, tenantId?: string): Promise<ManifestDiff> =>
     request(
@@ -627,6 +781,12 @@ export const api = {
   reputationComponents: (): Promise<ReputationComponentSummary[]> => request('/api/v1/reputation/components'),
 
   // Deployment-global, unlike forceDtrackSync — no tenant to scope this to.
+  forceFreshnessSync: (): Promise<FreshnessSyncResult> =>
+    request('/api/v1/freshness/sync', { method: 'POST' }),
+
+  freshnessStatus: (): Promise<FreshnessStatus> => request('/api/v1/freshness/status'),
+
+  // Deployment-global, unlike forceDtrackSync — no tenant to scope this to.
   forceMaliciousSync: (): Promise<MaliciousSyncResult> =>
     request('/api/v1/malicious/sync', { method: 'POST' }),
 
@@ -670,6 +830,16 @@ export const api = {
 
   setReputationTenantSetting: (disabled: boolean, tenantId?: string): Promise<void> =>
     request(`/api/v1/settings/reputation-sync${tenantQs(tenantId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ disabled }),
+    }),
+
+  freshnessTenantSetting: (tenantId?: string): Promise<ReputationTenantSetting> =>
+    request(`/api/v1/settings/freshness${tenantQs(tenantId)}`),
+
+  setFreshnessTenantSetting: (disabled: boolean, tenantId?: string): Promise<void> =>
+    request(`/api/v1/settings/freshness${tenantQs(tenantId)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ disabled }),
@@ -721,6 +891,16 @@ export const api = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ profile_id: profileId, enabled, enforce_level: enforceLevel }),
+    }),
+
+  licensePolicy: (tenantId?: string): Promise<LicensePolicy> =>
+    request(`/api/v1/settings/license-policy${tenantQs(tenantId)}`),
+
+  setLicensePolicy: (policy: LicensePolicy, tenantId?: string): Promise<void> =>
+    request(`/api/v1/settings/license-policy${tenantQs(tenantId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(policy),
     }),
 
   // Not routed through request() — that always parses the response as
@@ -777,6 +957,28 @@ export const api = {
   reindexComponents: (tenantId?: string): Promise<ReindexResult> =>
     request(`/api/v1/search/reindex${tenantQs(tenantId)}`, { method: 'POST' }),
 
+  componentsAffected: (
+    opts: { purl?: string; name?: string; version?: string; currentOnly?: boolean },
+    tenantId?: string
+  ): Promise<AffectedManifest[]> => {
+    const extra: Record<string, string | number> = {};
+    if (opts.purl) extra.purl = opts.purl;
+    if (opts.name) extra.name = opts.name;
+    if (opts.version) extra.version = opts.version;
+    if (opts.currentOnly) extra.current_only = 'true';
+    return request(`/api/v1/components/affected${tenantQs(tenantId, extra)}`);
+  },
+
+  vulnerabilityAffected: (
+    vulnId: string,
+    opts: { currentOnly?: boolean } = {},
+    tenantId?: string
+  ): Promise<AffectedManifest[]> => {
+    const extra: Record<string, string | number> = {};
+    if (opts.currentOnly) extra.current_only = 'true';
+    return request(`/api/v1/vulnerabilities/${encodeURIComponent(vulnId)}/affected${tenantQs(tenantId, extra)}`);
+  },
+
   listKeys: (tenantId?: string): Promise<ApiKeyInfo[]> =>
     request(`/api/v1/keys${tenantQs(tenantId)}`),
 
@@ -809,4 +1011,36 @@ export const api = {
 
   auditLogs: (limit = 100, tenantId?: string): Promise<AuditEntry[]> =>
     request(`/api/v1/audit-logs${tenantQs(tenantId, { limit })}`),
+
+  listWebhooks: (tenantId?: string): Promise<WebhookEndpoint[]> =>
+    request(`/api/v1/webhooks${tenantQs(tenantId)}`),
+
+  createWebhook: (url: string, eventTypes: string[], tenantId?: string): Promise<CreateWebhookResult> =>
+    request(`/api/v1/webhooks${tenantQs(tenantId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, event_types: eventTypes }),
+    }),
+
+  updateWebhook: (
+    id: string,
+    url: string,
+    eventTypes: string[],
+    enabled: boolean,
+    tenantId?: string
+  ): Promise<void> =>
+    request(`/api/v1/webhooks/${id}${tenantQs(tenantId)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, event_types: eventTypes, enabled }),
+    }),
+
+  deleteWebhook: (id: string, tenantId?: string): Promise<void> =>
+    request(`/api/v1/webhooks/${id}${tenantQs(tenantId)}`, { method: 'DELETE' }),
+
+  testWebhook: (id: string, tenantId?: string): Promise<WebhookTestResult> =>
+    request(`/api/v1/webhooks/${id}/test${tenantQs(tenantId)}`, { method: 'POST' }),
+
+  webhookDeliveries: (id: string, tenantId?: string): Promise<WebhookDelivery[]> =>
+    request(`/api/v1/webhooks/${id}/deliveries${tenantQs(tenantId)}`),
 };

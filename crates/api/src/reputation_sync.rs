@@ -32,16 +32,24 @@ pub fn stale_before_cutoff() -> chrono::DateTime<chrono::Utc> {
 /// `sbom_components` has indexed but no (or a stale) cached deps.dev
 /// Scorecard result for. Unlike `dtrack_sync`'s push/refresh loop, this has
 /// no per-manifest state to reconcile — it just works through a
-/// deployment-global backlog of package identities, one tick's worth at a
+/// deployment-global backlog of package identities, one bounded batch at a
 /// time. Every per-item failure is caught and logged, never propagated
 /// (same idiom as `dtrack_sync.rs`): a transient deps.dev outage must not
-/// kill the loop.
-pub async fn run_reputation_sync_loop(db: Arc<Database>, client: Arc<DepsDevClient>, interval: Duration) {
-    let mut ticker = tokio::time::interval(interval);
-    loop {
-        ticker.tick().await;
-        sync_pass(&db, &client).await;
-    }
+/// kill the loop. Bursts through a large backlog at `burst_interval`
+/// spacing rather than waiting a full `interval` between every batch — see
+/// `sync_loop::run_burst_loop`.
+pub async fn run_reputation_sync_loop(
+    db: Arc<Database>,
+    client: Arc<DepsDevClient>,
+    interval: Duration,
+    burst_interval: Duration,
+) {
+    crate::sync_loop::run_burst_loop(interval, burst_interval, move || {
+        let db = db.clone();
+        let client = client.clone();
+        async move { sync_pass(&db, &client).await }
+    })
+    .await;
 }
 
 /// One batch's worth of the reputation sync loop's work, run either by the
