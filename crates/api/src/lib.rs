@@ -149,6 +149,10 @@ pub fn create_router(state: AppState) -> Router {
             post(handlers::reindex_components),
         )
         .route(
+            "/api/v1/tenants/cache/clear",
+            post(handlers::clear_tenant_caches),
+        )
+        .route(
             "/api/v1/components/affected",
             get(handlers::components_affected),
         )

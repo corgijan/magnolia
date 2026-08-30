@@ -141,7 +141,7 @@ export interface LicenseViolation {
 
 export interface LicensePolicy {
   denied_licenses: string[];
-  flag_unknown: boolean;
+  unknown_license_handling: 'ignore' | 'warn' | 'flag';
   enforce_level: 'off' | 'warn' | 'block';
 }
 
@@ -390,6 +390,13 @@ export interface ComponentSearchResult {
 export interface ReindexResult {
   manifests_indexed: number;
   components_indexed: number;
+}
+
+export interface ClearTenantCachesResult {
+  component_index_rows: number;
+  malicious_findings_rows: number;
+  dtrack_findings_rows: number;
+  dtrack_projects_rows: number;
 }
 
 /** One manifest in a "blast radius" answer — which manifests contain a
@@ -961,6 +968,9 @@ export const api = {
 
   reindexComponents: (tenantId?: string): Promise<ReindexResult> =>
     request(`/api/v1/search/reindex${tenantQs(tenantId)}`, { method: 'POST' }),
+
+  clearTenantCaches: (tenantId?: string): Promise<ClearTenantCachesResult> =>
+    request(`/api/v1/tenants/cache/clear${tenantQs(tenantId)}`, { method: 'POST' }),
 
   componentsAffected: (
     opts: { purl?: string; name?: string; version?: string; currentOnly?: boolean },

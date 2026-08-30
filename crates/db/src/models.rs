@@ -290,7 +290,10 @@ pub struct MaliciousFindingRecord {
 pub struct TenantLicensePolicyRecord {
     pub tenant_id: uuid::Uuid,
     pub denied_licenses: Vec<String>,
-    pub flag_unknown: bool,
+    /// "ignore" | "warn" | "flag" — see `magnolia_core::UnknownLicenseHandling`.
+    /// Kept as a plain string here, same convention `enforce_level` already
+    /// uses: this layer stores primitives, the core/API layers own parsing.
+    pub unknown_license_handling: String,
     pub enforce_level: String,
     pub updated_by: String,
     pub updated_at: DateTime<Utc>,

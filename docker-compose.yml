@@ -1,12 +1,23 @@
+# Production/VPS note: nothing in this file publishes a port for `db`,
+# `dtrack-db`, or `dependency-track` — they're reachable only from other
+# containers on the compose network (by service name), never from the host
+# or the internet, regardless of the host's firewall state (removing the
+# `ports:` mapping means Docker never creates the host-level forwarding
+# rule at all — unlike ufw, which Docker's own iptables rules are known to
+# bypass). Only `api` (port 3000) is published. See `.env.example` and the
+# README's "Production / VPS deployment" section before exposing this to
+# the internet — in particular, override `POSTGRES_PASSWORD`,
+# `BOOTSTRAP_SUPER_ADMIN_KEY`, `DTRACK_DB_PASSWORD`, and
+# `DTRACK_ADMIN_PASSWORD` in a local `.env` (git-ignored), and put a
+# reverse proxy with TLS in front of port 3000 — this serves plain HTTP,
+# and API keys go out as bearer tokens.
 services:
   db:
     image: postgres:15
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: sbomstash
-    ports:
-      - "5432:5432"
     volumes:
       - db_data:/var/lib/postgresql/data
     healthcheck:
@@ -23,7 +34,7 @@ services:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgres://postgres:postgres@db:5432/sbomstash
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-postgres}@db:5432/sbomstash
       SERVER_ADDR: 0.0.0.0:3000
       RUST_LOG: info
       SIGNING_KEY_PATH: /data/.sbomstash_key
@@ -34,18 +45,24 @@ services:
       # content is gone. Not a substitute for the S3Store production still
       # needs.
       STORAGE_PATH: /data/sboms
-      # Dev/test convenience: on startup, ensures this exact <key_id>:<secret>
-      # exists as a super_admin key (creating its tenant if needed), so a
-      # fresh `docker compose up` is immediately usable with a known key —
-      # no manual SQL bootstrap step. Idempotent; never overwrites an
-      # existing key. Change or unset this for anything beyond local testing.
-      BOOTSTRAP_SUPER_ADMIN_KEY: "deadbeef-dead-dead-dead-deadbeefdead:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
-      BOOTSTRAP_TENANT_DOMAIN: test.example
-      BOOTSTRAP_TENANT_NAME: "PLATFORM"
+      # On startup, ensures this exact <key_id>:<secret> exists as a
+      # super_admin key (creating its tenant if needed) — the only way to
+      # get a first usable key into a fresh deployment. Idempotent; never
+      # overwrites an existing key. Defaults to the well-known, publicly
+      # documented dev key so local `docker compose up` needs zero setup —
+      # **override all three of these in `.env` before exposing this to the
+      # internet** (see `.env.example`); anyone who reads this repo knows
+      # the default key.
+      BOOTSTRAP_SUPER_ADMIN_KEY: "${BOOTSTRAP_SUPER_ADMIN_KEY:-deadbeef-dead-dead-dead-deadbeefdead:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef}"
+      BOOTSTRAP_TENANT_DOMAIN: "${BOOTSTRAP_TENANT_DOMAIN:-test.example}"
+      BOOTSTRAP_TENANT_NAME: "${BOOTSTRAP_TENANT_NAME:-PLATFORM}"
       # Relaxes a small number of RBAC checks for local testing (currently:
       # lets an uploader-role key revoke its own manifests, not just
-      # domain_admin/auditor/super_admin). Never set this in production.
-      DEV_MODE: "true"
+      # domain_admin/auditor/super_admin). Defaults to off here (unlike
+      # local `cargo run`, which has no default) — set DEV_MODE=true in a
+      # local-only `.env` if you rely on it for dev; never set it for an
+      # internet-reachable deployment.
+      DEV_MODE: "${DEV_MODE:-false}"
       # Optional, deployment-wide Dependency-Track integration (see
       # DTRACK_PLAN.md) — only takes effect when the "dtrack" profile is
       # also started (`docker compose --profile dtrack up`). DTRACK_URL
@@ -82,7 +99,7 @@ services:
     profiles: ["dtrack"]
     environment:
       POSTGRES_USER: dtrack
-      POSTGRES_PASSWORD: dtrack
+      POSTGRES_PASSWORD: ${DTRACK_DB_PASSWORD:-dtrack}
       POSTGRES_DB: dtrack
     volumes:
       - dtrack_db_data:/var/lib/postgresql/data
@@ -114,15 +131,18 @@ services:
       # the ALPINE_DATABASE_* names (see git history) instead.
       DT_DATASOURCE_URL: jdbc:postgresql://dtrack-db:5432/dtrack
       DT_DATASOURCE_USERNAME: dtrack
-      DT_DATASOURCE_PASSWORD: dtrack
-    ports:
-      - "8080:8080"
+      DT_DATASOURCE_PASSWORD: ${DTRACK_DB_PASSWORD:-dtrack}
     volumes:
       - dtrack_data:/data
     # dependencytrack/frontend is deliberately not included — Magnolia's
     # own UI is the intended findings surface; the dtrack web UI is only
     # useful for the one-time manual bootstrap (see README), reachable
-    # directly against this service's REST API without it.
+    # directly against this service's REST API without it. No `ports:`
+    # here either — `api` reaches it over the compose network by service
+    # name (`http://dependency-track:8080`); if you ever need direct
+    # access (e.g. to click around its own UI), add a loopback-only
+    # mapping temporarily: `127.0.0.1:8080:8080` (never `8080:8080` alone
+    # on an internet-facing host).
 
 volumes:
   db_data:

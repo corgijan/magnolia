@@ -198,6 +198,10 @@ then fold `peaks` left to right to obtain the tree root.
 ## Configuration
 
 ### Environment Variables
+
+See `.env.example` for the docker-compose-driven equivalent of these (what
+to override in a local `.env` file, with generation commands) — this list is
+for running `magnolia-server` directly, e.g. via `cargo run`.
 ```bash
 DATABASE_URL=postgres://user:pass@localhost:5432/sbomstash
 RUST_LOG=info
@@ -224,7 +228,7 @@ DEV_MODE=true
 ```
 deadbeef-dead-dead-dead-deadbeefdead:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
 ```
-That's a tenant on `test.example` (from `BOOTSTRAP_TENANT_DOMAIN`), created idempotently on every startup — safe to leave in place across restarts. Paste that key straight into the UI header and skip the manual-bootstrap step entirely. **Change or remove it before anything beyond local testing** — it's a well-known, publicly documented key.
+That's a tenant on `test.example` (from `BOOTSTRAP_TENANT_DOMAIN`), created idempotently on every startup — safe to leave in place across restarts. Paste that key straight into the UI header and skip the manual-bootstrap step entirely. **Change it before anything beyond local testing** — it's a well-known, publicly documented key; see "Production / VPS deployment" below.
 
 Then just run the frontend natively (step 5 below) — its dev-server proxy already points at `127.0.0.1:3000`.
 
@@ -354,6 +358,59 @@ env:
   DTRACK_API_KEY: ""                          # fill in after the bootstrap step above
   DTRACK_SYNC_INTERVAL_SECS: "600"            # optional, defaults to 600
 ```
+
+### Production / VPS deployment
+
+The compose files ship with insecure defaults so local `docker compose up`
+needs zero setup — none of that is safe to leave in place on a host reachable
+from the internet.
+
+1. **Set real secrets.** Copy `.env.example` to `.env` and fill in
+   `BOOTSTRAP_SUPER_ADMIN_KEY`, `POSTGRES_PASSWORD`, `DEV_MODE=false`, and
+   (if you're also enabling Dependency-Track) `DTRACK_DB_PASSWORD` /
+   `DTRACK_ADMIN_PASSWORD` — generation commands are in the file itself.
+   `.env` is git-ignored; `docker compose` picks it up automatically from
+   the same directory as the compose file.
+
+2. **Start everything except the UI** (Magnolia's own frontend service
+   stays commented out in `docker-compose.yml` — it's not required; any
+   HTTP client, including `scripts/magnolia-upload.sh`, talks to `api`
+   directly):
+   ```bash
+   docker compose -f docker-compose.yml -f docker-compose.dtrack.yml up -d --build
+   ```
+   This brings up `db`, `api`, and the full Dependency-Track stack
+   (`dtrack-db`, `dependency-track`, `dtrack-bootstrap`) in one command —
+   drop `-f docker-compose.dtrack.yml` if you don't want Dependency-Track at
+   all. Either way, only `api` publishes a port (3000); `db`, `dtrack-db`,
+   and `dependency-track` are reachable solely from other containers on the
+   compose network, never from the host or the internet — see the comment
+   at the top of `docker-compose.yml`.
+
+3. **Put a reverse proxy with TLS in front of port 3000.** `api` itself
+   serves plain HTTP — API keys go out as bearer tokens, so this matters.
+   Any of Caddy, nginx, or Traefik works; Caddy is the least config for a
+   single-domain setup (automatic Let's Encrypt, one line: `your-domain.com
+   { reverse_proxy localhost:3000 }`). Not included here since the right
+   choice depends on what else, if anything, shares this VPS.
+
+4. **Firewall the host** to only 22 (SSH) and 443/80 (your reverse proxy) —
+   `ufw allow 22,80,443/tcp` plus a default-deny, or your cloud provider's
+   security-group equivalent. Don't rely on the firewall alone to keep `db`
+   off the internet, though — Docker's own port-publishing (`ports:` in a
+   compose file) creates iptables rules that bypass ufw's rules entirely;
+   the actual guarantee here is that `db`/`dtrack-db`/`dependency-track`
+   simply have no `ports:` mapping at all, so there's nothing for a firewall
+   to need to block in the first place.
+
+5. **Back up `db_data`.** It's a normal named Docker volume — `docker run
+   --rm -v aise_db_data:/data -v $PWD:/backup postgres:15 tar czf
+   /backup/db_backup.tar.gz -C /data .` (stop `api` first, or use `pg_dump`
+   for a live backup instead). `signing_key` (holds the DSSE signing key
+   and, if `STORAGE_PATH` stays set, uploaded SBOM bytes) is worth the same
+   treatment — losing it doesn't lose the Merkle log's integrity, but it
+   does lose the ability to sign new manifests or serve old SBOM content
+   until replaced.
 
 ### Migrations
 

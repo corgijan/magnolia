@@ -7,6 +7,7 @@ import {
   AuditEntry,
   ConsistencyProof,
   BackendConfig,
+  ClearTenantCachesResult,
   ComplianceSetting,
   ComponentSearchResult,
   CreateKeyResponse,
@@ -1935,7 +1936,12 @@ function SbomDetailPanel({
   const showReputationSignal =
     !!manifest && !manifest.document_type && !reputationDisabledForTenant && manifest.component_reputation.length > 0;
   const showVulnSignal = !!manifest && !manifest.document_type && dtrackEnabled && !dtrackSyncDisabled;
-  const showLicenseSignal = !!manifest && !manifest.document_type && licenseEnforceLevel !== 'off';
+  // Always shown for a real SBOM, regardless of enforce_level — this is a
+  // live preview (like `/verify`'s), not a record of what was actually
+  // enforced, so "off" still needs to be visible: a tenant trying out
+  // "warn" on unknown-license handling should see the result immediately,
+  // without also having to flip Enforcement on first.
+  const showLicenseSignal = !!manifest && !manifest.document_type;
   const showFreshnessSignal =
     !!manifest && !manifest.document_type && !freshnessDisabledForTenant && manifest.component_freshness.length > 0;
   const hasSecuritySignals =
@@ -2107,8 +2113,14 @@ function SbomDetailPanel({
                         <SignalLabel
                           label="License compliance"
                           tooltip={
-                            'Components checked against this tenant\'s license policy (Settings → License policy).' +
-                            (licenseEnforceLevel === 'block' ? ' Denied licenses block uploads outright.' : ' Warn only — never blocks an upload.')
+                            'Components checked against this tenant\'s license policy (Settings → License policy) — ' +
+                            'a live preview, recomputed on every view, not just a record of what was enforced at ' +
+                            'upload time.' +
+                            (licenseEnforceLevel === 'block'
+                              ? ' Denied licenses (and, if configured, unknown-license components) block uploads outright.'
+                              : licenseEnforceLevel === 'warn'
+                              ? ' Warn only — never blocks an upload.'
+                              : ' Enforcement is currently off — shown here as a preview of what would be flagged.')
                           }
                         />
                       </td>
@@ -4997,6 +5009,9 @@ function Settings({
   const [createNamespaceError, setCreateNamespaceError] = useState('');
   const [deleteNamespaceBusy, setDeleteNamespaceBusy] = useState<string | null>(null);
   const [deleteNamespaceError, setDeleteNamespaceError] = useState('');
+  const [clearCachesBusy, setClearCachesBusy] = useState(false);
+  const [clearCachesError, setClearCachesError] = useState('');
+  const [clearCachesResult, setClearCachesResult] = useState<ClearTenantCachesResult | null>(null);
 
   const loadRegisteredNamespaces = useCallback(() => {
     api.listRegisteredNamespaces(tenantId)
@@ -5221,6 +5236,34 @@ function Settings({
     }
   };
 
+  const handleClearTenantCaches = async () => {
+    if (
+      !window.confirm(
+        'Delete this tenant\'s caches?\n\n' +
+          'This clears the component search index, cached malicious-package findings, and cached ' +
+          'Dependency-Track findings/projects for this tenant. Manifests, the SBOM archive, and the ' +
+          'Merkle log are NOT touched — everything here is rebuilt automatically (next upload/reindex, ' +
+          'next OSV sync, next dtrack sync).\n\n' +
+          'Two things to know: clearing malicious findings can re-fire "malicious.match_found" webhooks ' +
+          'for previously-known hits on the next sync, and clearing Dependency-Track findings permanently ' +
+          'deletes any manual triage/VEX comments recorded on them.'
+      )
+    ) {
+      return;
+    }
+    setClearCachesBusy(true);
+    setClearCachesError('');
+    setClearCachesResult(null);
+    try {
+      const res = await api.clearTenantCaches(tenantId);
+      setClearCachesResult(res);
+    } catch (e) {
+      setClearCachesError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setClearCachesBusy(false);
+    }
+  };
+
   const forceReputationSync = async () => {
     setReputationSyncBusy(true);
     setReputationSyncError('');
@@ -5279,7 +5322,7 @@ function Settings({
   useEffect(load, [load]);
 
   const saveLicensePolicy = async (next: Partial<LicensePolicy>) => {
-    const base = licensePolicy ?? { denied_licenses: [], flag_unknown: false, enforce_level: 'off' as const };
+    const base = licensePolicy ?? { denied_licenses: [], unknown_license_handling: 'ignore' as const, enforce_level: 'off' as const };
     const updated: LicensePolicy = { ...base, ...next };
     setLicensePolicyBusy(true);
     setLicensePolicyError('');
@@ -5511,6 +5554,31 @@ function Settings({
           <div className="muted">No namespaces registered yet.</div>
         )}
       </div>
+
+      <div className="card">
+        <div className="card-header">
+          <h2>Danger zone</h2>
+        </div>
+        <p className="muted">
+          Delete this tenant's caches — the component search index, cached malicious-package findings,
+          and cached Dependency-Track findings/projects. Manifests, the SBOM archive, and the Merkle log
+          are never touched; everything cleared here is rebuilt automatically (next upload/reindex, next
+          OSV sync, next dtrack sync). Clearing malicious findings can re-fire "malicious.match_found"
+          webhooks for previously-known hits on the next sync, and clearing Dependency-Track findings
+          permanently deletes any manual triage/VEX comments recorded on them.
+        </p>
+        <button className="btn" disabled={clearCachesBusy} onClick={handleClearTenantCaches}>
+          {clearCachesBusy ? 'Clearing…' : 'Delete tenant caches'}
+        </button>
+        {clearCachesError && <ErrorBox message={clearCachesError} />}
+        {clearCachesResult && (
+          <div className="muted" style={{ marginTop: 12 }}>
+            Cleared {clearCachesResult.component_index_rows} component-index row(s),{' '}
+            {clearCachesResult.malicious_findings_rows} malicious finding(s), {clearCachesResult.dtrack_findings_rows}{' '}
+            dtrack finding(s), and {clearCachesResult.dtrack_projects_rows} dtrack project link(s).
+          </div>
+        )}
+      </div>
         </>
       )}
 
@@ -5594,8 +5662,10 @@ function Settings({
           out of a component's (possibly compound) license expression — e.g. a deny-list entry of
           "GPL-3.0-only" also matches a component licensed "MIT AND GPL-3.0-only". "Block" rejects the
           upload outright; "warn" only surfaces violations on the SBOM's detail view. Components with no
-          license info at all (missing, or SPDX "NOASSERTION") are ignored by default — set the "no
-          license info" option below to flag them instead. This affects every uploader on the tenant, not
+          license info at all (missing, or SPDX "NOASSERTION") are ignored by default — the "no license
+          info" option below can instead "warn" (always reported, but never blocks an upload even when
+          Enforcement is set to "block") or "flag as a violation" (treated exactly like a denied license,
+          so it blocks too once Enforcement is "block"). This affects every uploader on the tenant, not
           just you.
         </p>
         <p className="muted">
@@ -5633,14 +5703,17 @@ function Settings({
                 disabled={licensePolicyBusy}
               />
             </label>
-            <label className="field" style={{ flex: '0 1 220px', minWidth: 180, marginBottom: 0 }}>
+            <label className="field" style={{ flex: '0 1 240px', minWidth: 200, marginBottom: 0 }}>
               <span>Components with no license info</span>
               <select
-                value={licensePolicy.flag_unknown ? 'flag' : 'ignore'}
+                value={licensePolicy.unknown_license_handling}
                 disabled={licensePolicyBusy}
-                onChange={(e) => saveLicensePolicy({ flag_unknown: e.target.value === 'flag' })}
+                onChange={(e) =>
+                  saveLicensePolicy({ unknown_license_handling: e.target.value as LicensePolicy['unknown_license_handling'] })
+                }
               >
                 <option value="ignore">ignore (default)</option>
+                <option value="warn">warn (never blocks)</option>
                 <option value="flag">flag as a violation</option>
               </select>
             </label>

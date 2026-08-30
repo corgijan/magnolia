@@ -22,8 +22,8 @@ pub use compliance::{
 };
 pub use component_index::{extract_components, ExtractedComponent};
 pub use license::{
-    evaluate_license_policy, is_valid_spdx_license_id, normalize_license_expr, LicensePolicy, LicenseViolation,
-    LicenseViolationReason,
+    evaluate_license_policy, is_valid_spdx_license_id, license_policy_status, normalize_license_expr, LicensePolicy,
+    LicenseViolation, LicenseViolationReason, UnknownLicenseHandling,
 };
 pub use freshness::{classify_freshness, FreshnessStatus};
 pub use purl::{purl_to_depsdev_package, purl_to_osv_ecosystem};

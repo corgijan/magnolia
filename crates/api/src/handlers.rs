@@ -276,14 +276,15 @@ pub struct ComplianceReportJson {
 #[derive(serde::Serialize)]
 pub struct LicensePolicyJson {
     pub denied_licenses: Vec<String>,
-    pub flag_unknown: bool,
+    /// "ignore" | "warn" | "flag" — see `magnolia_core::UnknownLicenseHandling`.
+    pub unknown_license_handling: String,
     pub enforce_level: String,
 }
 
 #[derive(serde::Deserialize)]
 pub struct SetLicensePolicyRequest {
     pub denied_licenses: Vec<String>,
-    pub flag_unknown: bool,
+    pub unknown_license_handling: String,
     pub enforce_level: String,
 }
 
@@ -884,41 +885,42 @@ async fn license_violations_for_tenant(
     tenant_id: Uuid,
     format: &str,
     sbom_bytes: &[u8],
-) -> Result<(Vec<CoreLicenseViolation>, String), ApiError> {
+) -> Result<(Vec<CoreLicenseViolation>, String, magnolia_core::UnknownLicenseHandling), ApiError> {
     let Some(policy) = state.db.get_tenant_license_policy(tenant_id).await.map_err(db_err)? else {
-        return Ok((Vec::new(), "off".to_string()));
+        return Ok((Vec::new(), "off".to_string(), magnolia_core::UnknownLicenseHandling::Ignore));
     };
+    let unknown_handling = magnolia_core::UnknownLicenseHandling::parse(&policy.unknown_license_handling);
     if policy.enforce_level == "off" {
-        return Ok((Vec::new(), policy.enforce_level));
+        return Ok((Vec::new(), policy.enforce_level, unknown_handling));
     }
     let components = magnolia_core::extract_components(format, sbom_bytes);
     let core_policy =
-        magnolia_core::LicensePolicy { denied_licenses: policy.denied_licenses, flag_unknown: policy.flag_unknown };
+        magnolia_core::LicensePolicy { denied_licenses: policy.denied_licenses, unknown_license_handling: unknown_handling };
     let violations = magnolia_core::evaluate_license_policy(&components, &core_policy);
-    Ok((violations, policy.enforce_level))
+    Ok((violations, policy.enforce_level, unknown_handling))
 }
 
 /// Same evaluation as `license_violations_for_tenant`, but never gated on
 /// `enforce_level == "off"` — used by `/verify`'s preview, which wants to
 /// show what WOULD flag against this tenant's configured deny-list/
-/// flag_unknown even before enforcement is turned on. A tenant that's
-/// never touched the license policy at all gets an empty deny-list here
-/// (not an error), which naturally yields zero violations.
+/// unknown-license handling even before enforcement is turned on. A tenant
+/// that's never touched the license policy at all gets an empty deny-list
+/// here (not an error), which naturally yields zero violations.
 async fn license_violations_preview_for_tenant(
     state: &AppState,
     tenant_id: Uuid,
     format: &str,
     sbom_bytes: &[u8],
-) -> Result<(Vec<CoreLicenseViolation>, String), ApiError> {
+) -> Result<(Vec<CoreLicenseViolation>, String, magnolia_core::UnknownLicenseHandling), ApiError> {
     let policy = state.db.get_tenant_license_policy(tenant_id).await.map_err(db_err)?;
-    let (denied_licenses, flag_unknown, enforce_level) = match policy {
-        Some(p) => (p.denied_licenses, p.flag_unknown, p.enforce_level),
-        None => (Vec::new(), false, "off".to_string()),
+    let (denied_licenses, unknown_handling, enforce_level) = match policy {
+        Some(p) => (p.denied_licenses, magnolia_core::UnknownLicenseHandling::parse(&p.unknown_license_handling), p.enforce_level),
+        None => (Vec::new(), magnolia_core::UnknownLicenseHandling::Ignore, "off".to_string()),
     };
     let components = magnolia_core::extract_components(format, sbom_bytes);
-    let core_policy = magnolia_core::LicensePolicy { denied_licenses, flag_unknown };
+    let core_policy = magnolia_core::LicensePolicy { denied_licenses, unknown_license_handling: unknown_handling };
     let violations = magnolia_core::evaluate_license_policy(&components, &core_policy);
-    Ok((violations, enforce_level))
+    Ok((violations, enforce_level, unknown_handling))
 }
 
 fn license_violation_detail(v: &CoreLicenseViolation) -> String {
@@ -943,8 +945,9 @@ async fn enforce_license_policy(
     format: &str,
     sbom_bytes: &[u8],
 ) -> Result<(), ApiError> {
-    let (violations, enforce_level) = license_violations_for_tenant(state, tenant_id, format, sbom_bytes).await?;
-    if enforce_level != "block" || violations.is_empty() {
+    let (violations, enforce_level, unknown_handling) =
+        license_violations_for_tenant(state, tenant_id, format, sbom_bytes).await?;
+    if magnolia_core::license_policy_status(&violations, &enforce_level, unknown_handling) != "fail" {
         return Ok(());
     }
     let details: Vec<String> = violations.iter().map(license_violation_detail).collect();
@@ -2298,9 +2301,15 @@ pub async fn manifest(
     // reflected on every existing manifest immediately, not just ones
     // reindexed since. `document` uploads have no components to extract
     // (matches `enforce_license_policy`/`index_manifest_components`
-    // skipping them at upload time).
+    // skipping them at upload time). Uses the *preview* variant, not
+    // `license_violations_for_tenant` — this is a live "what would this
+    // score" display like `/verify`'s, not a record of what was actually
+    // enforced, so it stays populated even when `enforce_level == "off"`
+    // (a tenant trying out "warn" on unknown-license handling should see
+    // it reflected here immediately, not just once they also flip
+    // Enforcement on).
     let license_violations: Vec<LicenseViolationJson> = if record.document_type.is_none() {
-        license_violations_for_tenant(&state, tenant_id, &record.sbom_format, &sbom_bytes)
+        license_violations_preview_for_tenant(&state, tenant_id, &record.sbom_format, &sbom_bytes)
             .await?
             .0
             .into_iter()
@@ -3235,21 +3244,18 @@ pub async fn verify_sbom(
         }
 
         // ---- license policy — always previewed against this tenant's
-        // configured deny-list/flag_unknown, even when enforce_level is
-        // "off" or nothing has been configured yet (an empty deny-list
-        // then, not an error). Also folded in from the former Tools
-        // "Check compliance" tool — a tenant drafting a policy wants to
-        // preview its effect before flipping enforcement on. Only actually
-        // fails the verdict when `enforce_level == "block"`.
-        let (violations, license_enforce_level) =
+        // configured deny-list/unknown-license handling, even when
+        // enforce_level is "off" or nothing has been configured yet (an
+        // empty deny-list then, not an error). Also folded in from the
+        // former Tools "Check compliance" tool — a tenant drafting a policy
+        // wants to preview its effect before flipping enforcement on. Only
+        // actually fails the verdict when `enforce_level == "block"` AND at
+        // least one violation is severe enough to block (a denied license,
+        // or an unknown-license one under "flag" handling — see
+        // `license_policy_status`; "warn" handling never blocks).
+        let (violations, license_enforce_level, unknown_handling) =
             license_violations_preview_for_tenant(&state, tenant_id, &format, &sbom_bytes).await?;
-        let status = if violations.is_empty() {
-            "pass"
-        } else if license_enforce_level == "block" {
-            "fail"
-        } else {
-            "warn"
-        };
+        let status = magnolia_core::license_policy_status(&violations, &license_enforce_level, unknown_handling);
         let details = violations.iter().map(license_violation_detail).collect();
         checks.push(verify_check("license-policy", status, &license_enforce_level, details));
 
@@ -3480,10 +3486,14 @@ pub async fn license_policy(
     Ok(Json(match row {
         Some(r) => LicensePolicyJson {
             denied_licenses: r.denied_licenses,
-            flag_unknown: r.flag_unknown,
+            unknown_license_handling: r.unknown_license_handling,
             enforce_level: r.enforce_level,
         },
-        None => LicensePolicyJson { denied_licenses: Vec::new(), flag_unknown: false, enforce_level: "off".to_string() },
+        None => LicensePolicyJson {
+            denied_licenses: Vec::new(),
+            unknown_license_handling: "ignore".to_string(),
+            enforce_level: "off".to_string(),
+        },
     }))
 }
 
@@ -3498,6 +3508,11 @@ pub async fn set_license_policy(
     require(&grant, Action::ManageSettings, &grant.namespace_scope)?;
     if !matches!(body.enforce_level.as_str(), "off" | "warn" | "block") {
         return Err(ApiError::BadRequest("enforce_level must be one of: off, warn, block".to_string()));
+    }
+    if !matches!(body.unknown_license_handling.as_str(), "ignore" | "warn" | "flag") {
+        return Err(ApiError::BadRequest(
+            "unknown_license_handling must be one of: ignore, warn, flag".to_string(),
+        ));
     }
     let denied_licenses: Vec<String> =
         body.denied_licenses.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
@@ -3515,7 +3530,13 @@ pub async fn set_license_policy(
     let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
     state
         .db
-        .set_tenant_license_policy(tenant_id, &denied_licenses, body.flag_unknown, &body.enforce_level, &grant.principal())
+        .set_tenant_license_policy(
+            tenant_id,
+            &denied_licenses,
+            &body.unknown_license_handling,
+            &body.enforce_level,
+            &grant.principal(),
+        )
         .await
         .map_err(db_err)?;
     Ok(StatusCode::NO_CONTENT)
@@ -3728,6 +3749,63 @@ pub async fn reindex_components(
     .await;
 
     Ok(Json(ReindexResponse { manifests_indexed, components_indexed }))
+}
+
+#[derive(serde::Serialize)]
+pub struct ClearTenantCachesResponse {
+    pub component_index_rows: u64,
+    pub malicious_findings_rows: u64,
+    pub dtrack_findings_rows: u64,
+    pub dtrack_projects_rows: u64,
+}
+
+/// Deletes this tenant's derived/cached data — the component-search index
+/// (`sbom_components`), cached malicious-package findings, and cached
+/// Dependency-Track findings/projects — without touching manifests, the
+/// Merkle log, or stored SBOM bytes. Every one of these is rebuilt from
+/// source on its own schedule (a fresh upload or `reindex_components` for
+/// the component index, the next OSV sync for malicious findings, the next
+/// dtrack sync for dtrack data), so this is always recoverable, just not
+/// instantly. `Action::ManageSettings`, same gate as `reindex_components`.
+///
+/// Two real side effects worth knowing before using this (also called out
+/// in `clear_malicious_findings_for_tenant`/`clear_dtrack_cache_for_tenant`'s
+/// own doc comments): clearing malicious findings can re-fire
+/// `malicious.match_found` webhooks for previously-known hits on the next
+/// OSV sync; clearing dtrack findings permanently loses any manual
+/// triage/VEX comments recorded on them (`finding_comments` cascades).
+pub async fn clear_tenant_caches(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+) -> Result<Json<ClearTenantCachesResponse>, ApiError> {
+    require(&grant, Action::ManageSettings, &grant.namespace_scope)?;
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+
+    let component_index_rows = state.db.clear_component_index(tenant_id).await.map_err(db_err)?;
+    let malicious_findings_rows = state.db.clear_malicious_findings_for_tenant(tenant_id).await.map_err(db_err)?;
+    let (dtrack_findings_rows, dtrack_projects_rows) =
+        state.db.clear_dtrack_cache_for_tenant(tenant_id).await.map_err(db_err)?;
+
+    let _ = record_audit(
+        &state,
+        &grant,
+        "clear_tenant_caches",
+        &format!(
+            "components={component_index_rows} malicious={malicious_findings_rows} \
+             dtrack_findings={dtrack_findings_rows} dtrack_projects={dtrack_projects_rows}"
+        ),
+        true,
+        None,
+    )
+    .await;
+
+    Ok(Json(ClearTenantCachesResponse {
+        component_index_rows,
+        malicious_findings_rows,
+        dtrack_findings_rows,
+        dtrack_projects_rows,
+    }))
 }
 
 #[derive(serde::Serialize)]

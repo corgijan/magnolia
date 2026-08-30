@@ -858,6 +858,72 @@ impl Database {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Clears this tenant's component-search index (`sbom_components`) —
+    /// paired with `reindex_components`/`index_manifest_components`, which
+    /// only ever add rows; this is the way back if the index needs to be
+    /// rebuilt from scratch. Component Search returns nothing for this
+    /// tenant until a fresh upload or a manual reindex repopulates it.
+    /// Returns rows deleted.
+    pub async fn clear_component_index(&self, tenant_id: Uuid) -> Result<u64, DbError> {
+        let result = sqlx::query("DELETE FROM sbom_components WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .execute(&self.pool)
+            .await
+            .map_err(map_query_error)?;
+        Ok(result.rows_affected())
+    }
+
+    /// Clears this tenant's cached malicious-package findings
+    /// (`malicious_component_findings`) — that table only carries
+    /// `manifest_hash`, not `tenant_id`, so scoping goes through
+    /// `manifests`. The next OSV sync/upload repopulates from scratch;
+    /// since `insert_malicious_findings` treats a fresh insert as "newly
+    /// seen," clearing this can make previously-known `MAL-` hits re-fire
+    /// `malicious.match_found` webhooks on the next sync. Returns rows
+    /// deleted.
+    pub async fn clear_malicious_findings_for_tenant(&self, tenant_id: Uuid) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            "DELETE FROM malicious_component_findings \
+             WHERE manifest_hash IN (SELECT manifest_hash FROM manifests WHERE tenant_id = $1)",
+        )
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await
+        .map_err(map_query_error)?;
+        Ok(result.rows_affected())
+    }
+
+    /// Clears this tenant's cached Dependency-Track data (`dtrack_findings`
+    /// + `dtrack_projects`, both scoped via `manifests` the same way
+    /// `clear_malicious_findings_for_tenant` is) — the next dtrack sync
+    /// pass repopulates both from the live dtrack server; the actual
+    /// project in Dependency-Track itself is untouched, only this app's
+    /// record of having pushed/synced it. `dtrack_findings` cascades to
+    /// `finding_comments` (`ON DELETE CASCADE`), so any manual triage
+    /// comments on those findings are permanently lost, not just the
+    /// findings themselves. Returns `(findings_deleted, projects_deleted)`.
+    pub async fn clear_dtrack_cache_for_tenant(&self, tenant_id: Uuid) -> Result<(u64, u64), DbError> {
+        let findings = sqlx::query(
+            "DELETE FROM dtrack_findings \
+             WHERE manifest_hash IN (SELECT manifest_hash FROM manifests WHERE tenant_id = $1)",
+        )
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await
+        .map_err(map_query_error)?
+        .rows_affected();
+        let projects = sqlx::query(
+            "DELETE FROM dtrack_projects \
+             WHERE manifest_hash IN (SELECT manifest_hash FROM manifests WHERE tenant_id = $1)",
+        )
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await
+        .map_err(map_query_error)?
+        .rows_affected();
+        Ok((findings, projects))
+    }
+
     /// Exact-match existence check, used by `upload_sbom` when this tenant
     /// has `require_namespace_registration` set — deliberately not a
     /// prefix/scope match like the listing/read methods above: a namespace
@@ -956,7 +1022,7 @@ impl Database {
     ) -> Result<Option<TenantLicensePolicyRecord>, DbError> {
         sqlx::query_as::<_, TenantLicensePolicyRecord>(
             r#"
-            SELECT tenant_id, denied_licenses, flag_unknown, enforce_level, updated_by, updated_at
+            SELECT tenant_id, denied_licenses, unknown_license_handling, enforce_level, updated_by, updated_at
             FROM tenant_license_policies
             WHERE tenant_id = $1
             "#,
@@ -969,23 +1035,25 @@ impl Database {
 
     /// Upserts a tenant's license policy — always writes a row, same
     /// "off is a persisted state, not an absence" convention as
-    /// `set_compliance_setting`.
+    /// `set_compliance_setting`. `unknown_license_handling` is validated by
+    /// the caller (API layer) against "ignore"/"warn"/"flag" — this layer
+    /// just persists whatever string it's given, same as `enforce_level`.
     pub async fn set_tenant_license_policy(
         &self,
         tenant_id: Uuid,
         denied_licenses: &[String],
-        flag_unknown: bool,
+        unknown_license_handling: &str,
         enforce_level: &str,
         updated_by: &str,
     ) -> Result<(), DbError> {
         sqlx::query(
             r#"
             INSERT INTO tenant_license_policies
-                (tenant_id, denied_licenses, flag_unknown, enforce_level, updated_by, updated_at)
+                (tenant_id, denied_licenses, unknown_license_handling, enforce_level, updated_by, updated_at)
             VALUES ($1, $2, $3, $4, $5, now())
             ON CONFLICT (tenant_id)
             DO UPDATE SET denied_licenses = EXCLUDED.denied_licenses,
-                           flag_unknown = EXCLUDED.flag_unknown,
+                           unknown_license_handling = EXCLUDED.unknown_license_handling,
                            enforce_level = EXCLUDED.enforce_level,
                            updated_by = EXCLUDED.updated_by,
                            updated_at = EXCLUDED.updated_at
@@ -993,7 +1061,7 @@ impl Database {
         )
         .bind(tenant_id)
         .bind(denied_licenses)
-        .bind(flag_unknown)
+        .bind(unknown_license_handling)
         .bind(enforce_level)
         .bind(updated_by)
         .execute(&self.pool)

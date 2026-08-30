@@ -11,9 +11,50 @@ pub struct LicensePolicy {
     /// each individual identifier resolved out of a component's license
     /// expression, not against the whole expression string.
     pub denied_licenses: Vec<String>,
-    /// Whether a component with no usable license information at all
-    /// counts as a violation in its own right.
-    pub flag_unknown: bool,
+    /// How a component with no usable license information at all is
+    /// treated — see `UnknownLicenseHandling`.
+    pub unknown_license_handling: UnknownLicenseHandling,
+}
+
+/// How a component with no usable license information at all (missing, or
+/// SPDX "NOASSERTION") is treated — deliberately a 3-way choice rather than
+/// a bool, since "missing license metadata" and "a component whose license
+/// is affirmatively on the deny-list" are different severities of problem
+/// even when a tenant wants both surfaced: `Warn` reports it without ever
+/// blocking an upload (even under `enforce_level == "block"`), while `Flag`
+/// gives it the same blocking weight as a denied license. See
+/// `license_policy_status`, which is where that distinction actually bites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnknownLicenseHandling {
+    /// Not a violation at all — the default.
+    Ignore,
+    /// A violation, but capped at "warn": never fails an upload/verify
+    /// check on its own, regardless of the policy's `enforce_level`.
+    Warn,
+    /// A violation with the same severity as a denied license — follows
+    /// `enforce_level` like any other violation, including `block`.
+    Flag,
+}
+
+impl UnknownLicenseHandling {
+    /// Parses the DB/API's plain-string representation ("ignore" | "warn" |
+    /// "flag") — anything else (including absent/legacy data) falls back to
+    /// `Ignore`, the same default `LicensePolicy` has always had.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "warn" => Self::Warn,
+            "flag" => Self::Flag,
+            _ => Self::Ignore,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ignore => "ignore",
+            Self::Warn => "warn",
+            Self::Flag => "flag",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -87,7 +128,7 @@ pub fn evaluate_license_policy(
     for c in components {
         match &c.license {
             None => {
-                if policy.flag_unknown {
+                if policy.unknown_license_handling != UnknownLicenseHandling::Ignore {
                     violations.push(LicenseViolation {
                         component_name: c.name.clone(),
                         component_version: c.version.clone(),
@@ -111,6 +152,33 @@ pub fn evaluate_license_policy(
         }
     }
     violations
+}
+
+/// Combines already-computed `violations` with this tenant's `enforce_level`
+/// ("off" | "warn" | "block") and `unknown_license_handling` into a single
+/// check status — "pass" | "warn" | "fail". The one subtlety this
+/// centralizes so upload enforcement and `/verify`'s preview can't drift
+/// apart: an `Unknown`-reason violation under `Warn` handling never
+/// contributes to "fail", even when `enforce_level == "block"` — only a
+/// `Denied` violation, or an `Unknown` one under `Flag` handling, can
+/// actually block.
+pub fn license_policy_status(
+    violations: &[LicenseViolation],
+    enforce_level: &str,
+    unknown_handling: UnknownLicenseHandling,
+) -> &'static str {
+    if violations.is_empty() {
+        return "pass";
+    }
+    let blockable = violations.iter().any(|v| match &v.reason {
+        LicenseViolationReason::Denied { .. } => true,
+        LicenseViolationReason::Unknown => unknown_handling == UnknownLicenseHandling::Flag,
+    });
+    if enforce_level == "block" && blockable {
+        "fail"
+    } else {
+        "warn"
+    }
 }
 
 #[cfg(test)]
@@ -163,7 +231,10 @@ mod tests {
     #[test]
     fn denied_license_in_compound_expression_is_flagged() {
         let components = vec![component("lib-a", Some("MIT AND GPL-3.0-only"))];
-        let policy = LicensePolicy { denied_licenses: vec!["GPL-3.0-only".to_string()], flag_unknown: false };
+        let policy = LicensePolicy {
+            denied_licenses: vec!["GPL-3.0-only".to_string()],
+            unknown_license_handling: UnknownLicenseHandling::Ignore,
+        };
         let violations = evaluate_license_policy(&components, &policy);
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].component_name, "lib-a");
@@ -173,27 +244,83 @@ mod tests {
     #[test]
     fn deny_match_is_case_insensitive() {
         let components = vec![component("lib-a", Some("gpl-3.0-only"))];
-        let policy = LicensePolicy { denied_licenses: vec!["GPL-3.0-ONLY".to_string()], flag_unknown: false };
+        let policy = LicensePolicy {
+            denied_licenses: vec!["GPL-3.0-ONLY".to_string()],
+            unknown_license_handling: UnknownLicenseHandling::Ignore,
+        };
         assert_eq!(evaluate_license_policy(&components, &policy).len(), 1);
     }
 
     #[test]
-    fn unknown_license_only_flagged_when_policy_opts_in() {
+    fn unknown_license_ignored_by_default() {
         let components = vec![component("lib-a", None)];
-        let off = LicensePolicy { denied_licenses: vec![], flag_unknown: false };
+        let off = LicensePolicy { denied_licenses: vec![], unknown_license_handling: UnknownLicenseHandling::Ignore };
         assert!(evaluate_license_policy(&components, &off).is_empty());
+    }
 
-        let on = LicensePolicy { denied_licenses: vec![], flag_unknown: true };
-        let violations = evaluate_license_policy(&components, &on);
-        assert_eq!(violations.len(), 1);
-        assert_eq!(violations[0].reason, LicenseViolationReason::Unknown);
-        assert_eq!(violations[0].license_expr, None);
+    #[test]
+    fn unknown_license_flagged_under_warn_or_flag_handling() {
+        let components = vec![component("lib-a", None)];
+        for handling in [UnknownLicenseHandling::Warn, UnknownLicenseHandling::Flag] {
+            let policy = LicensePolicy { denied_licenses: vec![], unknown_license_handling: handling };
+            let violations = evaluate_license_policy(&components, &policy);
+            assert_eq!(violations.len(), 1);
+            assert_eq!(violations[0].reason, LicenseViolationReason::Unknown);
+            assert_eq!(violations[0].license_expr, None);
+        }
     }
 
     #[test]
     fn compliant_component_yields_no_violation() {
         let components = vec![component("lib-a", Some("MIT"))];
-        let policy = LicensePolicy { denied_licenses: vec!["GPL-3.0-only".to_string()], flag_unknown: true };
+        let policy = LicensePolicy {
+            denied_licenses: vec!["GPL-3.0-only".to_string()],
+            unknown_license_handling: UnknownLicenseHandling::Flag,
+        };
         assert!(evaluate_license_policy(&components, &policy).is_empty());
+    }
+
+    fn unknown_violation() -> Vec<LicenseViolation> {
+        vec![LicenseViolation {
+            component_name: "lib-a".to_string(),
+            component_version: None,
+            license_expr: None,
+            reason: LicenseViolationReason::Unknown,
+        }]
+    }
+
+    fn denied_violation() -> Vec<LicenseViolation> {
+        vec![LicenseViolation {
+            component_name: "lib-a".to_string(),
+            component_version: None,
+            license_expr: Some("GPL-3.0-only".to_string()),
+            reason: LicenseViolationReason::Denied { denied: "GPL-3.0-only".to_string() },
+        }]
+    }
+
+    #[test]
+    fn status_is_pass_when_no_violations() {
+        assert_eq!(license_policy_status(&[], "block", UnknownLicenseHandling::Flag), "pass");
+    }
+
+    #[test]
+    fn status_never_fails_for_unknown_under_warn_handling_even_when_blocking() {
+        let violations = unknown_violation();
+        assert_eq!(license_policy_status(&violations, "block", UnknownLicenseHandling::Warn), "warn");
+        assert_eq!(license_policy_status(&violations, "warn", UnknownLicenseHandling::Warn), "warn");
+    }
+
+    #[test]
+    fn status_fails_for_unknown_under_flag_handling_when_blocking() {
+        let violations = unknown_violation();
+        assert_eq!(license_policy_status(&violations, "block", UnknownLicenseHandling::Flag), "fail");
+        assert_eq!(license_policy_status(&violations, "warn", UnknownLicenseHandling::Flag), "warn");
+    }
+
+    #[test]
+    fn status_fails_for_denied_license_when_blocking_regardless_of_unknown_handling() {
+        let violations = denied_violation();
+        assert_eq!(license_policy_status(&violations, "block", UnknownLicenseHandling::Warn), "fail");
+        assert_eq!(license_policy_status(&violations, "block", UnknownLicenseHandling::Ignore), "fail");
     }
 }
