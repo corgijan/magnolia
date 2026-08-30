@@ -81,14 +81,27 @@ services:
     volumes:
       - signing_key:/data
 
-  # frontend:
-  #   build:
-  #     context: ./frontend
-  #     dockerfile: Dockerfile
-  #   depends_on:
-  #     - api
-  #   ports:
-  #     - "4000:80"
+  # ---- Optional web UI (docker compose --profile frontend up) ----
+  # Not started by a plain `docker compose up`, same opt-in pattern as the
+  # dtrack services below — most of this project's own dev/testing has
+  # been running the frontend natively instead (`cd frontend && npm start`,
+  # see README's "Local Development Setup"), and a from-scratch VPS
+  # deployment may not want this container at all (e.g. serving the built
+  # assets from a CDN, or pointing a separately-hosted UI at this API via
+  # the in-app "Server URL" override instead). nginx.conf inside the image
+  # proxies `/api/` and `/health` to `http://api:3000` — the Docker service
+  # name and the container's real internal port, unaffected by API_PORT
+  # above (that only remaps `api`'s host-side binding) — so this needs no
+  # extra configuration to reach it over the compose network.
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    profiles: ["frontend"]
+    depends_on:
+      - api
+    ports:
+      - "${FRONTEND_PORT:-4000}:80"
 
   # ---- Optional Dependency-Track integration (docker compose --profile dtrack up) ----
   # Not started by a plain `docker compose up` — opt-in only. See

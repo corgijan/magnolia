@@ -372,20 +372,29 @@ from the internet.
    `.env` is git-ignored; `docker compose` picks it up automatically from
    the same directory as the compose file.
 
-2. **Start everything except the UI** (Magnolia's own frontend service
-   stays commented out in `docker-compose.yml` — it's not required; any
-   HTTP client, including `scripts/magnolia-upload.sh`, talks to `api`
-   directly):
+2. **Start everything except the UI** (Magnolia's own frontend, like
+   Dependency-Track, is optional and off by default — `profiles:
+   ["frontend"]`; not required at all if any other HTTP client, including
+   `scripts/magnolia-upload.sh` or a separately-hosted UI pointed at this
+   server via its "Server URL" field, talks to `api` directly):
    ```bash
    docker compose -f docker-compose.yml -f docker-compose.dtrack.yml up -d --build
    ```
    This brings up `db`, `api`, and the full Dependency-Track stack
    (`dtrack-db`, `dependency-track`, `dtrack-bootstrap`) in one command —
    drop `-f docker-compose.dtrack.yml` if you don't want Dependency-Track at
-   all. Either way, only `api` publishes a port (3000); `db`, `dtrack-db`,
-   and `dependency-track` are reachable solely from other containers on the
-   compose network, never from the host or the internet — see the comment
-   at the top of `docker-compose.yml`.
+   all. Either way, only `api` publishes a port (`3000`, or `API_PORT` if
+   set in `.env`); `db`, `dtrack-db`, and `dependency-track` are reachable
+   solely from other containers on the compose network, never from the host
+   or the internet — see the comment at the top of `docker-compose.yml`.
+
+   **To also serve the web UI from this same host**, add `--profile
+   frontend` to the command above (nginx, serving the built React app on
+   `FRONTEND_PORT`, default `4000` — proxies `/api/` and `/health` to `api`
+   internally, no extra config needed):
+   ```bash
+   docker compose -f docker-compose.yml -f docker-compose.dtrack.yml --profile frontend up -d --build
+   ```
 
 3. **Put a reverse proxy with TLS in front of port 3000.** `api` itself
    serves plain HTTP — API keys go out as bearer tokens, so this matters.

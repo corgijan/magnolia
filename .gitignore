@@ -23,4 +23,5 @@ target/
 # Local secrets for docker-compose (e.g. DTRACK_API_KEY, written by
 # scripts/bootstrap-dtrack.sh) — never committed.
 .env
+aidex
 

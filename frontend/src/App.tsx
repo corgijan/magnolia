@@ -32,6 +32,8 @@ import {
   ReputationComponentSummary,
   ReputationStatus,
   ReputationSyncResult,
+  getApiBaseUrl,
+  setApiBaseUrl,
   setApiKey,
   Tenant,
   TreeHead,
@@ -6214,15 +6216,29 @@ function useServerHealth(intervalMs = 10000): boolean | null {
 function ConnectionGate({
   apiKey,
   onKeyChange,
+  apiBaseUrl,
+  onBaseUrlChange,
   checking,
   keyError,
 }: {
   apiKey: string;
   onKeyChange: (value: string) => void;
+  apiBaseUrl: string;
+  onBaseUrlChange: (value: string) => void;
   checking: boolean;
   keyError: string;
 }) {
   const health = useServerHealth();
+  const [baseUrlDraft, setBaseUrlDraft] = useState(apiBaseUrl);
+  // `apiBaseUrl` starts as '' and is only filled in once the parent's
+  // mount effect reads localStorage — a render that happens after this
+  // component's own initial `useState(apiBaseUrl)` capture. Without this,
+  // a previously-set URL never shows up in the field (it looks unset even
+  // though every request is still actually using it), which makes it
+  // impossible to tell from the UI that it needs clearing.
+  useEffect(() => {
+    setBaseUrlDraft(apiBaseUrl);
+  }, [apiBaseUrl]);
 
   return (
     <div className="card">
@@ -6237,6 +6253,25 @@ function ConnectionGate({
         {apiKey && checking && <span>checking…</span>}
         {apiKey && !checking && !keyError && <Badge ok>valid</Badge>}
         {apiKey && !checking && keyError && <Badge ok={false}>invalid</Badge>}
+      </div>
+      <label className="field">
+        <span>Server URL</span>
+        <input
+          value={baseUrlDraft}
+          onChange={(e) => setBaseUrlDraft(e.target.value)}
+          onBlur={() => onBaseUrlChange(baseUrlDraft)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') onBaseUrlChange(baseUrlDraft);
+          }}
+          placeholder="(this page's own origin — e.g. https://magnolia.example)"
+          spellCheck={false}
+        />
+      </label>
+      <div className="muted" style={{ marginBottom: 12 }}>
+        Point this UI at a Magnolia server running elsewhere (e.g. a VPS deployment) instead of the
+        origin this page was loaded from. Leave blank to use this page's own origin — the default,
+        and what a build served directly by the API/behind a reverse proxy already wants. Stored only
+        in this browser; every other client of this UI is unaffected.
       </div>
       <label className="field">
         <span>API key  &lt;key_id&gt;:&lt;secret&gt;</span>
@@ -6273,6 +6308,7 @@ function readUrlState(): { tab: Tab | null; tenant: string | null; manifest: str
 export default function App() {
   const [tab, setTab] = useState<Tab>(() => readUrlState().tab ?? 'leaves');
   const [apiKey, setKey] = useState('');
+  const [apiBaseUrl, setBaseUrl] = useState('');
   const [treeHead, setTreeHead] = useState<TreeHead | null>(null);
   const [headError, setHeadError] = useState('');
   // The Explorer's "currently viewed SBOM" — lifted up here (not local
@@ -6344,8 +6380,10 @@ export default function App() {
   useEffect(() => {
     try {
       setKey(window.localStorage.getItem('magnolia_api_key') ?? '');
+      setBaseUrl(window.localStorage.getItem('magnolia_api_base_url') ?? '');
     } catch {
       setKey('');
+      setBaseUrl('');
     }
   }, []);
 
@@ -6384,7 +6422,7 @@ export default function App() {
     return () => {
       mounted = false;
     };
-  }, [apiKey]);
+  }, [apiKey, apiBaseUrl]);
 
   useEffect(() => {
     if (!apiKey) {
@@ -6459,6 +6497,11 @@ export default function App() {
     setApiKey(value);
   };
 
+  const applyBaseUrl = (value: string) => {
+    setApiBaseUrl(value);
+    setBaseUrl(getApiBaseUrl());
+  };
+
   const logOut = () => applyKey('');
 
   const visibleTabs = whoami
@@ -6492,6 +6535,8 @@ export default function App() {
           <ConnectionGate
             apiKey={apiKey}
             onKeyChange={applyKey}
+            apiBaseUrl={apiBaseUrl}
+            onBaseUrlChange={applyBaseUrl}
             checking={checkingKey}
             keyError={keyError}
           />
