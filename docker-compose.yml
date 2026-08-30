@@ -45,15 +45,19 @@ services:
       # content is gone. Not a substitute for the S3Store production still
       # needs.
       STORAGE_PATH: /data/sboms
-      # On startup, ensures this exact <key_id>:<secret> exists as a
+      # On startup, ensures this exact `mag_<secret>` key exists as a
       # super_admin key (creating its tenant if needed) — the only way to
       # get a first usable key into a fresh deployment. Idempotent; never
-      # overwrites an existing key. Defaults to the well-known, publicly
-      # documented dev key so local `docker compose up` needs zero setup —
-      # **override all three of these in `.env` before exposing this to the
-      # internet** (see `.env.example`); anyone who reads this repo knows
-      # the default key.
-      BOOTSTRAP_SUPER_ADMIN_KEY: "${BOOTSTRAP_SUPER_ADMIN_KEY:-deadbeef-dead-dead-dead-deadbeefdead:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef}"
+      # overwrites an existing key.
+      #
+      # Deliberately has **no default**: a built-in fallback would be a
+      # publicly-known super_admin credential for anyone who reads this
+      # repo (which is exactly what the old `deadbeef-...` default was).
+      # Unset means no bootstrap key is created at all — fail closed.
+      # Generate one with:
+      #   cargo run -p magnolia-auth --example bootstrap_key
+      # and put it in `.env` (git-ignored). See `.env.example`.
+      BOOTSTRAP_SUPER_ADMIN_KEY: "${BOOTSTRAP_SUPER_ADMIN_KEY:-}"
       BOOTSTRAP_TENANT_DOMAIN: "${BOOTSTRAP_TENANT_DOMAIN:-test.example}"
       BOOTSTRAP_TENANT_NAME: "${BOOTSTRAP_TENANT_NAME:-PLATFORM}"
       # Relaxes a small number of RBAC checks for local testing (currently:
@@ -97,6 +101,13 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      # Baked into the built JS at image-build time (CRA doesn't read env
+      # vars at container runtime) -- a change here needs
+      # `docker compose build frontend`, not just a restart, to take
+      # effect. Empty by default; the label under the brand only renders
+      # when it's set to something.
+      args:
+        FRONTEND_INSTANCE_NAME: "${FRONTEND_INSTANCE_NAME:-}"
     profiles: ["frontend"]
     depends_on:
       - api

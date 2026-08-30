@@ -30,6 +30,7 @@ chrono = { version = "0.4", features = ["serde"] }
 argon2 = { version = "0.5", features = ["rand"] }
 password-hash = { version = "0.5", features = ["getrandom"] }
 hex = "0.4"
+subtle = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower-http = { version = "0.5", features = ["cors"] }

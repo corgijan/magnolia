@@ -7,7 +7,7 @@
 
 
 # Magnoliafile
-tenant_url=magnolia.corgijan.dev
+tenant_url=https://magnolia.corgijan.dev
 tenant_domain=test
 namespace=/test
 sbom=mal_sbom.json

@@ -310,30 +310,100 @@ async fn run_migrations(pool: &sqlx::PgPool) {
         .expect("failed to run database migrations");
 }
 
-/// Dev/test convenience: if `BOOTSTRAP_SUPER_ADMIN_KEY=<key_id>:<secret>` is
-/// set, ensure that exact key exists as a super_admin key (creating its
-/// tenant from `BOOTSTRAP_TENANT_DOMAIN`/`BOOTSTRAP_TENANT_NAME` if needed),
-/// so a fresh environment (e.g. `docker compose up`) is immediately usable
-/// without a manual SQL bootstrap step. Idempotent — does nothing if the
-/// key_id already exists. Never overwrites an existing key.
+/// If `BOOTSTRAP_SUPER_ADMIN_KEY` is set, ensure that exact key exists as a
+/// super_admin key (creating its tenant from `BOOTSTRAP_TENANT_DOMAIN`/
+/// `BOOTSTRAP_TENANT_NAME` if needed), so a fresh environment is usable
+/// without a manual SQL bootstrap step. This is the only way to get a first
+/// key into a new deployment; every key after that is self-service.
+///
+/// Accepts both token shapes (see `magnolia_auth::ApiKeyToken`): the
+/// current `mag_<secret>`, and the legacy `<key_id>:<secret>`. Idempotent
+/// either way — a `mag_` token is matched by its hash (possible only
+/// because hashes are deterministic now; see `lookup_api_key_by_hash`),
+/// a legacy one by its embedded key_id. Never overwrites an existing key.
 async fn bootstrap_super_admin_from_env(db: &Database) {
     let Ok(full_key) = std::env::var("BOOTSTRAP_SUPER_ADMIN_KEY") else {
         return;
     };
-    let Some((key_id_str, secret)) = full_key.split_once(':') else {
-        tracing::warn!("BOOTSTRAP_SUPER_ADMIN_KEY must be <key_id>:<secret>; ignoring");
+    let full_key = full_key.trim();
+    // Explicitly-empty is "no bootstrap key configured", not an error --
+    // that's what `${BOOTSTRAP_SUPER_ADMIN_KEY:-}` expands to when the
+    // operator hasn't set one, and a fresh deployment should fail closed
+    // (no key) rather than fall back to any built-in default.
+    if full_key.is_empty() {
         return;
-    };
-    let Ok(key_id) = uuid::Uuid::parse_str(key_id_str) else {
-        tracing::warn!(key_id = key_id_str, "BOOTSTRAP_SUPER_ADMIN_KEY key_id is not a valid UUID; ignoring");
+    }
+
+    let Some(token) = magnolia_auth::ApiKeyToken::parse(full_key) else {
+        tracing::warn!(
+            "BOOTSTRAP_SUPER_ADMIN_KEY must be `mag_<secret>` (or a legacy `<key_id>:<secret>`); ignoring"
+        );
         return;
     };
 
-    let key_exists = match db.lookup_api_key(key_id).await {
-        Ok(existing) => existing.is_some(),
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to check for existing bootstrap key; skipping bootstrap");
-            return;
+    // The only path where a *human* supplies an API-key secret -- every
+    // other key comes from `GeneratedKey::new`'s CSPRNG. Key hashes are
+    // unsalted SHA-256 (see `ApiKey::hash`'s doc comment for why that is
+    // safe for high-entropy secrets), so a short or guessable value here
+    // *would* be brute-forceable from a database dump, unlike a generated
+    // one. Warn rather than reject, so an upgrade can't brick an existing
+    // deployment over a key that was already working.
+    const MIN_BOOTSTRAP_SECRET_LEN: usize = 32;
+    let entropy_bearing = match &token {
+        magnolia_auth::ApiKeyToken::Prefixed { .. } => {
+            full_key.len() - magnolia_auth::KEY_PREFIX.len()
+        }
+        magnolia_auth::ApiKeyToken::Legacy { secret, .. } => secret.len(),
+    };
+    if entropy_bearing < MIN_BOOTSTRAP_SECRET_LEN {
+        tracing::warn!(
+            length = entropy_bearing,
+            minimum = MIN_BOOTSTRAP_SECRET_LEN,
+            "BOOTSTRAP_SUPER_ADMIN_KEY's secret is short enough to be brute-forceable from a \
+             database dump — generate one with `cargo run -p magnolia-auth --example bootstrap_key`"
+        );
+    }
+
+    // Resolve the row this token would occupy: whether it already exists,
+    // the id to insert under if it doesn't, and the hash to store.
+    let (key_id, key_hash, key_exists) = match &token {
+        magnolia_auth::ApiKeyToken::Prefixed { key_hash } => {
+            match db.lookup_api_key_by_hash(key_hash).await {
+                // A `mag_` token carries no id, so on first insert we mint
+                // one; on later startups the existing row is found by hash
+                // and this generated id is simply unused.
+                Ok(existing) => (
+                    existing.as_ref().map(|r| r.id).unwrap_or_else(uuid::Uuid::new_v4),
+                    key_hash.clone(),
+                    existing.is_some(),
+                ),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to check for existing bootstrap key; skipping bootstrap");
+                    return;
+                }
+            }
+        }
+        magnolia_auth::ApiKeyToken::Legacy { key_id, secret } => {
+            let exists = match db.lookup_api_key(*key_id).await {
+                Ok(existing) => existing.is_some(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to check for existing bootstrap key; skipping bootstrap");
+                    return;
+                }
+            };
+            let hashed = match (magnolia_auth::ApiKey {
+                key: secret.clone(),
+                created_at: chrono::Utc::now(),
+            })
+            .hash()
+            {
+                Ok(h) => h.hash,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to hash bootstrap key; skipping bootstrap");
+                    return;
+                }
+            };
+            (*key_id, hashed, exists)
         }
     };
 
@@ -374,21 +444,8 @@ async fn bootstrap_super_admin_from_env(db: &Database) {
         return;
     }
 
-    let hashed = match (magnolia_auth::ApiKey {
-        key: secret.to_string(),
-        created_at: chrono::Utc::now(),
-    })
-    .hash()
-    {
-        Ok(h) => h,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to hash bootstrap key; skipping bootstrap");
-            return;
-        }
-    };
-
     if let Err(e) = db
-        .insert_api_key(key_id, tenant_id, &domain, "/", "super_admin", &hashed.hash, None)
+        .insert_api_key(key_id, tenant_id, &domain, "/", "super_admin", &key_hash, None)
         .await
     {
         tracing::warn!(error = %e, "failed to insert bootstrap super_admin key");
@@ -398,7 +455,8 @@ async fn bootstrap_super_admin_from_env(db: &Database) {
     tracing::warn!(
         %key_id,
         domain,
-        "bootstrapped super_admin key from BOOTSTRAP_SUPER_ADMIN_KEY env var — dev/test only, never set this in production"
+        "bootstrapped super_admin key from BOOTSTRAP_SUPER_ADMIN_KEY — treat this value as a \
+         production credential: it grants full platform super_admin access"
     );
 }
 

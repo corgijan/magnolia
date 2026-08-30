@@ -64,23 +64,41 @@ impl FromRequestParts<AppState> for AuthGrant {
         let token = header
             .strip_prefix("Bearer ")
             .ok_or(ApiError::Unauthorized)?;
-        let (key_id_str, secret) = token
-            .split_once(':')
-            .ok_or_else(|| ApiError::BadRequest("API key must be <key_id>:<secret>".to_string()))?;
 
-        let key_id = Uuid::from_str(key_id_str).map_err(|_| ApiError::Unauthorized)?;
-        let row = state
-            .db
-            .lookup_api_key(key_id)
-            .await
-            .map_err(|e| ApiError::InternalError(e.to_string()))?
-            .ok_or(ApiError::Unauthorized)?;
-
-        let valid = ApiKeyVerifier::verify(secret, &row.key_hash)
-            .map_err(|e| ApiError::InternalError(e.to_string()))?;
-        if !valid {
-            return Err(ApiError::Unauthorized);
-        }
+        // Two accepted shapes (see `ApiKeyToken`): current `mag_<secret>`,
+        // which is located by hashing the whole token, and the legacy
+        // `<key_id>:<secret>` form, which is located by id and then
+        // verified. A token matching neither is `Unauthorized` rather than
+        // a descriptive 400 — an unauthenticated caller learns nothing
+        // about which part they got wrong.
+        let row = match magnolia_auth::ApiKeyToken::parse(token).ok_or(ApiError::Unauthorized)? {
+            magnolia_auth::ApiKeyToken::Prefixed { key_hash } => {
+                // Finding the row *is* the verification here: the lookup
+                // matches on the hash of exactly what was presented, so a
+                // hit means the token hashes to a stored value. There is
+                // no separate compare step and no secret in the query.
+                state
+                    .db
+                    .lookup_api_key_by_hash(&key_hash)
+                    .await
+                    .map_err(|e| ApiError::InternalError(e.to_string()))?
+                    .ok_or(ApiError::Unauthorized)?
+            }
+            magnolia_auth::ApiKeyToken::Legacy { key_id, secret } => {
+                let row = state
+                    .db
+                    .lookup_api_key(key_id)
+                    .await
+                    .map_err(|e| ApiError::InternalError(e.to_string()))?
+                    .ok_or(ApiError::Unauthorized)?;
+                let valid = ApiKeyVerifier::verify(&secret, &row.key_hash)
+                    .map_err(|e| ApiError::InternalError(e.to_string()))?;
+                if !valid {
+                    return Err(ApiError::Unauthorized);
+                }
+                row
+            }
+        };
 
         let role = Role::from_str(&row.role)
             .map_err(|_| ApiError::InternalError(format!("unknown role in database: {}", row.role)))?;

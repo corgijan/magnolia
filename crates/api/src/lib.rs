@@ -35,6 +35,7 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(handlers::health))
         .route("/install.sh", get(handlers::install_script))
+        .route("/install.py", get(handlers::install_script_py))
         .route("/api/v1/whoami", get(handlers::whoami))
         .route("/api/v1/config", get(handlers::config))
         .route("/api/v1/signing-key", get(handlers::signing_key))

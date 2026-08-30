@@ -171,8 +171,11 @@ export interface ComponentReputation {
   fetch_error: string | null;
 }
 
-// One package's cached score, deployment-wide — not scoped to any one
-// manifest. Backs the "all scored packages" aggregation modal.
+// One package's cached score. Backs the "all scored packages" aggregation
+// modal, which is scoped to the packages appearing in *this tenant's* SBOMs
+// (the underlying component_reputation table is shared across tenants, but
+// listing it raw would enumerate other tenants' dependencies — see
+// list_reputation_for_tenant). super_admin only.
 export interface ReputationComponentSummary {
   ecosystem: string;
   name: string;
@@ -810,7 +813,8 @@ export const api = {
 
   reputationStatus: (): Promise<ReputationStatus> => request('/api/v1/reputation/status'),
 
-  reputationComponents: (): Promise<ReputationComponentSummary[]> => request('/api/v1/reputation/components'),
+  reputationComponents: (tenantId?: string): Promise<ReputationComponentSummary[]> =>
+    request(`/api/v1/reputation/components${tenantQs(tenantId)}`),
 
   // Deployment-global, unlike forceDtrackSync — no tenant to scope this to.
   forceFreshnessSync: (): Promise<FreshnessSyncResult> =>

@@ -51,7 +51,7 @@ Previously a namespace-scoped key (e.g. `namespace_scope: "/product/v1"`) could 
 `Manifest.version` existed in the core struct but was hardcoded to `"1.0"` and never persisted. Now it's a required multipart field on upload (`BadRequest` if missing/empty), persisted in a new `manifests.version` column, included in the manifest's signed payload, and returned by both the upload response and manifest lookup.
 
 ### Server startup / dev bootstrap
-- `BOOTSTRAP_SUPER_ADMIN_KEY=<key_id>:<secret>` env var (optional): on startup, ensures that exact key exists as a super_admin key, creating its tenant from `BOOTSTRAP_TENANT_DOMAIN`/`BOOTSTRAP_TENANT_NAME` if needed. Idempotent (checks `key_id` first, never overwrites). `docker-compose.yml` sets this to a well-known `deadbeef-...` example so `docker compose up` is immediately usable — verified across two consecutive restarts (creates once, skips on the second).
+- `BOOTSTRAP_SUPER_ADMIN_KEY=mag_<secret>` env var: on startup, ensures that exact key exists as a super_admin key, creating its tenant from `BOOTSTRAP_TENANT_DOMAIN`/`BOOTSTRAP_TENANT_NAME` if needed. Idempotent — a `mag_` token is matched by its hash, a legacy `<key_id>:<secret>` one by its embedded key_id; never overwrites. No default: unset creates no key at all (fail closed), since a built-in fallback would be a publicly-known super_admin credential. Generate with `cargo run -p magnolia-auth --example bootstrap_key`.
 
 ### API (`magnolia-api`, binary `magnolia-server`)
 | Endpoint | Notes |

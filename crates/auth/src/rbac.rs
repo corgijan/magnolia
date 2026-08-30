@@ -80,6 +80,19 @@ pub enum Action {
     /// Platform-level: create/list tenants. Not scoped to the grant's own
     /// domain, since a tenant doesn't yet exist to scope it to.
     ManageTenants,
+    /// Privileged operations on a tenant's *own* data that go beyond
+    /// ordinary settings management — currently bulk deletion of derived
+    /// cached data, and tenant-wide aggregate views of the dependency
+    /// surface. Still domain- and namespace-scoped (unlike `ManageTenants`),
+    /// so it never reaches another tenant.
+    ///
+    /// Deliberately withheld from `DomainAdmin`, which otherwise has full
+    /// self-service over its tenant: these either destroy many records at
+    /// once (and can cascade into human-authored triage comments) or expose
+    /// the whole tenant's dependency surface in a single view. It needs no
+    /// arm in the matrix below — `(SuperAdmin, _)` already allows it, and
+    /// every other role falls through to the catch-all denial.
+    ManageTenantData,
 }
 
 impl RbacEngine {
@@ -225,6 +238,7 @@ mod tests {
         assert_allows(&domain_admin, Action::ManageAcls);
         assert_allows(&domain_admin, Action::ManageSettings);
         assert_denies(&domain_admin, Action::ManageTenants);
+        assert_denies(&domain_admin, Action::ManageTenantData);
 
         assert_allows(&uploader, Action::Upload);
         assert_denies(&uploader, Action::Read);
@@ -241,6 +255,7 @@ mod tests {
         assert_denies(&auditor, Action::ManageKeys);
         assert_denies(&auditor, Action::ManageAcls);
         assert_denies(&auditor, Action::ManageSettings);
+        assert_denies(&auditor, Action::ManageTenantData);
     }
 
     #[test]
@@ -296,6 +311,30 @@ mod tests {
         // Prefix-escape: "/p10" is NOT under "/p1".
         assert!(
             RbacEngine::require_role(&g, "acme.example", "/p10", Action::Upload).is_err()
+        );
+    }
+
+    #[test]
+    fn only_super_admin_can_manage_tenant_data() {
+        // ManageTenantData has no arm in the matrix -- it relies on
+        // `(SuperAdmin, _)` allowing it and every other role falling to the
+        // catch-all denial. This test pins that behaviour so adding a new
+        // role, or a new arm, can't silently widen it.
+        assert_allows(&grant(Role::SuperAdmin), Action::ManageTenantData);
+        for role in [Role::DomainAdmin, Role::Uploader, Role::Auditor] {
+            assert_denies(&grant(role), Action::ManageTenantData);
+        }
+    }
+
+    #[test]
+    fn manage_tenant_data_is_still_domain_scoped() {
+        // Unlike ManageTenants, it must NOT bypass the domain check -- a
+        // super_admin of one tenant may not reach another tenant's data
+        // through it.
+        let g = grant(Role::SuperAdmin);
+        assert!(
+            RbacEngine::require_role(&g, "other.example", "/", Action::ManageTenantData).is_err(),
+            "ManageTenantData must stay domain-scoped"
         );
     }
 

@@ -75,8 +75,8 @@ pub trait ObjectStore: Send + Sync {
 
 **Components:**
 - **ApiKey**: Generated once, displayed once, never stored in plaintext
-- **ApiKeyHash**: Argon2-hashed key stored in DB
-- **ApiKeyVerifier**: Timing-safe Argon2 comparison
+- **ApiKeyHash**: SHA-256 hash of the key, stored in DB with a `sha256:` scheme prefix
+- **ApiKeyVerifier**: Constant-time comparison; dispatches on the stored prefix, so pre-migration `$argon2` rows still verify
 - **Grant**: `(api_key_hash → domain, namespace_scope, role, expires_at, revoked_flag)`
 - **RbacEngine**: Central RBAC matrix enforcement
 
@@ -142,7 +142,7 @@ tenant_id UUID,
 domain VARCHAR(255),
 namespace_scope VARCHAR(255),
 role VARCHAR(50),
-key_hash VARCHAR(255),               -- Argon2 hash
+key_hash VARCHAR(255),               -- 'sha256:<hex>' (legacy rows: Argon2 PHC)
 expires_at TIMESTAMPTZ,
 revoked BOOLEAN,
 created_at TIMESTAMPTZ

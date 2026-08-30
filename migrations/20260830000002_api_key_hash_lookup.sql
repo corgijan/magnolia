@@ -1,0 +1,12 @@
+-- `mag_`-prefixed API keys don't carry a row id, so authentication looks the
+-- row up by its (deterministic, unsalted SHA-256) key_hash instead -- see
+-- Database::lookup_api_key_by_hash. Without an index that's a sequential
+-- scan of api_keys on *every* authenticated request.
+--
+-- UNIQUE, not just an index: two rows sharing a hash would mean two keys
+-- with the same secret, which `fetch_optional` would surface as an
+-- ambiguous-row error at authentication time rather than anything
+-- actionable. A 256-bit CSPRNG token colliding is not a realistic worry --
+-- this is here to make the invariant explicit and enforced by the database
+-- rather than assumed by the application.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys (key_hash);

@@ -267,6 +267,18 @@ function Spinner({ label }: { label: string }) {
   return <div className="spinner">{label}</div>;
 }
 
+// A signal row's "nothing here yet, but a background job is actively
+// working on it" state — distinct from a plain empty/muted state, which
+// reads as "checked, nothing found" rather than "not checked yet."
+function ScanningBadge({ label = 'Scanning…' }: { label?: string }) {
+  return (
+    <span className="badge-scanning">
+      <span className="scanning-dot" />
+      {label}
+    </span>
+  );
+}
+
 function Modal({
   title,
   onClose,
@@ -1935,8 +1947,14 @@ function SbomDetailPanel({
   // matches) a whole bullet list — unreadable once more than one signal was
   // present. They now share one Signal/Status/Details table of their own.
   const showMaliciousSignal = !!manifest && !manifest.document_type && !maliciousCheckDisabledForTenant;
-  const showReputationSignal =
-    !!manifest && !manifest.document_type && !reputationDisabledForTenant && manifest.component_reputation.length > 0;
+  // No longer gated on `.length > 0` — upload_sbom nudges an immediate
+  // reputation/freshness sync pass right after a real SBOM is indexed (see
+  // handlers.rs), so an empty array here is almost always "still running,"
+  // not "nothing to show." Hiding the row entirely made a freshly uploaded
+  // manifest look like the check hadn't happened at all; showing a
+  // Scanning… state instead (see the row's own rendering below) is honest
+  // about what's actually going on.
+  const showReputationSignal = !!manifest && !manifest.document_type && !reputationDisabledForTenant;
   const showVulnSignal = !!manifest && !manifest.document_type && dtrackEnabled && !dtrackSyncDisabled;
   // Always shown for a real SBOM, regardless of enforce_level — this is a
   // live preview (like `/verify`'s), not a record of what was actually
@@ -1944,8 +1962,7 @@ function SbomDetailPanel({
   // "warn" on unknown-license handling should see the result immediately,
   // without also having to flip Enforcement on first.
   const showLicenseSignal = !!manifest && !manifest.document_type;
-  const showFreshnessSignal =
-    !!manifest && !manifest.document_type && !freshnessDisabledForTenant && manifest.component_freshness.length > 0;
+  const showFreshnessSignal = !!manifest && !manifest.document_type && !freshnessDisabledForTenant;
   const hasSecuritySignals =
     showMaliciousSignal || showReputationSignal || showVulnSignal || showLicenseSignal || showFreshnessSignal;
 
@@ -2036,32 +2053,41 @@ function SbomDetailPanel({
                         <SignalLabel label="Package reputation" tooltip="OpenSSF Scorecard, via deps.dev" />
                       </td>
                       <td>
-                        <span className="badge-stack">
-                          {reputationSummary.red > 0 && (
-                            <span className="badge badge-err">{reputationSummary.red} red</span>
-                          )}
-                          {reputationSummary.yellow > 0 && (
-                            <span className="badge badge-warn">{reputationSummary.yellow} yellow</span>
-                          )}
-                          {reputationSummary.green > 0 && (
-                            <span className="badge badge-ok">{reputationSummary.green} green</span>
-                          )}
-                          {reputationSummary.red === 0
-                            && reputationSummary.yellow === 0
-                            && reputationSummary.green === 0 && (
-                            <span className="muted">no scores yet</span>
-                          )}
-                        </span>
+                        {reputationSummary.total === 0 ? (
+                          <ScanningBadge />
+                        ) : (
+                          <span className="badge-stack">
+                            {reputationSummary.red > 0 && (
+                              <span className="badge badge-err">{reputationSummary.red} red</span>
+                            )}
+                            {reputationSummary.yellow > 0 && (
+                              <span className="badge badge-warn">{reputationSummary.yellow} yellow</span>
+                            )}
+                            {reputationSummary.green > 0 && (
+                              <span className="badge badge-ok">{reputationSummary.green} green</span>
+                            )}
+                            {reputationSummary.red === 0 &&
+                              reputationSummary.yellow === 0 &&
+                              reputationSummary.green === 0 && <ScanningBadge />}
+                          </span>
+                        )}
                       </td>
                       <td className="signal-detail">
-                        <span className="muted">
-                          {reputationSummary.checked} of {reputationSummary.total} checked
-                          {reputationSummary.pending > 0 ? ` · ${reputationSummary.pending} pending` : ''}
-                          {reputationSummary.failed > 0 ? ` · ${reputationSummary.failed} failed` : ''}
-                          {reputationSummary.noScore > 0
-                            ? ` · ${reputationSummary.noScore} without a scorecard`
-                            : ''}
-                        </span>
+                        {reputationSummary.total === 0 ? (
+                          <span className="muted">
+                            Scoring components against OpenSSF Scorecard — usually ready within moments of
+                            upload.
+                          </span>
+                        ) : (
+                          <span className="muted">
+                            {reputationSummary.checked} of {reputationSummary.total} checked
+                            {reputationSummary.pending > 0 ? ` · ${reputationSummary.pending} pending` : ''}
+                            {reputationSummary.failed > 0 ? ` · ${reputationSummary.failed} failed` : ''}
+                            {reputationSummary.noScore > 0
+                              ? ` · ${reputationSummary.noScore} without a scorecard`
+                              : ''}
+                          </span>
+                        )}
                       </td>
                     </tr>
                   )}
@@ -2081,7 +2107,7 @@ function SbomDetailPanel({
                         ) : manifest.dtrack_push_error ? (
                           <Badge ok={false}>sync error</Badge>
                         ) : (
-                          <Badge ok={false}>not synced</Badge>
+                          <ScanningBadge />
                         )}
                       </td>
                       <td className="signal-detail">
@@ -2101,9 +2127,9 @@ function SbomDetailPanel({
                           <span className="muted">{manifest.dtrack_push_error}</span>
                         ) : (
                           <span className="muted">
-                            This SBOM hasn't finished vulnerability scanning yet. Dependency-Track checks for new
-                            uploads every {formatSyncWaitTime(dtrackSyncIntervalSecs)} — if this was uploaded
-                            recently, please wait and check back.
+                            Scanning with Dependency-Track — usually ready within moments of upload; falls
+                            back to a periodic check every {formatSyncWaitTime(dtrackSyncIntervalSecs)} if that
+                            doesn't complete right away.
                           </span>
                         )}
                       </td>
@@ -2159,32 +2185,43 @@ function SbomDetailPanel({
                         />
                       </td>
                       <td>
-                        <span className="badge-stack">
-                          {freshnessSummary.majorBehind > 0 && (
-                            <span className="badge badge-err">{freshnessSummary.majorBehind} major behind</span>
-                          )}
-                          {freshnessSummary.behind > 0 && (
-                            <span className="badge badge-warn">{freshnessSummary.behind} behind</span>
-                          )}
-                          {freshnessSummary.majorBehind === 0 && freshnessSummary.behind === 0 && (
-                            <span className="badge badge-ok">up to date</span>
-                          )}
-                        </span>
+                        {freshnessSummary.total === 0 ? (
+                          <ScanningBadge />
+                        ) : (
+                          <span className="badge-stack">
+                            {freshnessSummary.majorBehind > 0 && (
+                              <span className="badge badge-err">{freshnessSummary.majorBehind} major behind</span>
+                            )}
+                            {freshnessSummary.behind > 0 && (
+                              <span className="badge badge-warn">{freshnessSummary.behind} behind</span>
+                            )}
+                            {freshnessSummary.majorBehind === 0 && freshnessSummary.behind === 0 && (
+                              <span className="badge badge-ok">up to date</span>
+                            )}
+                          </span>
+                        )}
                       </td>
                       <td className="signal-detail">
-                        <span className="cell-actions">
+                        {freshnessSummary.total === 0 ? (
                           <span className="muted">
-                            {freshnessSummary.current} current · {freshnessSummary.behind} behind ·{' '}
-                            {freshnessSummary.majorBehind} major behind
-                            {freshnessSummary.unknown > 0 ? ` · ${freshnessSummary.unknown} unknown` : ''}
-                            {freshnessSummary.pending > 0 ? ` · ${freshnessSummary.pending} pending` : ''}
+                            Comparing component versions against deps.dev's latest — usually ready within
+                            moments of upload.
                           </span>
-                          {(freshnessSummary.behind > 0 || freshnessSummary.majorBehind > 0) && (
-                            <button className="btn" onClick={() => setShowComponentFreshnessModal(true)}>
-                              View outdated components…
-                            </button>
-                          )}
-                        </span>
+                        ) : (
+                          <span className="cell-actions">
+                            <span className="muted">
+                              {freshnessSummary.current} current · {freshnessSummary.behind} behind ·{' '}
+                              {freshnessSummary.majorBehind} major behind
+                              {freshnessSummary.unknown > 0 ? ` · ${freshnessSummary.unknown} unknown` : ''}
+                              {freshnessSummary.pending > 0 ? ` · ${freshnessSummary.pending} pending` : ''}
+                            </span>
+                            {(freshnessSummary.behind > 0 || freshnessSummary.majorBehind > 0) && (
+                              <button className="btn" onClick={() => setShowComponentFreshnessModal(true)}>
+                                View outdated components…
+                              </button>
+                            )}
+                          </span>
+                        )}
                       </td>
                     </tr>
                   )}
@@ -4923,7 +4960,13 @@ function Settings({
   treeHead,
   onRefreshTreeHead,
   headError,
+  isSuperAdmin,
 }: {
+  /** Gates the two super_admin-only controls below ("Delete tenant caches",
+   * "View all scored packages"). The backend enforces this independently via
+   * `Action::ManageTenantData` — hiding them here only avoids offering a
+   * button that would 403. */
+  isSuperAdmin: boolean;
   /** The nav bar's Findings-tab visibility is computed from a separate copy
    * of this same flag held by the top-level App component (fetched once,
    * not re-derived from this component's own state) — without this
@@ -5192,7 +5235,7 @@ function Settings({
   const openReputationModal = () => {
     setShowReputationModal(true);
     if (reputationComponents !== null) return; // already loaded
-    api.reputationComponents()
+    api.reputationComponents(tenantId)
       .then(setReputationComponents)
       .catch((e) => setReputationComponentsError(e instanceof Error ? e.message : String(e)));
   };
@@ -5844,7 +5887,9 @@ function Settings({
               <button className="btn" disabled={reputationSyncBusy} onClick={forceReputationSync}>
                 {reputationSyncBusy ? 'Syncing…' : 'Force reputation sync'}
               </button>
-              <button className="btn" onClick={openReputationModal}>View all scored packages…</button>
+              {isSuperAdmin && (
+                <button className="btn" onClick={openReputationModal}>View all scored packages…</button>
+              )}
               <span className="muted">
                 Runs one batch of the OpenSSF Scorecard lookup job now instead of waiting for its next
                 scheduled tick — deployment-wide, not scoped to this tenant.
@@ -6274,12 +6319,12 @@ function ConnectionGate({
         in this browser; every other client of this UI is unaffected.
       </div>
       <label className="field">
-        <span>API key  &lt;key_id&gt;:&lt;secret&gt;</span>
+        <span>API key</span>
         <input
           type="password"
           value={apiKey}
           onChange={(e) => onKeyChange(e.target.value)}
-          placeholder="API key  <key_id>:<secret>"
+          placeholder="mag_…"
           spellCheck={false}
         />
       </label>
@@ -6290,6 +6335,17 @@ function ConnectionGate({
 }
 
 // ---------- App ----------
+
+// Small label under the brand ("Development", "Staging", ...) so it's
+// obvious at a glance which deployment you're looking at — baked in at
+// build time (CRA only ever substitutes REACT_APP_* vars into the bundle
+// during `npm start`/`npm run build`, never read at container runtime), so
+// changing it for an already-built image means rebuilding, not just
+// restarting. Set via FRONTEND_INSTANCE_NAME in docker-compose.yml/.env
+// (wired through as a Docker build arg for the containerized frontend) or
+// REACT_APP_FRONTEND_INSTANCE_NAME directly for `npm start`. Empty by
+// default — nothing renders unless it's explicitly set.
+const INSTANCE_NAME = process.env.REACT_APP_FRONTEND_INSTANCE_NAME ?? '';
 
 // Reads ?tab=&tenant= from the current URL so the active tab/tenant survive
 // a refresh or a shared link. Only trusted at startup — `tenant` is only
@@ -6529,6 +6585,7 @@ export default function App() {
         <header className="app-header">
           <div className="brand">
             <span className="brand-mark">◆</span> Magnolia
+            {INSTANCE_NAME && <div className="brand-instance">{INSTANCE_NAME}</div>}
           </div>
         </header>
         <main className="content">
@@ -6551,6 +6608,7 @@ export default function App() {
         <aside className="sidebar">
           <div className="sidebar-brand">
             <span className="brand-mark">◆</span> Magnolia
+            {INSTANCE_NAME && <div className="brand-instance">{INSTANCE_NAME}</div>}
           </div>
 
           <nav className="sidebar-nav">
@@ -6660,6 +6718,7 @@ export default function App() {
                 treeHead={treeHead}
                 onRefreshTreeHead={refreshHead}
                 headError={headError}
+                isSuperAdmin={whoami.role === 'super_admin'}
               />
             )}
           </main>

@@ -1,6 +1,6 @@
-# Magnolia — Compliance SBOM Archive
+# Magnolia — Supply-Chain Observability & Transparency
 
-A pragmatic, cryptographically-sound SBOM archive for EU Cyber Resilience Act (CRA) compliance. Version-accurate, immutable, append-only.
+A pragmatic, cryptographically-sound service for software supply-chain observability and transparency, built on a version-accurate, immutable, append-only SBOM archive. EU Cyber Resilience Act (CRA) compliance is one concrete application of it, not the whole purpose.
 
 ## Quick Start
 
@@ -35,7 +35,7 @@ See **[ARCHITECTURE.md](./ARCHITECTURE.md)** for deep dive.
 
 2. **Multi-Tenancy & RBAC** (`crates/auth/`)
    - Domain-scoped namespaces, one tenant per domain, full data isolation between tenants
-   - API key authentication (Argon2-hashed)
+   - API key authentication (SHA-256 hashed at rest)
    - RBAC matrix:
      - `super_admin` — everything in its own tenant, plus can create other tenants (`ManageTenants` is platform-level, not domain-scoped)
      - `domain_admin` — full self-service over its own tenant: upload, read/download, manage its own keys/ACLs. Minted automatically as a new tenant's first key. Cannot create other tenants.
@@ -71,7 +71,7 @@ The server binary is `crates/api/src/main.rs` (`cargo run --bin magnolia-server`
 
 **Working (tested):**
 - ✅ Merkle Mountain Range with correct inclusion + consistency proofs (17 unit tests)
-- ✅ API key auth (`<key_id>:<secret>`, Argon2-hashed secrets, timing-safe verify)
+- ✅ API key auth (`mag_<secret>`, SHA-256-hashed secrets, constant-time verify; legacy `<key_id>:<secret>` keys still accepted)
 - ✅ RBAC matrix enforcement incl. namespace prefix-scope boundary check (14 unit tests)
 - ✅ **Tenants are a real entity** (`tenants` table, one row per domain) — `POST /api/v1/tenants` (super_admin only) creates a tenant *and* mints its first `domain_admin` key in one call
 - ✅ **Full per-tenant data isolation**: each tenant has its own Merkle tree / signed-tree-head chain; leaves, tree-head, proofs, manifests, keys, and audit log are all scoped to the caller's tenant — nothing is shared or visible across tenants
@@ -91,7 +91,7 @@ The server binary is `crates/api/src/main.rs` (`cargo run --bin magnolia-server`
 
 ## API (v1)
 
-All endpoints take `Authorization: Bearer <key_id>:<secret>`.
+All endpoints take `Authorization: Bearer mag_<secret>`. (Keys minted before the format change, of the form `<key_id>:<secret>`, are still accepted — no need to re-issue.)
 API keys are created via `POST /api/v1/keys` (the full key is shown once, for
 *your own* tenant — you cannot mint a key for anyone else's).
 
@@ -105,10 +105,10 @@ sbom_file=<binary>  format=cyclonedx|spdx  namespace=/product/v1  version=1.2.3
 ```
 `version` is required — a free-text label for the SBOM/product release it describes (e.g. `1.2.3`), stored on the manifest. `namespace` must fall within the key's own `namespace_scope` (segment-aware prefix match; `/` covers everything).
 
-**Basic example** (`sbom.json` is a CycloneDX or SPDX file on disk; `<key_id>:<secret>` must be a key belonging to a real tenant — the platform/bootstrap tenant is admin-only and rejects uploads):
+**Basic example** (`sbom.json` is a CycloneDX or SPDX file on disk; the key must belong to a real tenant — the platform/bootstrap tenant is admin-only and rejects uploads):
 ```bash
 curl -X POST http://127.0.0.1:3000/api/v1/upload \
-  -H "Authorization: Bearer <key_id>:<secret>" \
+  -H "Authorization: Bearer mag_<secret>" \
   -F "sbom_file=@sbom.json" \
   -F "format=cyclonedx" \
   -F "namespace=/product/v1" \
@@ -172,6 +172,38 @@ Inclusion proof response (hashes are hex strings):
 Verification: hash the leaf up `sibling_path` (must match `peaks[peak_index]`),
 then fold `peaks` left to right to obtain the tree root.
 
+### CLI / CI integration
+
+`POST /api/v1/upload` and `POST /api/v1/verify` (the dry-run CI policy gate —
+see its own doc comment on `verify_sbom` in handlers.rs) are both wrapped by
+a small CLI, served straight from your own Magnolia instance so there's
+nothing extra to install or keep in sync — **Python is the default,
+recommended way to run it** (stdlib only, nothing to `pip install`; the
+original bash version is still served too, for bash-only environments):
+
+```bash
+curl -fsSL <tenant_url>/install.py | python3 - --version=2.0.0
+curl -fsSL <tenant_url>/install.py | python3 - verify --sbom=out.cdx.json
+```
+
+Or save it once and run it locally against a checked-out `Magnoliafile`:
+
+```bash
+curl -fsSL <tenant_url>/install.py -o magnolia-upload.py && chmod +x magnolia-upload.py
+MAGNOLIA_API_KEY='mag_<secret>' ./magnolia-upload.py verify
+```
+
+Same flags, same `Magnoliafile` format, same exit codes as the bash version
+below — pick whichever your environment already has:
+
+```bash
+curl -fsSL <tenant_url>/install.sh | bash -s -- verify --sbom=out.cdx.json
+```
+
+Full flag reference: `./magnolia-upload.py --help` (or `./magnolia-upload.sh
+--help`) — both scripts' `--help` is generated from their own source, so
+it's always in sync with what they actually do.
+
 ## Design Philosophy: Pragmatic MVP
 
 **Chosen: Direct WORM (Path B)**
@@ -190,7 +222,7 @@ then fold `peaks` left to right to obtain the tree root.
 
 1. **S3 Object Lock (WORM)** — Once locked, files immutable
 2. **Merkle-tree tamper-evidence** — Changing any SBOM changes root, signature breaks
-3. **API key + Argon2** — Keys hashed at rest, timing-safe comparison
+3. **API key + SHA-256** — Keys hashed at rest, constant-time comparison. Secrets are server-generated with 244 bits of CSPRNG entropy, which is what makes an unsalted fast hash appropriate here (a password KDF defends low-entropy inputs; these cannot be brute-forced at any hash speed). See `ApiKey::hash`
 4. **Audit logs (append-only)** — Every action logged immutably
 5. **Domain boundaries** — Tenants cannot cross-read data
 6. **RBAC matrix** — Principle of least privilege
@@ -207,11 +239,12 @@ DATABASE_URL=postgres://user:pass@localhost:5432/sbomstash
 RUST_LOG=info
 SERVER_ADDR=127.0.0.1:3000
 
-# Optional, dev/test only: ensures this exact <key_id>:<secret> exists as a
-# super_admin key on startup (creating its tenant if needed). Idempotent —
-# safe to leave set across restarts, never overwrites an existing key.
-# Unset (or change to your own value) for anything beyond local testing.
-BOOTSTRAP_SUPER_ADMIN_KEY=deadbeef-dead-dead-dead-deadbeefdead:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+# Ensures this exact key exists as a super_admin key on startup (creating
+# its tenant if needed). Idempotent — safe to leave set across restarts,
+# never overwrites an existing key. This is the only way to get a first key
+# into a fresh deployment. Generate one with:
+#   cargo run -p magnolia-auth --example bootstrap_key
+BOOTSTRAP_SUPER_ADMIN_KEY=mag_<43 base64url chars>
 BOOTSTRAP_TENANT_DOMAIN=test.example
 BOOTSTRAP_TENANT_NAME=Test Tenant
 
@@ -224,11 +257,15 @@ DEV_MODE=true
 
 ### Local Development Setup
 
-**Quickest path:** `docker compose up --build` starts Postgres and the API server on `127.0.0.1:3000`. The server migrates its own schema on every startup (nobody ever needs to run a `.sql` file by hand — see "Migrations" below) and, out of the box, also **bootstraps a ready-to-use super_admin key** via the `BOOTSTRAP_SUPER_ADMIN_KEY` env var in `docker-compose.yml`:
+**Quickest path:** generate a bootstrap key, put it in `.env`, then `docker compose up --build`:
+```bash
+cargo run -p magnolia-auth --example bootstrap_key   # prints a mag_... key
+echo 'BOOTSTRAP_SUPER_ADMIN_KEY=mag_...' >> .env     # .env is git-ignored
+docker compose up --build
 ```
-deadbeef-dead-dead-dead-deadbeefdead:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
-```
-That's a tenant on `test.example` (from `BOOTSTRAP_TENANT_DOMAIN`), created idempotently on every startup — safe to leave in place across restarts. Paste that key straight into the UI header and skip the manual-bootstrap step entirely. **Change it before anything beyond local testing** — it's a well-known, publicly documented key; see "Production / VPS deployment" below.
+The server migrates its own schema on every startup (nobody ever needs to run a `.sql` file by hand — see "Migrations" below) and creates that key as a super_admin on the `BOOTSTRAP_TENANT_DOMAIN` tenant (`test.example` by default), idempotently, on every startup. Paste it into the UI header and skip the manual-bootstrap step entirely.
+
+There is deliberately **no built-in default** — a fallback baked into this repo would be a publicly-known super_admin credential (which is exactly what the old `deadbeef-…` default was). Leaving `BOOTSTRAP_SUPER_ADMIN_KEY` unset simply creates no key at all.
 
 Then just run the frontend natively (step 5 below) — its dev-server proxy already points at `127.0.0.1:3000`.
 
@@ -257,7 +294,7 @@ chmod 600 .sbomstash_key
    the `BOOTSTRAP_SUPER_ADMIN_KEY` key if they don't already exist:
 ```bash
 export DATABASE_URL=postgres://postgres:postgres@localhost:5432/sbomstash
-export BOOTSTRAP_SUPER_ADMIN_KEY=deadbeef-dead-dead-dead-deadbeefdead:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+export BOOTSTRAP_SUPER_ADMIN_KEY=mag_...   # from `cargo run -p magnolia-auth --example bootstrap_key`
 export BOOTSTRAP_TENANT_DOMAIN=acme.example
 export BOOTSTRAP_TENANT_NAME="Acme Corp"
 cargo run --bin magnolia-server
@@ -375,7 +412,7 @@ from the internet.
 2. **Start everything except the UI** (Magnolia's own frontend, like
    Dependency-Track, is optional and off by default — `profiles:
    ["frontend"]`; not required at all if any other HTTP client, including
-   `scripts/magnolia-upload.sh` or a separately-hosted UI pointed at this
+   `scripts/magnolia-upload.py` (see "CLI / CI integration" above) or a separately-hosted UI pointed at this
    server via its "Server URL" field, talks to `api` directly):
    ```bash
    docker compose -f docker-compose.yml -f docker-compose.dtrack.yml up -d --build

@@ -15,8 +15,8 @@ set -euo pipefail
 #   curl -fsSL https://magnolia.acme.example/install.sh | bash -s -- verify --sbom=out.cdx.json
 #
 # Or run locally against a checked-out Magnoliafile:
-#   MAGNOLIA_API_KEY='<key_id>:<secret>' ./magnolia-upload.sh
-#   MAGNOLIA_API_KEY='<key_id>:<secret>' ./magnolia-upload.sh verify
+#   MAGNOLIA_API_KEY='mag_<secret>' ./magnolia-upload.sh
+#   MAGNOLIA_API_KEY='mag_<secret>' ./magnolia-upload.sh verify
 #
 # Subcommands (first positional argument; default: upload, for backward
 # compatibility with call sites that never passed one):
@@ -184,7 +184,7 @@ if [ ${#missing[@]} -gt 0 ]; then
   exit 1
 fi
 if [ -z "${MAGNOLIA_API_KEY:-}" ]; then
-  echo "MAGNOLIA_API_KEY is not set (export MAGNOLIA_API_KEY='<key_id>:<secret>')" >&2
+  echo "MAGNOLIA_API_KEY is not set (export MAGNOLIA_API_KEY='mag_<secret>')" >&2
   exit 1
 fi
 if [ ! -f "$SBOM" ]; then

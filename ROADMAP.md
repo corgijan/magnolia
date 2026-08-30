@@ -184,3 +184,80 @@ findings.
   deployment; webhook delivery never tested against a real receiver; no
   security review of the new surface (webhook SSRF guard, HMAC signing,
   `/verify` auth, VEX overwrite semantics) yet.
+- 2026-08-30 — **Most of those gaps now closed.** Everything below was
+  exercised against the live Docker stack (api + postgres + Dependency-Track),
+  not just compiled: new endpoints, migrations, and frontend panels were
+  driven end-to-end with `curl`/`psql`/the real CLI. Webhook delivery against
+  a real external receiver is still untested. Details:
+  - **`/verify` is now the single policy gate.** Added `vulnerabilities`
+    (non-`MAL-` OSV IDs, from the querybatch response that was already being
+    fetched and discarded) and `package-reputation` (cache read, no live
+    deps.dev call in the request path). Folded in the Tools tab's separate
+    `POST /tools/compliance-check`, which is **removed**: compliance profiles
+    and license policy are now always previewed, even at `enforce_level=off`.
+    Response gained a richer `compliance[]` array so minimum-vs-full is
+    legible instead of collapsed into one status string.
+  - **License policy**: `flag_unknown: bool` → `UnknownLicenseHandling
+    {ignore,warn,flag}` (migration `20260830000001`). New pure
+    `license_policy_status()` is the single source of truth for pass/warn/fail,
+    shared by the upload gate and `/verify` so they cannot drift. SPDX
+    identifiers are now validated on save (`is_valid_spdx_license_id`).
+  - **Namespace registration**: added `DELETE /api/v1/namespaces/registered`
+    + Settings "Remove" button — previously a mis-typed namespace could never
+    be un-registered. Rejection message now lists what *is* registered.
+  - **Cache management**: `POST /api/v1/tenants/cache/clear` (component index,
+    malicious findings, dtrack findings/projects), audit-logged.
+  - **Freshness/reputation on upload**: `upload_sbom` now nudges an immediate
+    sync pass (spawned, never awaited) instead of waiting up to an hour;
+    verified a never-before-seen package scored in <1s. UI shows a
+    "Scanning…" state rather than hiding the row.
+  - **Deployment**: `db`/`dtrack-db`/`dependency-track` no longer publish host
+    ports at all; secrets parameterised via `.env` (+ tracked `.env.example`);
+    frontend behind a compose profile; `API_PORT`/`FRONTEND_PORT`/
+    `FRONTEND_INSTANCE_NAME` added; UI can be pointed at a remote API.
+  - **CLI**: stdlib-only Python port (`scripts/magnolia-upload.py`, served at
+    `/install.py`) is now the documented default; bash version retained.
+  - **Testing**: `test-sboms/` — four real `syft`-generated SBOMs spanning
+    CycloneDX 1.5/1.6 + SPDX 2.2/2.3 — plus `tests/test_real_sboms.py`, which
+    drives the real CLI against a live server. Rust suite 144 → 165.
+  - **Security review + auth overhaul.** Audit findings in
+    `docs/AI_DEVLOG.md` episode 8. Fixed the top one: Argon2-per-request
+    (~19 MB, ~12 ms) replaced with constant-time SHA-256 behind a
+    scheme-prefixed hash, keeping legacy keys working — measured
+    **333 → 4,335 req/s** (`ab -n 300 -c 20`). Key format changed to
+    `mag_<43 base64url>` (row located by hash; migration `20260830000002`
+    adds the unique index). The publicly-known `deadbeef-…` bootstrap key is
+    **revoked**, and `docker-compose.yml` now has *no* bootstrap default —
+    unset creates no key (fail closed).
+- Remaining known gaps (2026-08-30): **no CI** (`.github/workflows` absent —
+  nothing runs the 165 tests automatically); no DB-level integration tests;
+  webhook delivery untested against a real receiver; app connects to Postgres
+  as superuser and `audit_logs` has no DB-level immutability; signing key and
+  dtrack key are written `0644`; webhook SSRF guard checks only literal IPs
+  (no DNS-resolution or redirect check); no rate limiting / request timeout.
+  Course deliverables still missing: **OpenAPI document**, `crates/ai` + the
+  AI feature (decided later the same day — see the next entry), and the
+  evaluation suite (`eval/`).
+- 2026-08-30 — **AI feature decided and submitted** (course project
+  description): **CVE reachability evidence**. Primary goal is AI-assisted
+  scanning of the codebase to establish whether a reported CVE actually
+  affects it — whether the vulnerable code is present and reachable — so a
+  team acts on real exposure rather than raw finding counts. Declared
+  fallback, also submitted: AI-assisted extraction and grounded summarisation
+  of CVE advisories. In both cases the model surfaces **evidence for an
+  analyst, never an automated verdict** (see `CLAUDE.md` for why that line
+  matters and where it must show up in the UI). Project framing was also
+  corrected in `CLAUDE.md`: this is a **supply-chain observability and
+  transparency** service, with CRA compliance one application of it rather
+  than the whole purpose.
+  - *Suggested build order:* the fallback first. It shares advisory
+    ingestion (`malicious_check.rs` already pulls OSV advisory text via
+    `get_vuln`; `dtrack_findings` carries descriptions) and the eval harness
+    with the reachability version, so it de-risks the deliverable while
+    remaining useful if reachability doesn't land.
+  - *Not started:* `crates/ai` does not exist. Still required alongside it:
+    the OpenAI-compatible client (env-configured base URL/model/key), the
+    four mandatory failure modes (server unavailable, timeout, invalid
+    output → validate + retry once + degrade, processing failure), and the
+    `eval/` suite (≥10 cases incl. ambiguous / prompt-injection via advisory
+    text / malformed / out-of-scope, plus one baseline comparison).

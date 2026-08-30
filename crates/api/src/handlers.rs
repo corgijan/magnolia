@@ -6,7 +6,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use magnolia_audit::{AuditLogEntry, AuditResult};
-use magnolia_auth::{generate_server_key, Action, Role};
+use magnolia_auth::{Action, Role};
 use magnolia_core::{
     build_envelope, ed25519_public_key_base64, ed25519_public_key_pem, pae, profile_by_id,
     registered_profiles, ComplianceReport as CoreComplianceReport, ConsistencyProof,
@@ -1123,6 +1123,22 @@ pub async fn install_script() -> impl IntoResponse {
     )
 }
 
+/// Served at `/install.py` so `curl -fsSL <tenant_url>/install.py | python3
+/// - -- --tenant-domain=...` works -- a stdlib-only Python port of the same
+/// tool (same flags, same Magnoliafile format, same exit codes; see
+/// scripts/magnolia-upload.py's own module docstring), for environments
+/// that have python3 but not bash (or just prefer it) -- Python is the
+/// primary, most-documented path in the README; `/install.sh` stays for
+/// bash-only environments.
+const MAGNOLIA_UPLOAD_SCRIPT_PY: &str = include_str!("../../../scripts/magnolia-upload.py");
+
+pub async fn install_script_py() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/x-python; charset=utf-8")],
+        MAGNOLIA_UPLOAD_SCRIPT_PY,
+    )
+}
+
 #[derive(serde::Serialize)]
 pub struct WhoAmIJson {
     pub key_id: Uuid,
@@ -1997,6 +2013,29 @@ pub async fn upload_sbom(
             let storage = state.storage.clone();
             tokio::spawn(async move {
                 crate::dtrack_sync::sync_now(&db, &storage, &client, tenant_id).await;
+            });
+        }
+
+        // Same nudge, same reasoning, for package-reputation/freshness:
+        // without this, a freshly uploaded component's score/latest-version
+        // sits unscored until the next periodic tick (up to
+        // `REPUTATION_SYNC_INTERVAL_SECS`/`FRESHNESS_SYNC_INTERVAL_SECS`
+        // away, default 1h) even though `index_manifest_components` above
+        // just gave `sync_pass` real work to do. Both passes are
+        // deployment-wide (not scoped to this tenant/manifest — same shape
+        // as the "Force sync now" buttons in Settings), so this can run
+        // unconditionally whenever depsdev is configured at all; spawned,
+        // never awaited, so a slow/failing deps.dev call can't block or
+        // fail the upload response.
+        if let Some(client) = state.depsdev.clone() {
+            let db = state.db.clone();
+            let reputation_client = client.clone();
+            tokio::spawn(async move {
+                crate::reputation_sync::sync_pass(&db, &reputation_client).await;
+            });
+            let db = state.db.clone();
+            tokio::spawn(async move {
+                crate::freshness_sync::sync_pass(&db, &client).await;
             });
         }
     }
@@ -3766,7 +3805,14 @@ pub struct ClearTenantCachesResponse {
 /// source on its own schedule (a fresh upload or `reindex_components` for
 /// the component index, the next OSV sync for malicious findings, the next
 /// dtrack sync for dtrack data), so this is always recoverable, just not
-/// instantly. `Action::ManageSettings`, same gate as `reindex_components`.
+/// instantly.
+///
+/// `Action::ManageTenantData` — **super_admin only**, deliberately stricter
+/// than the `ManageSettings` gate `reindex_components` uses. Reindexing only
+/// ever adds rows; this deletes them in bulk, and the dtrack half cascades
+/// into `finding_comments`, destroying human-authored triage notes that no
+/// background sync can rebuild. That is not something a `domain_admin`
+/// should be able to do to a tenant by accident.
 ///
 /// Two real side effects worth knowing before using this (also called out
 /// in `clear_malicious_findings_for_tenant`/`clear_dtrack_cache_for_tenant`'s
@@ -3779,7 +3825,7 @@ pub async fn clear_tenant_caches(
     grant: AuthGrant,
     Query(q): Query<TenantOverrideQuery>,
 ) -> Result<Json<ClearTenantCachesResponse>, ApiError> {
-    require(&grant, Action::ManageSettings, &grant.namespace_scope)?;
+    require(&grant, Action::ManageTenantData, &grant.namespace_scope)?;
     let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
 
     let component_index_rows = state.db.clear_component_index(tenant_id).await.map_err(db_err)?;
@@ -4048,15 +4094,29 @@ impl From<magnolia_db::ComponentReputationSummaryRow> for ReputationComponentSum
     }
 }
 
-/// Every package with a cached Scorecard score, deployment-wide, ascending
+/// Every scored package that appears in **this tenant's** SBOMs, ascending
 /// by score — backs the Settings page's aggregation modal (a `manifest()`
-/// call only ever shows one manifest's own components; this shows the whole
-/// deployment's scored backlog at once). `Action::Read`: informational,
-/// not tenant data (see `component_reputation`'s migration comment — a
-/// package's score isn't scoped to who uploaded it).
-pub async fn reputation_components(grant: AuthGrant, State(state): State<AppState>) -> Result<Json<Vec<ReputationComponentSummaryJson>>, ApiError> {
-    require(&grant, Action::Read, &grant.namespace_scope)?;
-    let rows = state.db.list_all_reputation().await.map_err(db_err)?;
+/// call only ever shows one manifest's own components; this shows the
+/// tenant's whole scored surface at once).
+///
+/// Previously this listed `component_reputation` deployment-wide under
+/// plain `Action::Read`, on the reasoning that a Scorecard score is a
+/// property of the package rather than of who uploaded it. That is true of
+/// the *score*, but not of the *fact that a package is present*: the raw
+/// list enumerated every dependency of every other tenant on the
+/// deployment, which is exactly the kind of cross-tenant inference the rest
+/// of the API is careful to prevent. It is now scoped through
+/// `sbom_components` (`list_reputation_for_tenant`) and gated on
+/// `ManageTenantData` — super_admin only, since even within one tenant this
+/// is the whole dependency surface in a single view.
+pub async fn reputation_components(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+) -> Result<Json<Vec<ReputationComponentSummaryJson>>, ApiError> {
+    require(&grant, Action::ManageTenantData, &grant.namespace_scope)?;
+    let (tenant_id, _cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+    let rows = state.db.list_reputation_for_tenant(tenant_id).await.map_err(db_err)?;
     Ok(Json(rows.into_iter().map(ReputationComponentSummaryJson::from).collect()))
 }
 
@@ -4613,14 +4673,9 @@ async fn mint_key(
     namespace_scope: &str,
     expires_at: Option<DateTime<Utc>>,
 ) -> Result<CreateKeyResponse, ApiError> {
-    let (key_id, secret, full_key) = generate_server_key();
-    let key_material = magnolia_auth::ApiKey {
-        key: secret,
-        created_at: Utc::now(),
-    };
-    let hashed = key_material
-        .hash()
-        .map_err(|e| ApiError::InternalError(e.to_string()))?;
+    let generated =
+        magnolia_auth::GeneratedKey::new().map_err(|e| ApiError::InternalError(e.to_string()))?;
+    let key_id = generated.key_id;
 
     state
         .db
@@ -4630,14 +4685,14 @@ async fn mint_key(
             domain,
             namespace_scope,
             &role.to_string(),
-            &hashed.hash,
+            &generated.key_hash,
             expires_at,
         )
         .await
         .map_err(db_err)?;
 
     Ok(CreateKeyResponse {
-        key: full_key,
+        key: generated.token,
         key_id,
         tenant_id,
         domain: domain.to_string(),

@@ -392,6 +392,37 @@ impl Database {
 
     // ---- API keys ----
 
+    /// Finds a key by its stored hash — the lookup path for `mag_`-prefixed
+    /// tokens, which (unlike the legacy `<key_id>:<secret>` form) don't
+    /// carry a row id for us to select on.
+    ///
+    /// This is only possible because key hashes are deterministic and
+    /// unsalted (see `ApiKey::hash`): the caller can compute the exact
+    /// stored value from the token alone. It would not work against the
+    /// salted Argon2 rows, which is precisely why those keep using
+    /// `lookup_api_key` by id.
+    ///
+    /// Matching on the hash rather than the secret means the secret itself
+    /// is never sent to the database, never appears in a query log, and
+    /// never sits in a bind parameter.
+    pub async fn lookup_api_key_by_hash(
+        &self,
+        key_hash: &str,
+    ) -> Result<Option<ApiKeyRecord>, DbError> {
+        sqlx::query_as::<_, ApiKeyRecord>(
+            r#"
+            SELECT id, tenant_id, domain, namespace_scope, role, key_hash,
+                   expires_at, revoked, created_at
+            FROM api_keys
+            WHERE key_hash = $1
+            "#,
+        )
+        .bind(key_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DbError::QueryError(e.to_string()))
+    }
+
     pub async fn lookup_api_key(&self, id: Uuid) -> Result<Option<ApiKeyRecord>, DbError> {
         sqlx::query_as::<_, ApiKeyRecord>(
             r#"
@@ -1387,6 +1418,43 @@ impl Database {
             ORDER BY scorecard_score ASC
             "#,
         )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// Scored packages that actually appear in *this tenant's* SBOMs.
+    ///
+    /// `component_reputation` is deliberately not tenant-scoped — a
+    /// package's Scorecard score is a property of the package, not of who
+    /// uploaded it, so one row serves every tenant. That makes it cheap to
+    /// cache but means it must never be listed raw to a tenant: doing so
+    /// enumerates every dependency of every *other* tenant on the
+    /// deployment. This joins through `sbom_components` so a tenant only
+    /// ever sees packages it has itself uploaded.
+    ///
+    /// `DISTINCT` because one package typically appears in many of a
+    /// tenant's manifests. The join key is
+    /// `(ecosystem, registry_name)` — the same pair `reputation_sync`
+    /// writes rows under (see `backfill_ecosystem_phase`).
+    pub async fn list_reputation_for_tenant(
+        &self,
+        tenant_id: Uuid,
+    ) -> Result<Vec<ComponentReputationSummaryRow>, DbError> {
+        sqlx::query_as::<_, ComponentReputationSummaryRow>(
+            r#"
+            SELECT DISTINCT cr.ecosystem, cr.name, cr.scorecard_score,
+                   cr.project_repo, cr.checked_at
+            FROM component_reputation cr
+            JOIN sbom_components sc
+              ON sc.ecosystem = cr.ecosystem
+             AND sc.registry_name = cr.name
+            WHERE cr.scorecard_score IS NOT NULL
+              AND sc.tenant_id = $1
+            ORDER BY cr.scorecard_score ASC
+            "#,
+        )
+        .bind(tenant_id)
         .fetch_all(&self.pool)
         .await
         .map_err(map_query_error)
