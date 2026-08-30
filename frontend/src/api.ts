@@ -583,6 +583,31 @@ export function setApiKey(key: string): void {
   }
 }
 
+// The backend origin every request below is sent to — empty means "this
+// page's own origin" (the default: same-origin relative paths, unchanged
+// from before this existed), letting the UI be pointed at a Magnolia
+// instance running anywhere else (e.g. a VPS deployment) without a rebuild.
+// The server's CORS policy already allows any origin (see
+// `create_router`'s `CorsLayer`), so this works cross-origin out of the box.
+const BASE_URL_STORAGE = 'magnolia_api_base_url';
+
+export function getApiBaseUrl(): string {
+  return localStorage.getItem(BASE_URL_STORAGE) ?? '';
+}
+
+export function setApiBaseUrl(url: string): void {
+  const trimmed = url.trim().replace(/\/+$/, '');
+  if (trimmed) {
+    localStorage.setItem(BASE_URL_STORAGE, trimmed);
+  } else {
+    localStorage.removeItem(BASE_URL_STORAGE);
+  }
+}
+
+function resolveUrl(path: string): string {
+  return getApiBaseUrl() + path;
+}
+
 export class ApiHttpError extends Error {
   status: number;
   constructor(status: number, message: string) {
@@ -599,7 +624,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (key) {
     headers['Authorization'] = `Bearer ${key}`;
   }
-  const res = await fetch(path, { ...init, headers });
+  const res = await fetch(resolveUrl(path), { ...init, headers });
   if (!res.ok) {
     let message = `${res.status} ${res.statusText}`;
     try {
@@ -629,7 +654,7 @@ function tenantQs(tenantId?: string, extra: Record<string, string | number> = {}
 
 export const api = {
   health: (): Promise<boolean> =>
-    fetch('/health').then((res) => res.ok).catch(() => false),
+    fetch(resolveUrl('/health')).then((res) => res.ok).catch(() => false),
 
   whoami: (): Promise<WhoAmI> => request('/api/v1/whoami'),
 
@@ -925,7 +950,7 @@ export const api = {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     const key = getApiKey();
     if (key) headers['Authorization'] = `Bearer ${key}`;
-    const res = await fetch(`/api/v1/snapshot${tenantQs(tenantId)}`, {
+    const res = await fetch(resolveUrl(`/api/v1/snapshot${tenantQs(tenantId)}`), {
       method: 'POST',
       headers,
       body: JSON.stringify({ namespace: opts.namespace || undefined, version: opts.version || undefined }),

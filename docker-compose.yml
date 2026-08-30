@@ -77,7 +77,7 @@ services:
       DTRACK_API_KEY: "${DTRACK_API_KEY:-}"
       DTRACK_SYNC_INTERVAL_SECS: "${DTRACK_SYNC_INTERVAL_SECS:-600}"
     ports:
-      - "3000:3000"
+      - "${API_PORT:-3000}:3000"
     volumes:
       - signing_key:/data
 
