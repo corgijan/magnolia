@@ -337,7 +337,6 @@ The LLM is reached only by reach, through the OpenAI-compatible endpoint.
 
 ### CI upload → finding → reachability evidence → triage
 
-<p class="muted" style="font-size: 18px">live, with the screenshots that follow as a fallback</p>
 
 <!--
 Live demo, scenario 2:
