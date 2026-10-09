@@ -25,3 +25,18 @@ target/
 .env
 aidex
 
+
+# Dependency-Track API key copied out of the dtrack_key volume for native `cargo run`
+.dtrack-dev-key
+# Local signing key and SBOM storage created by a native `cargo run`
+.sbomstash_key
+.dev-data/
+
+# Demo source repository built by scripts/demo-repo.sh from demo/shop-api
+demo/.repos/
+
+# macOS Finder metadata, Python bytecode, and the local AiDex code index
+.DS_Store
+__pycache__/
+*.pyc
+.aidex/

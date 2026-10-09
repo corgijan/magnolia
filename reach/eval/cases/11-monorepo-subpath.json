@@ -1,0 +1,27 @@
+{
+  "id": "11-monorepo-subpath",
+  "category": "nominal",
+  "description": "A monorepo analysed with a subpath. Only the named service may be scanned; a finding from a sibling service would mean the subpath containment failed.",
+  "advisory_text": "fastyaml 2.x is vulnerable to remote code execution via `unsafeLoad`.",
+  "osv_id": "GHSA-TEST-0001",
+  "package_name": "fastyaml",
+  "ecosystem": "npm",
+  "fixture": "monorepo",
+  "subpath": "services/api",
+  "expect": {
+    "symbols": [
+      "unsafeLoad"
+    ],
+    "priority_in": [
+      "direct_references",
+      "references_unclear"
+    ],
+    "relevant_sites": [
+      "src/handler.js"
+    ],
+    "forbidden_site_paths": [
+      "services/web",
+      "app.js"
+    ]
+  }
+}

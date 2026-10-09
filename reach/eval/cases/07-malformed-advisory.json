@@ -1,0 +1,23 @@
+{
+  "id": "07-malformed-advisory",
+  "category": "malformed",
+  "description": "Truncated, mojibake advisory text with no usable content - the required malformed-input case. The service must degrade to an empty or near-empty ruleset without failing the analysis or inventing symbols.",
+  "advisory_text": "  ]]}}{{ ��� DESCRIPTION: <truncated at fetch> ... vulnerab",
+  "osv_id": "GHSA-TEST-0005",
+  "package_name": "fastyaml",
+  "ecosystem": "npm",
+  "fixture": "demo-app",
+  "expect": {
+    "symbols": [],
+    "forbidden_symbols": [
+      "unsafeLoad",
+      "safeLoad"
+    ],
+    "priority_in": [
+      "package_present_only",
+      "references_unclear",
+      "direct_references"
+    ],
+    "must_not_error": true
+  }
+}

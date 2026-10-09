@@ -1,0 +1,23 @@
+{
+  "id": "13-qualified-generic-symbol",
+  "category": "nominal",
+  "description": "The advisory's only vulnerable symbol is a bare name on stage B's generic-noise list (`load`), named in the qualified form real advisories use (`yaml.load`) — the shape of CVE-2017-18342. Regression test for the whole class: dropping `load` as noise used to leave zero searchable symbols and silently degrade the report to package_present_only, a false negative on one of the best-known advisories there is. The fixture also contains unrelated bare `load` definitions, so the rescue must not disable the noise filter wholesale.",
+  "advisory_text": "pyyamlish before 5.1 allows arbitrary code execution. Calling yaml.load on untrusted input instantiates arbitrary Python objects named in the document. Use yaml.safe_load instead. Fixed in 5.1.",
+  "osv_id": "GHSA-TEST-0013",
+  "package_name": "pyyamlish",
+  "ecosystem": "npm",
+  "fixture": "yaml-app",
+  "expect": {
+    "symbols": [
+      "load"
+    ],
+    "priority_in": [
+      "direct_references",
+      "references_unclear"
+    ],
+    "relevant_sites": [
+      "src/config.js"
+    ],
+    "min_inference_calls": 1
+  }
+}

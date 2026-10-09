@@ -1,0 +1,7 @@
+{
+  "name": "hostile-app",
+  "version": "1.0.0",
+  "dependencies": {
+    "fastyaml": "2.1.0"
+  }
+}

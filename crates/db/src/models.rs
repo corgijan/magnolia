@@ -346,6 +346,97 @@ pub struct ManifestRecord {
     pub revoked: bool,
     pub revoked_at: Option<DateTime<Utc>>,
     pub revoked_by: Option<String>,
+    /// Full git object id the SBOM was generated from, when the uploading
+    /// client sent one. `None` for every manifest uploaded before
+    /// reachability analysis existed — analysis refuses to run without it
+    /// rather than falling back to a branch head, which would produce
+    /// evidence about code the SBOM does not describe.
+    pub source_commit: Option<String>,
+}
+
+/// Where a namespace's *own* source lives — the application being analysed,
+/// not any dependency of it. Set explicitly through the settings API;
+/// never inferred from SBOM metadata, because an SBOM component's homepage
+/// URL points at the dependency's repository, which is exactly the wrong
+/// tree to scan for reachability.
+#[derive(Debug, Clone, FromRow)]
+pub struct NamespaceRepoRecord {
+    pub tenant_id: uuid::Uuid,
+    pub namespace: String,
+    pub repo_url: String,
+    pub subpath: Option<String>,
+    /// Branch, tag, or exact commit used for manifests that carry no
+    /// `source_commit` of their own. Resolved to an exact commit by the
+    /// analyser at request time; never analysed as a moving ref.
+    pub revision: Option<String>,
+    /// Background analysis of this namespace's current untriaged findings.
+    pub auto_analyze: bool,
+    /// Testing override: analyse `revision` even for manifests that carry
+    /// their own `source_commit`.
+    pub ignore_source_commit: bool,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Links one finding to one analysis in the `reach` service. AISE holds only
+/// the handle; the report itself lives in the analyser's database.
+#[derive(Debug, Clone, FromRow)]
+pub struct FindingReachabilityRecord {
+    pub id: i64,
+    pub manifest_hash: String,
+    pub finding_key: String,
+    pub analysis_id: uuid::Uuid,
+    /// Copied at request time, so the record stays interpretable even after
+    /// the namespace mapping changes.
+    pub repo_url: String,
+    pub commit_sha: String,
+    pub subpath: Option<String>,
+    pub requested_by: String,
+    pub created_at: DateTime<Utc>,
+    /// `"manifest"` or `"namespace_revision"` — where `commit_sha` came from.
+    pub commit_source: String,
+    /// The branch/tag `commit_sha` was resolved from, for
+    /// `commit_source = "namespace_revision"`.
+    pub requested_ref: Option<String>,
+    /// The analyser's status the last time AISE polled it — a cache, not the
+    /// source of truth. `None` until first polled.
+    pub status: Option<String>,
+    pub priority: Option<String>,
+    pub status_checked_at: Option<DateTime<Utc>>,
+    /// Archived copy of the analyser's report, written once the analysis
+    /// reached a terminal state. `None` while in flight, for an analysis that
+    /// failed before producing one, and for rows predating the archive
+    /// column. Deliberately unmodelled — the report schema belongs to
+    /// `reach`, and AISE stores it verbatim so a schema change there cannot
+    /// silently drop fields here.
+    pub report_json: Option<serde_json::Value>,
+    pub report_stored_at: Option<DateTime<Utc>>,
+}
+
+/// Input for `record_finding_reachability`. A struct rather than nine
+/// positional `&str`s, several of which are easy to transpose.
+#[derive(Debug, Clone, Copy)]
+pub struct NewFindingReachability<'a> {
+    pub manifest_hash: &'a str,
+    pub finding_key: &'a str,
+    pub analysis_id: uuid::Uuid,
+    pub repo_url: &'a str,
+    pub commit_sha: &'a str,
+    pub subpath: Option<&'a str>,
+    pub requested_by: &'a str,
+    pub commit_source: &'a str,
+    pub requested_ref: Option<&'a str>,
+}
+
+/// A finding the background reachability loop could analyse: on a
+/// namespace's current manifest, untriaged, with advisory text, in a
+/// namespace opted into `auto_analyze`, and never analysed before.
+#[derive(Debug, Clone, FromRow)]
+pub struct ReachabilityCandidateRecord {
+    pub tenant_id: uuid::Uuid,
+    pub manifest_hash: String,
+    pub finding_key: String,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -425,6 +516,10 @@ pub struct DtrackFindingWithContextRecord {
     pub release_version: String,
     pub revoked: bool,
     pub comment_count: i64,
+    /// Cached status/priority of the finding's most recent reachability
+    /// analysis, if any — see `FindingReachabilityRecord::status`.
+    pub reachability_status: Option<String>,
+    pub reachability_priority: Option<String>,
 }
 
 /// One entry in a finding's discussion thread — `author` is always the

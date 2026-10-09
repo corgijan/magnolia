@@ -2,6 +2,7 @@
 name = "magnolia-api"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "magnolia-server"
@@ -35,4 +36,5 @@ magnolia-db = { path = "../db" }
 magnolia-audit = { path = "../audit" }
 magnolia-dtrack = { path = "../dtrack" }
 magnolia-osv = { path = "../osv" }
+magnolia-reachability = { path = "../reachability" }
 magnolia-depsdev = { path = "../depsdev" }

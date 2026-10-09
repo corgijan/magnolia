@@ -4,6 +4,7 @@ mod freshness_sync;
 mod handlers;
 mod malicious_check;
 mod malicious_sync;
+mod reachability;
 mod reputation_bucket;
 mod reputation_sync;
 mod snapshot;
@@ -16,6 +17,7 @@ pub use dtrack_sync::{run_sync_loop, sync_now};
 pub use errors::ApiError;
 pub use freshness_sync::run_freshness_sync_loop;
 pub use malicious_sync::run_malicious_sync_loop;
+pub use reachability::run_reachability_auto_loop;
 pub use reputation_sync::run_reputation_sync_loop;
 pub use state::AppState;
 pub use auth::AuthGrant;
@@ -139,6 +141,20 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/settings/license-policy",
             get(handlers::license_policy).post(handlers::set_license_policy),
+        )
+        // Which repository a namespace's own source lives in — the input the
+        // CVE-reachability analyser needs and cannot infer.
+        .route(
+            "/api/v1/settings/namespace-repos",
+            get(handlers::list_namespace_repos)
+                .post(handlers::set_namespace_repo)
+                .delete(handlers::delete_namespace_repo),
+        )
+        // CVE reachability evidence for one finding: GET is status + report,
+        // POST queues an analysis.
+        .route(
+            "/api/v1/manifest/:manifest_hash/findings/:finding_key/reachability",
+            get(handlers::finding_reachability).post(handlers::request_finding_reachability),
         )
         .route("/api/v1/snapshot", post(handlers::snapshot))
         .route(

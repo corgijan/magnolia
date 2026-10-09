@@ -1392,6 +1392,7 @@ dependencies = [
  "magnolia-depsdev",
  "magnolia-dtrack",
  "magnolia-osv",
+ "magnolia-reachability",
  "magnolia-signer",
  "magnolia-storage",
  "reqwest",
@@ -1504,6 +1505,19 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "wiremock",
+]
+
+[[package]]
+name = "magnolia-reachability"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
  "wiremock",
 ]
 

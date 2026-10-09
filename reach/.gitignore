@@ -1,0 +1,8 @@
+/target
+/.reach-cache
+*.db
+*.db-wal
+*.db-shm
+# Eval results are run artifacts, not source. Commit the one representative
+# run referenced in the README by force-adding it.
+/eval/results

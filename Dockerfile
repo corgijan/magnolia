@@ -27,8 +27,8 @@ COPY --from=planner /app/recipe.json recipe.json
 # *compiled* dependency artifacts survive across builds as well; its
 # contents never become part of the image layer, hence copying the final
 # binary out of it explicitly below.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     cargo chef cook --release --recipe-path recipe.json
 
 # Real source, copied only after the dependency layer above is settled --
@@ -39,9 +39,9 @@ COPY crates ./crates
 COPY migrations ./migrations
 COPY scripts ./scripts
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/target \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=aise-api-target,target=/app/target,sharing=locked \
     cargo build --release --bin magnolia-server && \
     cp target/release/magnolia-server /app/magnolia-server
 

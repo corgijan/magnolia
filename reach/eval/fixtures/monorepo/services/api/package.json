@@ -1,0 +1,6 @@
+{
+  "name": "@acme/api",
+  "dependencies": {
+    "fastyaml": "2.1.0"
+  }
+}

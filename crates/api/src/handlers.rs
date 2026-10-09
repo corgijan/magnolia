@@ -47,6 +47,13 @@ pub struct UploadResponse {
     pub leaf_index: u64,
     pub leaf_seq_id: i64,
     pub signed_tree_head: TreeHeadJson,
+    /// Present only when the upload declared a source repository (the
+    /// Magnoliafile's `source_repo`): `"recorded"` when it is now the
+    /// namespace's mapping, `"kept_existing"` when an admin-set mapping
+    /// took precedence, `"not_recorded"` when saving it failed (the upload
+    /// itself still succeeded).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_repo: Option<&'static str>,
 }
 
 #[derive(serde::Serialize)]
@@ -394,6 +401,11 @@ pub struct FindingWithContextJson {
     pub release_version: String,
     pub revoked: bool,
     pub comment_count: i64,
+    /// Cached state of the finding's latest reachability analysis
+    /// (`queued`/`running`/`completed`/`failed`/`missing`), if any.
+    pub reachability_status: Option<String>,
+    /// The analysis' ordinal priority label once completed. Not a probability.
+    pub reachability_priority: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -423,6 +435,10 @@ pub struct ListFindingsQuery {
     /// `current_only` also respects.
     #[serde(default)]
     pub hide_stale: bool,
+    /// When true, only findings whose namespace has a source repository
+    /// mapped — the ones a reachability analysis can run on.
+    #[serde(default)]
+    pub known_source: bool,
     #[serde(default = "default_limit")]
     pub limit: i64,
     #[serde(default)]
@@ -473,6 +489,7 @@ pub async fn list_findings(
             vex_status_filter,
             query.current_only,
             query.hide_stale,
+            query.known_source,
             limit,
             offset,
         )
@@ -501,6 +518,8 @@ pub async fn list_findings(
                 release_version: r.release_version,
                 revoked: r.revoked,
                 comment_count: r.comment_count,
+                reachability_status: r.reachability_status,
+                reachability_priority: r.reachability_priority,
             })
             .collect(),
     ))
@@ -1184,6 +1203,10 @@ pub struct ConfigJson {
     /// have to know that's true today.
     pub freshness_enabled: bool,
     pub malicious_check_enabled: bool,
+    /// Whether this deployment has a CVE-reachability analyser configured.
+    /// The UI hides the "Analyze reachability" affordance entirely when
+    /// false, rather than showing a button that can only fail.
+    pub reachability_enabled: bool,
 }
 
 /// Server-operational info, not tenant data — safe for any authenticated
@@ -1201,6 +1224,7 @@ pub async fn config(State(state): State<AppState>, _grant: AuthGrant) -> Json<Co
         reputation_enabled: state.depsdev.is_some(),
         freshness_enabled: state.depsdev.is_some(),
         malicious_check_enabled: state.osv.is_some(),
+        reachability_enabled: state.reach.is_some(),
     })
 }
 
@@ -1683,6 +1707,17 @@ pub async fn upload_sbom(
     let mut namespace = "/".to_string();
     let mut version = String::new();
     let mut document_type = String::new();
+    // Optional: the git revision the SBOM was generated from, sent by the
+    // upload CLI. Recorded so CVE-reachability analysis has an exact tree to
+    // scan; without it that feature refuses to run rather than analysing a
+    // moving branch head.
+    let mut source_commit = String::new();
+    // Optional: where this namespace's source lives (Magnoliafile
+    // `source_repo`/`source_subpath`/`source_revision`). Recorded as the
+    // namespace's repository mapping unless an admin already set one.
+    let mut source_repo = String::new();
+    let mut source_subpath = String::new();
+    let mut source_revision = String::new();
     while let Some(next) = multipart
         .next_field()
         .await
@@ -1711,6 +1746,24 @@ pub async fn upload_sbom(
                 .map_err(|e| multipart_err("invalid document_type field", e))?
                 .trim()
                 .to_string(),
+            Some("source_commit") => source_commit = next
+                .text()
+                .await
+                .map_err(|e| multipart_err("invalid source_commit field", e))?
+                .trim()
+                .to_ascii_lowercase(),
+            Some("source_repo") => source_repo = next
+                .text()
+                .await
+                .map_err(|e| multipart_err("invalid source_repo field", e))?,
+            Some("source_subpath") => source_subpath = next
+                .text()
+                .await
+                .map_err(|e| multipart_err("invalid source_subpath field", e))?,
+            Some("source_revision") => source_revision = next
+                .text()
+                .await
+                .map_err(|e| multipart_err("invalid source_revision field", e))?,
             _ => {}
         }
     }
@@ -1719,6 +1772,27 @@ pub async fn upload_sbom(
     if version.is_empty() {
         return Err(ApiError::BadRequest("version is required".to_string()));
     }
+
+    // Rejected rather than silently dropped: an upload that believes it
+    // recorded a revision, and didn't, would leave the reachability button
+    // mysteriously disabled with nothing to point at.
+    let source_commit = if source_commit.is_empty() {
+        None
+    } else {
+        let looks_like_object_id = (source_commit.len() == 40 || source_commit.len() == 64)
+            && source_commit.chars().all(|c| c.is_ascii_hexdigit());
+        if !looks_like_object_id {
+            return Err(ApiError::BadRequest(
+                "source_commit must be a full 40- or 64-character git object id (`git rev-parse HEAD`), not a branch or tag"
+                    .to_string(),
+            ));
+        }
+        Some(source_commit)
+    };
+
+    // Validated before anything is stored, same as source_commit: a bad
+    // value in the Magnoliafile should fail the CI step that introduced it.
+    let declared_repo = parse_declared_source_repo(&source_repo, &source_subpath, &source_revision)?;
 
     if sbom_bytes.is_empty() {
         return Err(ApiError::BadRequest("sbom_file is empty".to_string()));
@@ -1976,9 +2050,52 @@ pub async fn upload_sbom(
             document_type_opt,
             &grant.principal(),
             manifest_created_at,
+            source_commit.as_deref(),
         )
         .await
         .map_err(db_err)?;
+
+    // After the manifest is stored, and never fatal: the SBOM is in the log
+    // either way, and the mapping is a convenience the response reports on.
+    let source_repo_outcome = match &declared_repo {
+        None => None,
+        Some(d) => Some(
+            match state
+                .db
+                .set_namespace_repo_from_upload(
+                    tenant_id,
+                    &namespace,
+                    &d.repo_url,
+                    d.subpath.as_deref(),
+                    d.revision.as_deref(),
+                    &format!("{MAGNOLIAFILE_PRINCIPAL_PREFIX}{}", grant.principal()),
+                )
+                .await
+            {
+                Ok(Some(_)) => {
+                    let _ = record_audit(
+                        &state,
+                        &grant,
+                        "namespace_repo_set",
+                        &format!("{}:{}", grant.domain, namespace),
+                        true,
+                        Some(format!(
+                            "from upload; repo_url={}; revision={}",
+                            d.repo_url,
+                            d.revision.as_deref().unwrap_or("-")
+                        )),
+                    )
+                    .await;
+                    "recorded"
+                }
+                Ok(None) => "kept_existing",
+                Err(e) => {
+                    tracing::warn!(%namespace, error = %e, "could not record the upload's source repository");
+                    "not_recorded"
+                }
+            },
+        ),
+    };
 
     crate::webhooks::emit_event(
         &state.db,
@@ -2061,6 +2178,7 @@ pub async fn upload_sbom(
         leaf_index: tree_size - 1,
         leaf_seq_id,
         signed_tree_head: sth_json,
+        source_repo: source_repo_outcome,
     }))
 }
 
@@ -5029,4 +5147,724 @@ pub async fn audit_logs(
             })
             .collect(),
     ))
+}
+// ============================================================================
+// CVE reachability evidence
+// ============================================================================
+//
+// AISE's side of the `reach/` analyser. Three responsibilities and no more:
+// resolve which repository and revision a finding's manifest corresponds to,
+// hand that to the analyser, and proxy the result back. The analysis itself,
+// the prompts, and the report schema all live in `reach/`.
+//
+// The framing rule from CLAUDE.md travels with the data: the analyser
+// produces evidence for a human, never a verdict, and nothing here turns a
+// report into a triage decision. No auto-close, no VEX status written from a
+// report — a human still triages, now with the call sites in front of them.
+
+/// A namespace's source-repository mapping.
+#[derive(serde::Serialize)]
+pub struct NamespaceRepoJson {
+    pub namespace: String,
+    pub repo_url: String,
+    pub subpath: Option<String>,
+    /// Default branch/tag/commit, used only for manifests uploaded without
+    /// a `source_commit` of their own.
+    pub revision: Option<String>,
+    pub auto_analyze: bool,
+    /// Testing override: analyse `revision` even when a manifest recorded
+    /// its own commit.
+    pub ignore_source_commit: bool,
+    pub created_by: String,
+    pub updated_at: String,
+}
+
+impl From<magnolia_db::NamespaceRepoRecord> for NamespaceRepoJson {
+    fn from(r: magnolia_db::NamespaceRepoRecord) -> Self {
+        Self {
+            namespace: r.namespace,
+            repo_url: r.repo_url,
+            subpath: r.subpath,
+            revision: r.revision,
+            auto_analyze: r.auto_analyze,
+            ignore_source_commit: r.ignore_source_commit,
+            created_by: r.created_by,
+            updated_at: r.updated_at.to_rfc3339(),
+        }
+    }
+}
+
+/// `GET /api/v1/settings/namespace-repos`
+pub async fn list_namespace_repos(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+) -> Result<Json<Vec<NamespaceRepoJson>>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+
+    let rows = state.db.list_namespace_repos(tenant_id).await.map_err(db_err)?;
+    Ok(Json(
+        rows.into_iter()
+            // A namespace-scoped key must not learn the repository URLs of
+            // namespaces it cannot otherwise see.
+            .filter(|r| {
+                cross_tenant
+                    || magnolia_auth::namespace_in_scope(&r.namespace, &grant.namespace_scope)
+            })
+            .map(NamespaceRepoJson::from)
+            .collect(),
+    ))
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetNamespaceRepoRequest {
+    pub namespace: String,
+    /// `https://` URL, or an absolute path for the offline demo fetcher.
+    pub repo_url: String,
+    /// Monorepo sub-directory to scan; `null` or empty means the whole tree.
+    #[serde(default)]
+    pub subpath: Option<String>,
+    /// Branch, tag or exact commit to analyse for manifests that carry no
+    /// `source_commit`. `null` or empty means "none" — such manifests stay
+    /// blocked rather than defaulting to some branch.
+    #[serde(default)]
+    pub revision: Option<String>,
+    /// Queue analyses for this namespace's current untriaged findings in the
+    /// background.
+    #[serde(default)]
+    pub auto_analyze: bool,
+    /// Testing override: use `revision` even for manifests that recorded
+    /// their own `source_commit`. Requires `revision`.
+    #[serde(default)]
+    pub ignore_source_commit: bool,
+}
+
+/// `POST /api/v1/settings/namespace-repos`
+///
+/// `ManageSettings`, not `Annotate`: this decides which repository an
+/// analyser is pointed at on this tenant's behalf, which is tenant-wide
+/// configuration rather than a per-finding annotation.
+pub async fn set_namespace_repo(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<TenantOverrideQuery>,
+    Json(body): Json<SetNamespaceRepoRequest>,
+) -> Result<Json<NamespaceRepoJson>, ApiError> {
+    require(&grant, Action::ManageSettings, &grant.namespace_scope)?;
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+
+    let namespace = normalize_namespace(&body.namespace)?;
+    if !cross_tenant && !magnolia_auth::namespace_in_scope(&namespace, &grant.namespace_scope) {
+        return Err(ApiError::Forbidden(
+            "namespace is outside this key's scope".to_string(),
+        ));
+    }
+
+    // Validated here as well as in the analyser: a caller should learn that
+    // a URL is unusable when they save the setting, not later from a failed
+    // analysis. The analyser still validates independently — this is a
+    // usability check, not the security boundary.
+    let repo_url = body.repo_url.trim().to_string();
+    validate_repo_url_shape(&repo_url)?;
+
+    let subpath = body.subpath.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if let Some(sub) = subpath {
+        validate_subpath_shape(sub)?;
+    }
+
+    let revision = body.revision.as_deref().map(str::trim).filter(|r| !r.is_empty());
+    if let Some(r) = revision {
+        validate_revision_shape(r)?;
+    }
+    // Rejected rather than silently ignored: with no revision, the switch
+    // would look on in Settings and change nothing.
+    if body.ignore_source_commit && revision.is_none() {
+        return Err(ApiError::BadRequest(
+            "ignoring the recorded commit needs a revision to analyse instead".to_string(),
+        ));
+    }
+
+    let record = state
+        .db
+        .set_namespace_repo(
+            tenant_id,
+            &namespace,
+            &repo_url,
+            subpath,
+            revision,
+            body.auto_analyze,
+            body.ignore_source_commit,
+            &grant.principal(),
+        )
+        .await
+        .map_err(db_err)?;
+
+    let _ = record_audit(
+        &state,
+        &grant,
+        "namespace_repo_set",
+        &format!("{}:{}", grant.domain, namespace),
+        true,
+        Some(format!(
+            "repo_url={repo_url}; revision={}; auto_analyze={}; ignore_source_commit={}",
+            revision.unwrap_or("-"),
+            body.auto_analyze,
+            body.ignore_source_commit
+        )),
+    )
+    .await;
+
+    Ok(Json(record.into()))
+}
+
+/// `DELETE /api/v1/settings/namespace-repos?namespace=...`
+pub async fn delete_namespace_repo(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Query(q): Query<NamespaceRepoDeleteQuery>,
+) -> Result<StatusCode, ApiError> {
+    require(&grant, Action::ManageSettings, &grant.namespace_scope)?;
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+
+    let namespace = normalize_namespace(&q.namespace)?;
+    if !cross_tenant && !magnolia_auth::namespace_in_scope(&namespace, &grant.namespace_scope) {
+        return Err(ApiError::Forbidden(
+            "namespace is outside this key's scope".to_string(),
+        ));
+    }
+
+    let removed = state.db.delete_namespace_repo(tenant_id, &namespace).await.map_err(db_err)?;
+    if !removed {
+        return Err(ApiError::NotFound);
+    }
+    let _ = record_audit(
+        &state,
+        &grant,
+        "namespace_repo_deleted",
+        &format!("{}:{}", grant.domain, namespace),
+        true,
+        None,
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+pub struct NamespaceRepoDeleteQuery {
+    pub namespace: String,
+    #[serde(default)]
+    pub tenant_id: Option<uuid::Uuid>,
+}
+
+/// Mirrors the analyser's own scheme allowlist so a bad value is rejected at
+/// the point it is typed. Kept intentionally simple: `reach` re-validates
+/// (including the argv-injection and credential checks), so this exists to
+/// produce a good error message, not to be relied on.
+fn validate_repo_url_shape(url: &str) -> Result<(), ApiError> {
+    if url.is_empty() {
+        return Err(ApiError::BadRequest("repo_url is required".to_string()));
+    }
+    if url.starts_with('-') || url.chars().any(|c| c.is_control()) {
+        return Err(ApiError::BadRequest("repo_url is not a valid URL".to_string()));
+    }
+    if let Some(rest) = url.strip_prefix("https://") {
+        let authority = rest.split('/').next().unwrap_or("");
+        if authority.is_empty() {
+            return Err(ApiError::BadRequest("repo_url is missing a host".to_string()));
+        }
+        if authority.contains('@') {
+            return Err(ApiError::BadRequest(
+                "repo_url must not contain credentials — configure REACH_GIT_TOKEN on the analyser instead"
+                    .to_string(),
+            ));
+        }
+        return Ok(());
+    }
+    if url.starts_with('/') && !url.split('/').any(|c| c == "..") {
+        // The offline demo / eval fixture path.
+        return Ok(());
+    }
+    Err(ApiError::BadRequest(
+        "repo_url must be an https:// URL (or an absolute local path for an offline demo)".to_string(),
+    ))
+}
+
+fn validate_subpath_shape(sub: &str) -> Result<(), ApiError> {
+    if sub.starts_with('/') || sub.split('/').any(|c| c == ".." || c == ".git") {
+        return Err(ApiError::BadRequest(
+            "subpath must be a relative path inside the repository, with no '..'".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// `created_by` prefix marking a namespace-repo mapping that came from an
+/// upload's Magnoliafile rather than from Settings. Only mappings with this
+/// prefix are ever replaced by a later upload; one an admin saved in
+/// Settings always wins.
+pub const MAGNOLIAFILE_PRINCIPAL_PREFIX: &str = "magnoliafile:";
+
+/// A source repository declared on an upload.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DeclaredSourceRepo {
+    pub repo_url: String,
+    pub subpath: Option<String>,
+    pub revision: Option<String>,
+}
+
+/// `Ok(None)` when the upload declared no repository — the normal case, and
+/// never an error. Stricter than the Settings form in one way: `https://`
+/// only. The absolute-local-path form exists for the offline demo, and is an
+/// admin's call; an upload key pointing the analyser at a path inside its
+/// own container would be a different matter.
+fn parse_declared_source_repo(
+    repo: &str,
+    subpath: &str,
+    revision: &str,
+) -> Result<Option<DeclaredSourceRepo>, ApiError> {
+    let repo = repo.trim();
+    let subpath = subpath.trim().trim_end_matches('/');
+    let revision = revision.trim();
+    if repo.is_empty() {
+        if !subpath.is_empty() || !revision.is_empty() {
+            return Err(ApiError::BadRequest(
+                "source_subpath/source_revision were given without source_repo".to_string(),
+            ));
+        }
+        return Ok(None);
+    }
+    if !repo.starts_with("https://") {
+        return Err(ApiError::BadRequest(
+            "source_repo must be an https:// URL".to_string(),
+        ));
+    }
+    validate_repo_url_shape(repo)?;
+    if !subpath.is_empty() {
+        validate_subpath_shape(subpath)?;
+    }
+    if !revision.is_empty() {
+        validate_revision_shape(revision)?;
+    }
+    Ok(Some(DeclaredSourceRepo {
+        repo_url: repo.to_string(),
+        subpath: (!subpath.is_empty()).then(|| subpath.to_string()),
+        revision: (!revision.is_empty()).then(|| revision.to_string()),
+    }))
+}
+
+/// Mirrors the analyser's ref-name rules (`reach/src/fetcher/resolve.rs`) so
+/// a typo is reported when the setting is saved. The analyser re-validates,
+/// and is the one that finds out whether the branch actually exists.
+fn validate_revision_shape(r: &str) -> Result<(), ApiError> {
+    let bad = || {
+        Err(ApiError::BadRequest(
+            "revision must be a branch name, tag or commit id (letters, digits and . _ / + - only, no '..')"
+                .to_string(),
+        ))
+    };
+    if r.len() > 200
+        || r.starts_with('-')
+        || r.starts_with('/')
+        || r.ends_with('/')
+        || r.ends_with('.')
+        || r.ends_with(".lock")
+        || r.contains("..")
+        || r.contains("//")
+        || !r.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-' | '+'))
+    {
+        return bad();
+    }
+    Ok(())
+}
+
+/// What the UI needs to decide whether the button is clickable, and to
+/// explain it when it isn't.
+#[derive(serde::Serialize)]
+pub struct ReachabilityJson {
+    /// False when the deployment has no analyser configured at all.
+    pub enabled: bool,
+    /// `null` when nothing blocks an analysis. Otherwise a sentence the UI
+    /// shows as the disabled button's tooltip — the reason must reach the
+    /// user, since "greyed out with no explanation" is the failure mode this
+    /// field exists to prevent.
+    pub blocked_reason: Option<String>,
+    pub repo_url: Option<String>,
+    pub subpath: Option<String>,
+    /// The exact commit analysed (or, before any analysis, the manifest's
+    /// own commit when it has one).
+    pub commit: Option<String>,
+    /// `"manifest"` or `"namespace_revision"`: whether `commit` is the
+    /// revision the SBOM was built from, or one resolved from the
+    /// namespace's default. The UI must say which — a resolved branch head
+    /// may not be the code the SBOM describes.
+    pub commit_source: Option<String>,
+    /// The namespace revision (branch/tag) in play when `commit_source` is
+    /// `"namespace_revision"`.
+    pub revision: Option<String>,
+    /// True when the background loop queued the analysis, not a person.
+    pub requested_automatically: bool,
+    /// The most recent analysis for this finding, if any.
+    pub analysis_id: Option<uuid::Uuid>,
+    pub status: Option<String>,
+    pub requested_by: Option<String>,
+    pub requested_at: Option<String>,
+    /// The analyser's report, verbatim. AISE does not reshape it.
+    pub report: Option<serde_json::Value>,
+    /// Set when the analysis failed, or when the analyser could not be
+    /// reached just now — the two are distinguished by `status`.
+    pub error: Option<String>,
+}
+
+/// Loads a finding and its manifest after checking the manifest belongs to
+/// the caller's tenant and namespace scope — 404 otherwise, so another
+/// tenant's hashes cannot be probed.
+async fn authorized_finding(
+    state: &AppState,
+    grant: &AuthGrant,
+    tenant_id: uuid::Uuid,
+    cross_tenant: bool,
+    manifest_hash: &str,
+    finding_key: &str,
+) -> Result<(magnolia_db::ManifestRecord, DtrackFindingRecord), ApiError> {
+    let record = state
+        .db
+        .get_manifest(manifest_hash)
+        .await
+        .map_err(db_err)?
+        .ok_or(ApiError::NotFound)?;
+    if record.tenant_id != tenant_id
+        || (!cross_tenant
+            && !magnolia_auth::namespace_in_scope(&record.namespace, &grant.namespace_scope))
+    {
+        return Err(ApiError::NotFound);
+    }
+    let finding = state
+        .db
+        .get_dtrack_finding(manifest_hash, finding_key)
+        .await
+        .map_err(db_err)?
+        .ok_or(ApiError::NotFound)?;
+    Ok((record, finding))
+}
+
+fn reachability_disabled() -> ReachabilityJson {
+    ReachabilityJson {
+        enabled: false,
+        blocked_reason: Some(
+            "This deployment has no reachability analyser configured (AISE_REACH_BASE_URL / AISE_REACH_TOKEN)."
+                .to_string(),
+        ),
+        repo_url: None,
+        subpath: None,
+        commit: None,
+        commit_source: None,
+        revision: None,
+        requested_automatically: false,
+        analysis_id: None,
+        status: None,
+        requested_by: None,
+        requested_at: None,
+        report: None,
+        error: None,
+    }
+}
+
+/// `GET /api/v1/manifest/:manifest_hash/findings/:finding_key/reachability`
+///
+/// Status for the UI. Proxies the analyser when an analysis exists; an
+/// analyser that is down degrades to "status unavailable" with the stored
+/// handle intact, never a 500 — same convention as every other optional
+/// signal in this codebase. Each successful poll also refreshes the cached
+/// status the findings list shows.
+pub async fn finding_reachability(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Path((manifest_hash, finding_key)): Path<(String, String)>,
+    Query(q): Query<TenantOverrideQuery>,
+) -> Result<Json<ReachabilityJson>, ApiError> {
+    require(&grant, Action::Read, &grant.namespace_scope)?;
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+
+    let Some(client) = state.reach.clone() else {
+        return Ok(Json(reachability_disabled()));
+    };
+
+    let (manifest, finding) =
+        authorized_finding(&state, &grant, tenant_id, cross_tenant, &manifest_hash, &finding_key).await?;
+    let plan = crate::reachability::plan_analysis(&state.db, &manifest, finding)
+        .await
+        .map_err(db_err)?;
+
+    let existing = state
+        .db
+        .latest_finding_reachability(&manifest_hash, &finding_key)
+        .await
+        .map_err(db_err)?;
+
+    let Some(link) = existing else {
+        let (repo_url, subpath, commit, commit_source, revision, blocked_reason) = match plan {
+            Ok(p) => {
+                let (commit, revision) = p.revision.commit_and_ref();
+                let source = Some(p.revision.commit_source().to_string());
+                (Some(p.repo_url), p.subpath, commit, source, revision, None)
+            }
+            Err(reason) => (None, None, None, None, None, Some(reason)),
+        };
+        return Ok(Json(ReachabilityJson {
+            enabled: true,
+            blocked_reason,
+            repo_url,
+            subpath,
+            commit,
+            commit_source,
+            revision,
+            requested_automatically: false,
+            analysis_id: None,
+            status: None,
+            requested_by: None,
+            requested_at: None,
+            report: None,
+            error: None,
+        }));
+    };
+
+    // The analyser being unreachable is a degradation, not an error: the
+    // request that queued this analysis still happened, and the UI should say
+    // so rather than pretend the analysis never existed.
+    // The archived copy, written the first time this analysis was seen in a
+    // terminal state. It is what makes the two degraded branches below still
+    // able to show evidence rather than only apologise.
+    let archived = link.report_json.clone();
+
+    let (status, report, error) = match client.get_analysis(link.analysis_id).await {
+        Ok(view) => {
+            let priority = crate::reachability::report_priority(&view);
+            let to_archive = crate::reachability::archivable_report(&view);
+            // Write when anything is new *or* when there is a report to
+            // archive and we have not archived one yet — otherwise a status
+            // that never changes (the analysis was already `completed` before
+            // this column existed) would never get its report stored.
+            if link.status.as_deref() != Some(view.status.as_str())
+                || link.priority != priority
+                || (to_archive.is_some() && archived.is_none())
+            {
+                crate::reachability::cache_status(
+                    &state.db,
+                    link.analysis_id,
+                    &view.status,
+                    priority.as_deref(),
+                    to_archive,
+                )
+                .await;
+            }
+            (Some(view.status), view.report.or(archived), view.error)
+        }
+        Err(magnolia_reachability::ReachError::NotFound) => {
+            crate::reachability::cache_status(&state.db, link.analysis_id, "missing", None, None).await;
+            let error = if archived.is_some() {
+                // The evidence survives AISE-side, so say that rather than
+                // sending the analyst off to spend the inference again.
+                "The analyser no longer has this analysis — its database may have been reset. \
+                 The report below is AISE's archived copy; re-run to analyse the current code."
+            } else {
+                "The analyser no longer has this analysis — its database may have been reset. \
+                 Run the analysis again."
+            };
+            (Some("missing".to_string()), archived, Some(error.to_string()))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, analysis_id = %link.analysis_id, "could not poll the reachability analyser");
+            let error = if archived.is_some() {
+                "The reachability analyser could not be reached just now — showing AISE's \
+                 archived copy of this report."
+            } else {
+                "The reachability analyser could not be reached just now."
+            };
+            (Some("unavailable".to_string()), archived, Some(error.to_string()))
+        }
+    };
+
+    Ok(Json(ReachabilityJson {
+        enabled: true,
+        // A re-run can still be blocked (the mapping was removed since).
+        blocked_reason: plan.err(),
+        repo_url: Some(link.repo_url),
+        subpath: link.subpath,
+        commit: Some(link.commit_sha),
+        commit_source: Some(link.commit_source),
+        revision: link.requested_ref,
+        requested_automatically: link.requested_by == crate::reachability::AUTO_PRINCIPAL,
+        analysis_id: Some(link.analysis_id),
+        status,
+        requested_by: Some(link.requested_by),
+        requested_at: Some(link.created_at.to_rfc3339()),
+        report,
+        error,
+    }))
+}
+
+/// Query parameters for queueing an analysis.
+#[derive(serde::Deserialize)]
+pub struct RequestReachabilityQuery {
+    #[serde(default)]
+    pub tenant_id: Option<uuid::Uuid>,
+    /// Queue a fresh analysis even though one is already in flight for this
+    /// finding. Off by default — see the handler's doc comment.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// `POST /api/v1/manifest/:manifest_hash/findings/:finding_key/reachability`
+///
+/// Queues an analysis. `Action::Annotate`: this is per-finding investigative
+/// work, the same permission tier as triaging one — it spends analyser
+/// capacity but changes no tenant configuration and no triage state.
+///
+/// Refuses with `409` while an analysis for the same finding is still
+/// `queued` or `running`, unless `?force=true`. The analyser processes one job
+/// at a time and each is minutes of inference, so a duplicate is not a
+/// harmless no-op: it takes the worker away from other findings for no new
+/// information. The UI already disables the button while an analysis is
+/// pending, but that is a client-side courtesy — a second tab, a stale page,
+/// or a direct API call all reach here, and the background loop's own
+/// concurrency budget does not cover this path.
+pub async fn request_finding_reachability(
+    State(state): State<AppState>,
+    grant: AuthGrant,
+    Path((manifest_hash, finding_key)): Path<(String, String)>,
+    Query(q): Query<RequestReachabilityQuery>,
+) -> Result<Json<ReachabilityJson>, ApiError> {
+    require(&grant, Action::Annotate, &grant.namespace_scope)?;
+    let (tenant_id, cross_tenant) = effective_tenant(&grant, q.tenant_id)?;
+
+    let client = state.reach.clone().ok_or_else(|| {
+        ApiError::BadRequest(
+            "This deployment has no reachability analyser configured.".to_string(),
+        )
+    })?;
+
+    let (manifest, finding) =
+        authorized_finding(&state, &grant, tenant_id, cross_tenant, &manifest_hash, &finding_key).await?;
+
+    // Checked after authorization, so an unauthorized caller learns nothing
+    // about whether an analysis exists.
+    if !q.force {
+        if let Some(existing) =
+            state.db.latest_finding_reachability(&manifest_hash, &finding_key).await.map_err(db_err)?
+        {
+            if matches!(existing.status.as_deref(), Some("queued") | Some("running")) {
+                return Err(ApiError::Conflict(format!(
+                    "An analysis for this finding is already {} (analysis {}). Wait for it to \
+                     finish, or re-send with ?force=true to queue another anyway.",
+                    existing.status.as_deref().unwrap_or("in flight"),
+                    existing.analysis_id
+                )));
+            }
+        }
+    }
+
+    let plan = crate::reachability::plan_analysis(&state.db, &manifest, finding)
+        .await
+        .map_err(db_err)?
+        .map_err(ApiError::BadRequest)?;
+
+    let link = crate::reachability::queue_analysis(
+        &state.db,
+        &client,
+        &manifest_hash,
+        &plan,
+        &grant.principal(),
+    )
+    .await
+    .map_err(|e| match e {
+        crate::reachability::QueueError::Unavailable => ApiError::InternalError(
+            "The reachability analyser could not be reached.".to_string(),
+        ),
+        crate::reachability::QueueError::Rejected(reason) => {
+            ApiError::BadRequest(format!("The analyser rejected the request: {reason}"))
+        }
+        crate::reachability::QueueError::Failed(reason) => {
+            tracing::warn!(%reason, "reachability analysis failed to queue");
+            ApiError::InternalError("The reachability analyser failed.".to_string())
+        }
+        crate::reachability::QueueError::Db(e) => db_err(e),
+    })?;
+
+    let _ = record_audit(
+        &state,
+        &grant,
+        "reachability_requested",
+        &format!("{manifest_hash}:{finding_key}"),
+        true,
+        Some(format!(
+            "analysis_id={}; vuln={}; commit={}; commit_source={}{}",
+            link.analysis_id,
+            plan.finding.vulnerability_id,
+            link.commit_sha,
+            link.commit_source,
+            link.requested_ref.as_deref().map(|r| format!("; ref={r}")).unwrap_or_default(),
+        )),
+    )
+    .await;
+
+    Ok(Json(ReachabilityJson {
+        enabled: true,
+        blocked_reason: None,
+        repo_url: Some(link.repo_url),
+        subpath: link.subpath,
+        commit: Some(link.commit_sha),
+        commit_source: Some(link.commit_source),
+        revision: link.requested_ref,
+        requested_automatically: false,
+        analysis_id: Some(link.analysis_id),
+        status: Some("queued".to_string()),
+        requested_by: Some(link.requested_by),
+        requested_at: Some(link.created_at.to_rfc3339()),
+        report: None,
+        error: None,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_declared_repo_is_the_normal_case_not_an_error() {
+        assert_eq!(parse_declared_source_repo("", "", "").unwrap(), None);
+        assert_eq!(parse_declared_source_repo("  ", "", " ").unwrap(), None);
+    }
+
+    #[test]
+    fn a_declared_repo_is_trimmed_and_empty_parts_become_none() {
+        let d = parse_declared_source_repo(" https://github.com/acme/api ", "services/api/", "")
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.repo_url, "https://github.com/acme/api");
+        assert_eq!(d.subpath.as_deref(), Some("services/api"));
+        assert_eq!(d.revision, None);
+    }
+
+    #[test]
+    fn an_upload_may_not_point_the_analyser_at_a_local_path() {
+        // Allowed in Settings for the offline demo, never from an upload key.
+        assert!(parse_declared_source_repo("/data/fixture", "", "").is_err());
+        assert!(parse_declared_source_repo("git@github.com:acme/api.git", "", "").is_err());
+        assert!(parse_declared_source_repo("https://user:pw@github.com/acme/api", "", "").is_err());
+    }
+
+    #[test]
+    fn subpath_and_revision_go_through_the_settings_validators() {
+        let repo = "https://github.com/acme/api";
+        assert!(parse_declared_source_repo(repo, "../etc", "").is_err());
+        assert!(parse_declared_source_repo(repo, "", "--upload-pack=x").is_err());
+        assert!(parse_declared_source_repo(repo, "", "main").unwrap().is_some());
+    }
+
+    #[test]
+    fn subpath_or_revision_without_a_repo_is_rejected_rather_than_dropped() {
+        assert!(parse_declared_source_repo("", "services/api", "").is_err());
+        assert!(parse_declared_source_repo("", "", "main").is_err());
+    }
 }

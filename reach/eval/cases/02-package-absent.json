@@ -1,0 +1,16 @@
+{
+  "id": "02-package-absent",
+  "category": "nominal",
+  "description": "The affected package is not in the repository at all. Stage A must short-circuit and no inference call may be made - the cost-control property, and on a local model the difference between a two-second and a two-minute answer.",
+  "advisory_text": "fastyaml 2.x is vulnerable to remote code execution via `unsafeLoad`.",
+  "osv_id": "GHSA-TEST-0001",
+  "package_name": "fastyaml",
+  "ecosystem": "npm",
+  "fixture": "clean-app",
+  "expect": {
+    "priority_in": [
+      "no_package_evidence"
+    ],
+    "max_inference_calls": 0
+  }
+}

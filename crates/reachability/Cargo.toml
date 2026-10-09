@@ -1,0 +1,16 @@
+[package]
+name = "magnolia-reachability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+wiremock = "0.6"

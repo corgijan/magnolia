@@ -1,4 +1,10 @@
 [workspace]
+# `reach/` is deliberately absent: the CVE-reachability analyser is a
+# standalone Cargo project with its own lockfile, built and tested from
+# inside its own directory. Excluding it here keeps `cargo test --workspace`
+# scoped to AISE itself and stops cargo treating the nested package as a
+# stray workspace member.
+exclude = ["reach"]
 members = [
     "crates/api",
     "crates/core",
@@ -10,12 +16,14 @@ members = [
     "crates/dtrack",
     "crates/osv",
     "crates/depsdev",
+    "crates/reachability",
 ]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 axum = { version = "0.7", features = ["multipart"] }

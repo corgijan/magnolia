@@ -10,7 +10,9 @@
 tenant_url=https://magnolia.corgijan.dev
 tenant_domain=test
 namespace=/test
-sbom=mal_sbom.json
+sbom=sbom_test.json
 format=cyclonedx
-
-
+# Optional — where this namespace's code lives, for CVE-reachability analysis.
+# source_repo=https://github.com/acme/api
+# source_subpath=services/api
+# source_revision=main

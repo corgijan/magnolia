@@ -80,6 +80,19 @@ services:
       DTRACK_URL: http://dependency-track:8080
       DTRACK_API_KEY: "${DTRACK_API_KEY:-}"
       DTRACK_SYNC_INTERVAL_SECS: "${DTRACK_SYNC_INTERVAL_SECS:-600}"
+      # Optional CVE-reachability analyser (the `reach` service below).
+      # Presence-gated exactly like DTRACK_URL/DTRACK_API_KEY: both must be
+      # set and non-empty, or the "Analyze reachability" button stays
+      # disabled and nothing else changes. The default token matches the
+      # `reach` service's own default so a plain `docker compose up` is
+      # wired end to end; override both in a local `.env` for anything
+      # reachable from another machine.
+      AISE_REACH_BASE_URL: "${AISE_REACH_BASE_URL:-http://reach:3100}"
+      AISE_REACH_TOKEN: "${REACH_API_TOKEN:-dev-reach-token}"
+      # Background analysis for namespaces opted in with auto_analyze. Empty
+      # values fall back to the built-in defaults (120 s, 2 in flight).
+      REACHABILITY_AUTO_INTERVAL_SECS: "${REACHABILITY_AUTO_INTERVAL_SECS:-}"
+      REACHABILITY_AUTO_MAX_IN_FLIGHT: "${REACHABILITY_AUTO_MAX_IN_FLIGHT:-}"
     ports:
       - "${API_PORT:-3000}:3000"
     volumes:
@@ -168,8 +181,105 @@ services:
     # mapping temporarily: `127.0.0.1:8080:8080` (never `8080:8080` alone
     # on an internet-facing host).
 
+  # ---- CVE reachability evidence analyser ----
+  # A standalone service (own Cargo project in `reach/`, own SQLite file,
+  # own image) that AISE talks to over REST only. It is started by a plain
+  # `docker compose up` because the AISE side degrades gracefully when it is
+  # absent, but it does nothing until an analysis is requested.
+  #
+  # No `ports:` mapping: like `db` and `dependency-track`, this is reachable
+  # only from other containers on the compose network. Add a loopback-only
+  # mapping (`127.0.0.1:3100:3100`) if you want to poke at /docs by hand.
+  reach:
+    build:
+      context: ./reach
+      dockerfile: Dockerfile
+    # `reach` refuses to bind a port unless a real test completion succeeds
+    # against REACH_AI_BASE_URL (see reach/src/main.rs) — so an inference
+    # server that is merely slow to come up, rather than genuinely
+    # misconfigured, used to leave a permanently dead container behind: the
+    # exit happens before the listener exists, so the Dockerfile's
+    # HEALTHCHECK --start-period never gets a chance to cover it. Restarting
+    # turns "started before ollama was warm" into a retry instead of a
+    # broken deployment. A genuinely wrong REACH_AI_* still fails, visibly
+    # and repeatedly, in the log.
+    restart: unless-stopped
+    depends_on:
+      # Only meaningful when the `ollama` profile is active; compose ignores
+      # a dependency on a service that is not being started, so this stays
+      # correct for a hosted REACH_AI_BASE_URL too.
+      ollama:
+        condition: service_healthy
+        required: false
+    environment:
+      REACH_SERVER_ADDR: 0.0.0.0:3100
+      REACH_DB_PATH: /data/reach.db
+      REACH_CACHE_DIR: /cache
+      REACH_CACHE_MB: "${REACH_CACHE_MB:-2048}"
+      # Has a dev default, unlike AISE's BOOTSTRAP_SUPER_ADMIN_KEY: this
+      # token guards an analyser that holds no tenant data and no
+      # credentials, and the service publishes no host port, so a
+      # fail-closed default would only mean a broken button on every fresh
+      # checkout. Override it in `.env` before exposing this anywhere.
+      REACH_API_TOKEN: "${REACH_API_TOKEN:-dev-reach-token}"
+      # Points at the `ollama` service below by default, so
+      # `docker compose --profile ollama up` is a working local-model
+      # deployment with no further configuration. Override to use a hosted
+      # OpenAI-compatible endpoint during development.
+      REACH_AI_BASE_URL: "${REACH_AI_BASE_URL:-http://ollama:11434}"
+      REACH_AI_MODEL: "${REACH_AI_MODEL:-gemma3:4b}"
+      REACH_AI_API_KEY: "${REACH_AI_API_KEY:-}"
+      REACH_AI_TIMEOUT_SECS: "${REACH_AI_TIMEOUT_SECS:-120}"
+      REACH_AI_MAX_TOKENS: "${REACH_AI_MAX_TOKENS:-1024}"
+      REACH_AI_TEMPERATURE: "${REACH_AI_TEMPERATURE:-0}"
+      REACH_GIT_TOKEN: "${REACH_GIT_TOKEN:-}"
+      REACH_MAX_REPO_MB: "${REACH_MAX_REPO_MB:-512}"
+      REACH_MAX_SITES: "${REACH_MAX_SITES:-50}"
+      REACH_MAX_SCORED_SITES: "${REACH_MAX_SCORED_SITES:-5}"
+      # Canned reports, no inference check at startup — for exercising the
+      # UI without a model. See reach/README.md.
+      REACH_TEST_MODE: "${REACH_TEST_MODE:-}"
+      RUST_LOG: "${REACH_LOG:-info}"
+    volumes:
+      - reach_data:/data
+      - reach_cache:/cache
+      # Offline demo source repository (scripts/demo-repo.sh builds it from
+      # demo/shop-api). Read-only: reach never writes to a source repo.
+      - ./demo/.repos:/demo-repos:ro
+
+  # ---- Optional local inference server (docker compose --profile ollama up) ----
+  # The submission target: an OpenAI-compatible endpoint serving a local
+  # Gemma-class model, with no hosted API involved. Opt-in because the model
+  # weights are a multi-gigabyte download and a development run may prefer a
+  # hosted endpoint.
+  #
+  # First run needs the model pulled once into the named volume:
+  #   docker compose --profile ollama up -d ollama
+  #   docker compose exec ollama ollama pull gemma3:4b
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["ollama"]
+    volumes:
+      - ollama_models:/root/.ollama
+    # `reach` depends on this being *healthy*, not merely started: its
+    # startup check is a real generation, and a cold ollama answers the port
+    # before it can answer a completion. `ollama list` is the cheapest call
+    # that proves the server is actually serving.
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    # No `ports:` — `reach` reaches it over the compose network by service
+    # name. An inference server with no authentication of its own must not
+    # be published to the host, let alone the internet.
+
 volumes:
   db_data:
   signing_key:
   dtrack_db_data:
   dtrack_data:
+  reach_data:
+  reach_cache:
+  ollama_models:

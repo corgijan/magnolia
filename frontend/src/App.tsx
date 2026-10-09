@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import {
   api,
   AffectedManifest,
@@ -42,6 +42,9 @@ import {
   VerifyCheck,
   VerifyResult,
   VexImportResult,
+  NamespaceRepo,
+  Reachability,
+  ReachabilitySite,
   VulnerabilityFinding,
   WEBHOOK_EVENT_TYPES,
   CreateWebhookResult,
@@ -455,6 +458,17 @@ function Dashboard({
           <div className="kv-row">
             <span className="kv-label" title="OpenSSF Scorecard, via deps.dev">Package reputation</span>
             <Badge ok={config.reputation_enabled}>{config.reputation_enabled ? 'enabled' : 'disabled'}</Badge>
+          </div>
+          <div className="kv-row">
+            <span className="kv-label" title="The reach analyser service">CVE reachability evidence</span>
+            <Badge ok={config.reachability_enabled}>
+              {config.reachability_enabled ? 'enabled' : 'disabled'}
+            </Badge>
+            <span className="muted">
+              {config.reachability_enabled
+                ? ' — analyser configured; per-finding analysis from the Findings view'
+                : ' — no analyser configured (AISE_REACH_BASE_URL / AISE_REACH_TOKEN)'}
+            </span>
           </div>
           <div className="kv-row">
             <span className="kv-label">DEV_MODE</span>
@@ -2864,6 +2878,809 @@ function FindingTriageControls({
   );
 }
 
+// Where each namespace's OWN source lives — the input CVE-reachability
+// analysis needs and cannot infer. Deliberately explicit: an SBOM component
+// carries its dependency's repository URL, which is precisely the wrong tree
+// to scan when asking whether *this application* references a vulnerable
+// symbol.
+// Mirrors the backend's MAGNOLIAFILE_PRINCIPAL_PREFIX: a mapping whose
+// created_by starts with this came from an upload, not from this page.
+const MAGNOLIAFILE_PRINCIPAL_PREFIX = 'magnoliafile:';
+
+function SourceRepoSettings({ tenantId }: { tenantId?: string }) {
+  const [repos, setRepos] = useState<NamespaceRepo[] | null>(null);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [namespace, setNamespace] = useState('');
+  const [repoUrl, setRepoUrl] = useState('');
+  const [subpath, setSubpath] = useState('');
+  const [revision, setRevision] = useState('');
+  const [autoAnalyze, setAutoAnalyze] = useState(false);
+  const [ignoreSourceCommit, setIgnoreSourceCommit] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      setRepos(await api.listNamespaceRepos(tenantId));
+      setError('');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, [tenantId]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const resetForm = () => {
+    setNamespace('');
+    setRepoUrl('');
+    setSubpath('');
+    setRevision('');
+    setAutoAnalyze(false);
+    setIgnoreSourceCommit(false);
+  };
+
+  const edit = (r: NamespaceRepo) => {
+    setNamespace(r.namespace);
+    setRepoUrl(r.repo_url);
+    setSubpath(r.subpath ?? '');
+    setRevision(r.revision ?? '');
+    setAutoAnalyze(r.auto_analyze);
+    setIgnoreSourceCommit(r.ignore_source_commit);
+  };
+
+  const save = async () => {
+    if (!namespace.trim() || !repoUrl.trim()) return;
+    setBusy(true);
+    setError('');
+    try {
+      await api.setNamespaceRepo(
+        {
+          namespace: namespace.trim(),
+          repoUrl: repoUrl.trim(),
+          subpath: subpath.trim() || undefined,
+          revision: revision.trim() || undefined,
+          autoAnalyze,
+          ignoreSourceCommit,
+        },
+        tenantId
+      );
+      resetForm();
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async (ns: string) => {
+    setBusy(true);
+    setError('');
+    try {
+      await api.deleteNamespaceRepo(ns, tenantId);
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const editing = repos?.some((r) => r.namespace === namespace.trim()) ?? false;
+
+  return (
+    <div className="card">
+      <div className="card-header">
+        <h2>Source repositories</h2>
+      </div>
+      <p className="muted">
+        Maps each namespace to the repository its SBOMs are built from, so reachability analysis can
+        show where an advisory's vulnerable symbols are referenced. The analysis scans the exact commit
+        recorded on the SBOM (sent by the upload CLI as <code>git rev-parse HEAD</code>). For SBOMs
+        uploaded without one, set a <strong>revision</strong> — a branch, tag or commit. It is
+        resolved to an exact commit when the analysis starts, and the finding says so, because a
+        branch head may not be the code that SBOM was built from.
+      </p>
+      <p className="muted">
+        With <strong>analyse automatically</strong> on, new untriaged findings on the namespace's
+        current release are analysed in the background, most severe first, so the evidence is ready
+        when you open the finding. It never triages anything. Use an <code>https://</code> URL
+        without credentials; a token for private repositories is configured on the analyser (
+        <code>REACH_GIT_TOKEN</code>).
+      </p>
+      <p className="muted">
+        A mapping can also come from the repository itself: <code>source_repo=</code> (plus optional{' '}
+        <code>source_subpath=</code> and <code>source_revision=</code>) in its <code>Magnoliafile</code> is
+        recorded on upload. One saved here always takes precedence — editing a Magnoliafile mapping here
+        makes it yours, and later uploads leave it alone.
+      </p>
+      {error && <ErrorBox message={error} />}
+      {repos === null && !error && <Spinner label="Loading source repositories…" />}
+      {repos !== null && repos.length === 0 && (
+        <div className="muted">No namespaces are mapped to a repository yet.</div>
+      )}
+      {repos !== null && repos.length > 0 && (
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Namespace</th>
+              <th>Repository</th>
+              <th>Subpath</th>
+              <th>Revision</th>
+              <th>Automatic</th>
+              <th>Set by</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {repos.map((r) => (
+              <tr key={r.namespace}>
+                <td>
+                  <code>{r.namespace}</code>
+                </td>
+                <td>
+                  {repoWebBase(r.repo_url) ? (
+                    <a href={repoWebBase(r.repo_url)!} target="_blank" rel="noreferrer">
+                      {r.repo_url}
+                    </a>
+                  ) : (
+                    r.repo_url
+                  )}
+                </td>
+                <td>{r.subpath || <span className="muted">—</span>}</td>
+                <td>
+                  {r.revision ? (
+                    <>
+                      <code>{r.revision}</code>
+                      {r.ignore_source_commit && (
+                        <>
+                          {' '}
+                          <span
+                            className="badge badge-warn badge-compact"
+                            title="Testing override: analysed even when the SBOM recorded its own commit"
+                          >
+                            overrides SBOM commit
+                          </span>
+                        </>
+                      )}
+                    </>
+                  ) : (
+                    <span className="muted" title="SBOMs without a recorded commit cannot be analysed">
+                      —
+                    </span>
+                  )}
+                </td>
+                <td>{r.auto_analyze ? <Badge ok>on</Badge> : <span className="muted">off</span>}</td>
+                <td className="muted">
+                  {r.created_by.startsWith(MAGNOLIAFILE_PRINCIPAL_PREFIX) ? (
+                    <span title={`Recorded by an upload (${r.created_by.slice(MAGNOLIAFILE_PRINCIPAL_PREFIX.length)})`}>
+                      Magnoliafile
+                    </span>
+                  ) : (
+                    shortPrincipal(r.created_by)
+                  )}{' '}
+                  · {new Date(r.updated_at).toLocaleDateString()}
+                </td>
+                <td>
+                  <span className="cell-actions">
+                    <button className="btn" disabled={busy} onClick={() => edit(r)}>
+                      Edit
+                    </button>
+                    <button className="btn" disabled={busy} onClick={() => remove(r.namespace)}>
+                      Remove
+                    </button>
+                  </span>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      <div className="form-row" style={{ marginTop: 10, alignItems: 'flex-end' }}>
+        <label className="field" style={{ flex: '0 1 200px', minWidth: 160, marginBottom: 0 }}>
+          <span>Namespace</span>
+          <input
+            value={namespace}
+            onChange={(e) => setNamespace(e.target.value)}
+            placeholder="/product/api"
+            disabled={busy}
+          />
+        </label>
+        <label className="field" style={{ flex: '1 1 300px', minWidth: 240, marginBottom: 0 }}>
+          <span>Repository URL</span>
+          <input
+            value={repoUrl}
+            onChange={(e) => setRepoUrl(e.target.value)}
+            placeholder="https://github.com/acme/api"
+            disabled={busy}
+          />
+        </label>
+        <label className="field" style={{ flex: '0 1 180px', minWidth: 140, marginBottom: 0 }}>
+          <span>Subpath (optional)</span>
+          <input
+            value={subpath}
+            onChange={(e) => setSubpath(e.target.value)}
+            placeholder="services/api"
+            disabled={busy}
+          />
+        </label>
+        <label
+          className="field"
+          style={{ flex: '0 1 160px', minWidth: 120, marginBottom: 0 }}
+          title="Used only for SBOMs uploaded without a source commit. Resolved to an exact commit when an analysis starts."
+        >
+          <span>Revision (optional)</span>
+          <input
+            value={revision}
+            onChange={(e) => setRevision(e.target.value)}
+            placeholder="main"
+            disabled={busy}
+          />
+        </label>
+      </div>
+      <div className="form-row" style={{ marginTop: 8, alignItems: 'center' }}>
+        <label
+          className="checkbox-field"
+          title="Each analysis takes several model calls — minutes on a local model. Only the current release's untriaged findings are analysed, a few at a time."
+        >
+          <input
+            type="checkbox"
+            checked={autoAnalyze}
+            onChange={(e) => setAutoAnalyze(e.target.checked)}
+            disabled={busy}
+          />
+          Analyse new findings automatically
+        </label>
+        <label
+          className="checkbox-field"
+          title="Normally the commit recorded on the SBOM always wins. With this on, the revision above is analysed instead — for testing, or when the recorded commit is not in this repository. Results are labelled as an override."
+        >
+          <input
+            type="checkbox"
+            checked={ignoreSourceCommit}
+            onChange={(e) => setIgnoreSourceCommit(e.target.checked)}
+            disabled={busy}
+          />
+          <span>
+            Ignore the SBOM's recorded commit (testing)
+            <span className="muted" style={{ display: 'block', fontSize: 11 }}>
+              {revision.trim() ? (
+                <>
+                  always analyse <code>{revision.trim()}</code> instead
+                </>
+              ) : (
+                'needs a revision'
+              )}
+            </span>
+          </span>
+        </label>
+        <button
+          className="btn"
+          disabled={busy || !namespace.trim() || !repoUrl.trim() || (ignoreSourceCommit && !revision.trim())}
+          onClick={save}
+        >
+          {busy ? 'Saving…' : editing ? 'Update mapping' : 'Save mapping'}
+        </button>
+        {(namespace || repoUrl || subpath || revision) && (
+          <button className="btn" disabled={busy} onClick={resetForm}>
+            Clear
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------- CVE reachability evidence ----------
+// A button on a finding, plus a "review help" rendering of the analyser's
+// report: what the advisory says, what to confirm, and where in the code to
+// look — ordered so triage can start at the most useful line.
+//
+// The framing is not cosmetic and must survive any restyling of this
+// component. The analyser produces EVIDENCE for a human, never a verdict, so
+// nothing here offers to triage a finding from a report, and the priority
+// label is rendered as a name with its trace next to it — never as a
+// percentage or a score, because it is not one. Every "things to confirm"
+// line is fixed text chosen by which rules fired, not model output.
+
+/** How often to re-poll while an analysis is queued or running. */
+const REACHABILITY_POLL_MS = 3000;
+
+/** Ordinal priority labels, worst-to-best as a human should read them. */
+const REACHABILITY_LABELS: Record<string, { text: string; tone: 'high' | 'mid' | 'low' }> = {
+  direct_references: { text: 'Direct references found', tone: 'high' },
+  references_unclear: { text: 'References need review', tone: 'mid' },
+  references_likely_irrelevant: { text: 'References look like false matches', tone: 'low' },
+  package_present_only: { text: 'Package present, no symbol references', tone: 'low' },
+  no_package_evidence: { text: 'No trace of the package', tone: 'low' },
+  inconclusive: { text: 'Inconclusive', tone: 'mid' },
+};
+
+const SITE_LABELS: Record<string, string> = {
+  likely_relevant: 'likely relevant',
+  unclear: 'unclear',
+  likely_irrelevant: 'likely irrelevant',
+};
+
+/** Review order: real references first, false matches last. */
+const SITE_ORDER: Record<string, number> = { likely_relevant: 0, unclear: 1, unlabelled: 2, likely_irrelevant: 3 };
+
+/** What to double-check for each outcome — the known blind spots of a
+ * lexical search, stated so an empty result is not read as "not affected". */
+const REVIEW_LIMITATIONS: Record<string, string[]> = {
+  direct_references: [
+    'Check whether data reaching these call sites can be controlled by an attacker.',
+  ],
+  references_unclear: [
+    'Read the unclassified call sites — the model could not tell from the snippet whether they use the vulnerable API.',
+  ],
+  references_likely_irrelevant: [
+    'Skim the false matches: a label is a model reading of a snippet, not a proof.',
+    'The search is lexical — aliased imports, re-exports and dynamic calls are not found.',
+  ],
+  package_present_only: [
+    'The search is lexical — aliased imports, re-exports, wrappers and dynamic calls are not found.',
+    'A framework or another dependency may call the vulnerable code on your behalf.',
+  ],
+  no_package_evidence: [
+    'A lock file format the scanner does not read, or a vendored copy, would look the same as "absent".',
+    'Confirm the SBOM and the scanned revision describe the same build.',
+  ],
+  inconclusive: ['Too little of the analysis ran to rely on it — see how this was determined, then re-run.'],
+};
+
+/** Web base URL for a repository hosted on a common forge, or null for a
+ * local path or an unknown host. */
+function repoWebBase(repoUrl: string | null | undefined): string | null {
+  if (!repoUrl || !repoUrl.startsWith('https://')) return null;
+  return repoUrl.replace(/\.git$/, '').replace(/\/+$/, '');
+}
+
+/** Deep link to a file line at an exact commit, for hosts whose URL scheme
+ * is known. null means "render as plain text" — never a guessed URL. */
+function sourceLineUrl(
+  repoUrl: string | null,
+  commit: string | null,
+  subpath: string | null,
+  path: string,
+  line?: number
+): string | null {
+  const base = repoWebBase(repoUrl);
+  if (!base || !commit) return null;
+  const host = new URL(base).host;
+  const file = [subpath?.replace(/^\/+|\/+$/g, ''), path].filter(Boolean).join('/');
+  if (host === 'github.com') return `${base}/blob/${commit}/${file}${line ? `#L${line}` : ''}`;
+  if (host.includes('gitlab')) return `${base}/-/blob/${commit}/${file}${line ? `#L${line}` : ''}`;
+  if (host === 'bitbucket.org') return `${base}/src/${commit}/${file}${line ? `#lines-${line}` : ''}`;
+  if (host === 'codeberg.org' || host.includes('gitea') || host.includes('forgejo'))
+    return `${base}/src/commit/${commit}/${file}${line ? `#L${line}` : ''}`;
+  return null;
+}
+
+function commitUrl(repoUrl: string | null, commit: string | null): string | null {
+  const base = repoWebBase(repoUrl);
+  if (!base || !commit) return null;
+  const host = new URL(base).host;
+  if (host === 'github.com' || host === 'codeberg.org') return `${base}/commit/${commit}`;
+  if (host.includes('gitlab')) return `${base}/-/commit/${commit}`;
+  if (host === 'bitbucket.org') return `${base}/commits/${commit}`;
+  return null;
+}
+
+/** Compact badge for a findings-list row. */
+function ReachabilityBadge({
+  status,
+  priority,
+  compact = false,
+}: {
+  status: string | null;
+  priority: string | null;
+  /** List rows: drop the "evidence:" prefix and keep to one line. */
+  compact?: boolean;
+}) {
+  if (!status) return null;
+  const prefix = compact ? '' : 'evidence: ';
+  const extra = compact ? ' badge-compact' : '';
+  if (status === 'queued' || status === 'running') {
+    return (
+      <span className={`badge badge-warn${extra}`} title="Reachability evidence">
+        {prefix}analysing…
+      </span>
+    );
+  }
+  if (status === 'completed' && priority) {
+    const label = REACHABILITY_LABELS[priority];
+    const cls = label?.tone === 'high' ? 'badge-err' : label?.tone === 'mid' ? 'badge-warn' : 'badge-ok';
+    return (
+      <span
+        className={`badge ${cls}${extra}`}
+        title="Reachability evidence is ready — open the finding's Reachability tab."
+      >
+        {prefix}
+        {label?.text ?? priority}
+      </span>
+    );
+  }
+  if (status === 'failed' || status === 'missing') {
+    return <span className="muted">{compact ? `analysis ${status}` : `evidence: analysis ${status}`}</span>;
+  }
+  return null;
+}
+
+function ReachabilitySiteItem({
+  site,
+  state,
+}: {
+  site: ReachabilitySite;
+  state: Reachability;
+}) {
+  const url = sourceLineUrl(state.repo_url, state.commit, state.subpath, site.path, site.line);
+  return (
+    <li>
+      <span className="muted">
+        {url ? (
+          <a href={url} target="_blank" rel="noreferrer">
+            {site.path}:{site.line}
+          </a>
+        ) : (
+          `${site.path}:${site.line}`
+        )}{' '}
+        · <code>{site.term}</code> · {site.label ? SITE_LABELS[site.label] ?? site.label : 'not classified'}
+        {site.label && !site.citation_verified ? ' · citation unverified' : ''}
+      </span>
+      {site.reasoning && <div>{site.reasoning}</div>}
+      <pre className="snippet">{site.snippet}</pre>
+    </li>
+  );
+}
+
+function ReachabilityPanel({
+  manifestHash,
+  findingKey,
+  tenantId,
+  componentName,
+  componentVersion,
+  onStatusChange,
+}: {
+  manifestHash: string;
+  findingKey: string;
+  tenantId?: string;
+  componentName?: string;
+  componentVersion?: string | null;
+  /** Called whenever the analysis status or priority changes (started,
+   * finished, failed), so a list showing a cached badge for this finding
+   * can update without a reload. */
+  onStatusChange?: (status: string | null, priority: string | null) => void;
+}) {
+  const [state, setState] = useState<Reachability | null>(null);
+  const [busy, setBusy] = useState(true);
+  const [starting, setStarting] = useState(false);
+  const [error, setError] = useState('');
+  const [showDetail, setShowDetail] = useState(false);
+  const [showIrrelevant, setShowIrrelevant] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      setState(await api.findingReachability(manifestHash, findingKey, tenantId));
+      setError('');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [manifestHash, findingKey, tenantId]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  // Poll only while there is something to wait for. An analysis against a
+  // local model can take minutes, so this must not depend on the user
+  // keeping a modal open — but it must also stop the moment it is done,
+  // rather than sitting on an interval forever.
+  const pending = state?.status === 'queued' || state?.status === 'running';
+  const status = state?.status ?? null;
+  const priority = state?.report?.priority ?? null;
+  // A ref, so a parent passing a new closure each render doesn't re-fire
+  // this — only a real change of status/priority does.
+  const onStatusChangeRef = useRef(onStatusChange);
+  onStatusChangeRef.current = onStatusChange;
+  useEffect(() => {
+    if (state) onStatusChangeRef.current?.(status, priority);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status, priority]);
+  useEffect(() => {
+    if (!pending) return;
+    const timer = setInterval(load, REACHABILITY_POLL_MS);
+    return () => clearInterval(timer);
+  }, [pending, load]);
+
+  const start = async () => {
+    setStarting(true);
+    setError('');
+    try {
+      setState(await api.requestFindingReachability(manifestHash, findingKey, tenantId));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  if (busy && !state) return <Spinner label="Checking reachability…" />;
+  // The deployment has no analyser configured: say nothing at all rather
+  // than showing an affordance that can only disappoint.
+  if (state && !state.enabled) return null;
+
+  const blocked = state?.blocked_reason ?? null;
+  const report = state?.report ?? null;
+  const label = report ? REACHABILITY_LABELS[report.priority] : undefined;
+  const fromNamespaceRevision = state?.commit_source === 'namespace_revision';
+  const fromRevisionOverride = state?.commit_source === 'revision_override';
+
+  const sites = report
+    ? [...report.sites].sort(
+        (a, b) => (SITE_ORDER[a.label ?? 'unlabelled'] ?? 9) - (SITE_ORDER[b.label ?? 'unlabelled'] ?? 9)
+      )
+    : [];
+  const toReview = sites.filter((s) => s.label !== 'likely_irrelevant');
+  const falseMatches = sites.filter((s) => s.label === 'likely_irrelevant');
+  const troubledStages = report ? report.stages.filter((s) => s.status === 'failed' || s.status === 'degraded') : [];
+  const toConfirm = report
+    ? [...(report.ruleset?.preconditions ?? []).map((p) => `Advisory precondition: ${p}`), ...(REVIEW_LIMITATIONS[report.priority] ?? [])]
+    : [];
+
+  const commitLink = state ? commitUrl(state.repo_url, state.commit) : null;
+  const repoLink = state ? repoWebBase(state.repo_url) : null;
+
+  return (
+    <div>
+      <div className="form-row" style={{ alignItems: 'center' }}>
+        <button
+          className="btn"
+          disabled={starting || !!blocked || pending}
+          onClick={start}
+          title={
+            blocked ??
+            (pending
+              ? 'An analysis is already running for this finding.'
+              : 'Scan the mapped source repository for references to the symbols this advisory names.')
+          }
+        >
+          {starting
+            ? 'Starting…'
+            : pending
+            ? 'Analyzing…'
+            : state?.analysis_id
+            ? 'Re-run analysis'
+            : 'Analyze reachability'}
+        </button>
+
+        {/* A disabled button with no explanation is the failure mode this
+            line exists to prevent. */}
+        {blocked && !state?.analysis_id && <span className="muted">{blocked}</span>}
+
+        {state?.repo_url && (
+          <span className="muted">
+            {repoLink ? (
+              <a href={repoLink} target="_blank" rel="noreferrer">
+                {state.repo_url}
+              </a>
+            ) : (
+              state.repo_url
+            )}
+            {state.subpath ? `/${state.subpath}` : ''}
+            {state.commit ? (
+              <>
+                {' @ '}
+                {commitLink ? (
+                  <a href={commitLink} target="_blank" rel="noreferrer">
+                    <code>{state.commit.slice(0, 12)}</code>
+                  </a>
+                ) : (
+                  <code>{state.commit.slice(0, 12)}</code>
+                )}
+              </>
+            ) : state.revision ? (
+              <>
+                {' @ '}
+                <code>{state.revision}</code> (resolved when the analysis starts)
+              </>
+            ) : null}
+            {state.analysis_id && state.requested_automatically ? ' · queued automatically' : ''}
+          </span>
+        )}
+      </div>
+
+      {/* Provenance of the scanned revision. A branch head resolved today is
+          not necessarily what this SBOM was built from; the analyst needs to
+          know which one they are reading. */}
+      {fromRevisionOverride && (
+        <div className="review-warning">
+          Testing override: this SBOM recorded its own commit, but this namespace is set to analyse{' '}
+          <code>{state?.revision}</code> instead
+          {state?.commit ? ' (resolved to the commit above)' : ''}. The scanned code is not necessarily the code
+          this SBOM was built from — Settings → Source repositories.
+        </div>
+      )}
+      {fromNamespaceRevision && (
+        <div className="muted" style={{ marginTop: 4 }}>
+          This SBOM has no recorded source commit, so the namespace revision{' '}
+          <code>{state?.revision}</code>
+          {state?.commit ? ' was resolved to the commit above' : ' will be resolved to a commit'} — it
+          may not be the exact code this SBOM describes.
+        </div>
+      )}
+
+      {error && <ErrorBox message={error} />}
+      {/* Shown alongside a report, not only instead of one: when the analyser
+          is unreachable or has lost the analysis, the backend falls back to
+          AISE's archived copy and says so here. Hiding the message whenever a
+          report exists would present a stale archive as a live result. */}
+      {state?.error && (
+        <div className={report ? 'review-warning' : 'muted'} style={{ marginTop: 4 }}>
+          {state.error}
+        </div>
+      )}
+      {pending && <Spinner label="Analysis running — this can take a few minutes on a local model." />}
+
+      {report && (
+        <div className="review-help">
+          <div className="form-row" style={{ alignItems: 'center' }}>
+            <span
+              className={`badge ${
+                label?.tone === 'high' ? 'badge-err' : label?.tone === 'mid' ? 'badge-warn' : 'badge-ok'
+              }`}
+            >
+              {label?.text ?? report.priority}
+            </span>
+            <span className="muted">{report.priority_description}</span>
+          </div>
+
+          {report.test_mode && (
+            <div className="review-warning">
+              Test mode: this is a canned report from the analyser (REACH_TEST_MODE). No advisory was read and
+              no code was scanned — the occurrence below is a placeholder, not evidence.
+            </div>
+          )}
+
+          {/* Not a probability, and the UI must never let it read as one. */}
+          <div className="muted" style={{ marginTop: 4, fontStyle: 'italic' }}>
+            {report.disclaimer}
+          </div>
+
+          {troubledStages.length > 0 && (
+            <div className="review-warning">
+              Parts of this analysis did not fully run (
+              {troubledStages.map((s) => `${s.stage} ${s.name}: ${s.status}`).join('; ')}), so the evidence below
+              may be incomplete.
+            </div>
+          )}
+
+          <div className="review-section">
+            <h4>What the advisory says</h4>
+            {report.ruleset?.summary ? (
+              <div>{report.ruleset.summary}</div>
+            ) : (
+              <div className="muted">No summary could be extracted from the advisory text.</div>
+            )}
+            <div className="muted" style={{ marginTop: 4 }}>
+              {report.ruleset?.affected_versions && <>Affected versions: {report.ruleset.affected_versions} · </>}
+              {componentName && (
+                <>
+                  In this SBOM: <code>{componentName}{componentVersion ? `@${componentVersion}` : ''}</code>
+                </>
+              )}
+            </div>
+            {report.ruleset && report.ruleset.vulnerable_symbols.length > 0 && (
+              <div className="muted" style={{ marginTop: 4 }}>
+                Searched for:{' '}
+                {report.ruleset.vulnerable_symbols.map((s) => (
+                  <code key={s} className="review-chip">
+                    {s}
+                  </code>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {toConfirm.length > 0 && (
+            <div className="review-section">
+              <h4>Worth confirming before you triage</h4>
+              <ul className="review-list">
+                {toConfirm.map((t, i) => (
+                  <li key={i}>{t}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          <div className="review-section">
+            <h4>Where to look{toReview.length > 0 ? ` (${toReview.length})` : ''}</h4>
+            {toReview.length > 0 ? (
+              <ul className="comment-list">
+                {toReview.map((s, i) => (
+                  <ReachabilitySiteItem key={`${s.path}:${s.line}:${i}`} site={s} state={state!} />
+                ))}
+              </ul>
+            ) : (
+              <div className="muted">
+                {sites.length === 0
+                  ? 'No reference to a vulnerable symbol was found in the scanned revision.'
+                  : 'Every occurrence found was labelled a likely false match.'}
+              </div>
+            )}
+            {falseMatches.length > 0 && (
+              <>
+                <button className="link-button" onClick={() => setShowIrrelevant((v) => !v)}>
+                  {showIrrelevant ? 'Hide' : 'Show'} {falseMatches.length} likely false match
+                  {falseMatches.length === 1 ? '' : 'es'}
+                </button>
+                {showIrrelevant && (
+                  <ul className="comment-list">
+                    {falseMatches.map((s, i) => (
+                      <ReachabilitySiteItem key={`${s.path}:${s.line}:f${i}`} site={s} state={state!} />
+                    ))}
+                  </ul>
+                )}
+              </>
+            )}
+          </div>
+
+          {report.package_evidence.length > 0 && (
+            <div className="review-section">
+              <h4>Package evidence</h4>
+              <ul className="review-list">
+                {report.package_evidence.map((e, i) => (
+                  <li key={i}>{e}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          <button className="btn" style={{ marginTop: 6 }} onClick={() => setShowDetail((v) => !v)}>
+            {showDetail ? 'Hide how this was determined' : 'How was this determined?'}
+          </button>
+
+          {showDetail && (
+            <div style={{ marginTop: 6 }}>
+              {/* The audit trail: which deterministic rules fired, and what
+                  each pipeline stage actually managed to do. A degraded run
+                  looks different from a clean one, and the reader can see
+                  which they are looking at. */}
+              <div className="muted">Rules that fired:</div>
+              <ul className="comment-list">
+                {report.rubric_trace.map((t, i) => (
+                  <li key={i}>{t}</li>
+                ))}
+              </ul>
+              <div className="muted">Pipeline stages:</div>
+              <ul className="comment-list">
+                {report.stages.map((st) => (
+                  <li key={st.stage}>
+                    <span className="muted">
+                      {st.stage} · {st.name} · {st.status} · {st.duration_ms} ms
+                    </span>
+                    <div>{st.detail}</div>
+                  </li>
+                ))}
+              </ul>
+              {state?.requested_by && (
+                <div className="muted">
+                  Requested by{' '}
+                  {state.requested_automatically ? 'background analysis' : shortPrincipal(state.requested_by)}
+                  {state.requested_at ? ` on ${new Date(state.requested_at).toLocaleString()}` : ''}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // A finding's discussion thread — loaded lazily (only once its parent row
 // is expanded) since most findings in a long list are never opened.
 // `author` always comes back as the calling API key's principal (see the
@@ -2917,8 +3734,7 @@ function FindingComments({
   };
 
   return (
-    <div style={{ marginTop: 10 }}>
-      <strong>Comments</strong>
+    <div>
       {busy && <Spinner label="Loading comments…" />}
       {error && <ErrorBox message={error} />}
       {comments && comments.length === 0 && <div className="muted">No comments yet.</div>}
@@ -3899,6 +4715,166 @@ function ComponentSearch({ onViewManifest }: { onViewManifest: (hash: string) =>
 const SEVERITY_OPTIONS = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO', 'UNASSIGNED'];
 const FINDINGS_PAGE_SIZE = 50;
 
+type FindingDetailTab = 'overview' | 'reachability' | 'triage';
+
+// One finding, split by what the reader is doing: understanding it
+// (Overview), checking whether the code is exposed (Reachability), or
+// recording a decision (Triage). Evidence and decision live on separate
+// tabs on purpose — the report is input to triage, never the verdict.
+function FindingDetail({
+  finding,
+  tenantId,
+  tab,
+  onTabChange,
+  onSaved,
+  onReachabilityChange,
+  onViewManifest,
+  onShowAffected,
+}: {
+  finding: FindingWithContext;
+  tenantId?: string;
+  tab: FindingDetailTab;
+  onTabChange: (tab: FindingDetailTab) => void;
+  onSaved: () => void;
+  onReachabilityChange: (status: string | null, priority: string | null) => void;
+  onViewManifest: (hash: string) => void;
+  onShowAffected: (vulnId: string) => void;
+}) {
+  const tabs: { id: FindingDetailTab; label: React.ReactNode }[] = [
+    { id: 'overview', label: 'Overview' },
+    { id: 'reachability', label: 'Reachability' },
+    {
+      id: 'triage',
+      label: (
+        <>
+          Triage{finding.comment_count > 0 ? ` · ${finding.comment_count} comment${finding.comment_count === 1 ? '' : 's'}` : ''}
+        </>
+      ),
+    },
+  ];
+
+  return (
+    <div className="card finding-detail">
+      <div className="finding-detail-header">
+        <div className="form-row" style={{ alignItems: 'center', marginBottom: 0 }}>
+          <Badge ok={severityBadgeOk(finding.severity)}>{finding.severity}</Badge>
+          <h2 style={{ margin: 0 }}>
+            <VulnerabilityId vulnerabilityId={finding.vulnerability_id} />
+          </h2>
+          <span className={finding.vex_status ? 'triage-chip triaged' : 'triage-chip'}>
+            {finding.vex_status ?? 'untriaged'}
+          </span>
+          {finding.revoked && <Badge ok={false}>revoked</Badge>}
+        </div>
+        <div className="muted" style={{ marginTop: 4 }}>
+          <code>
+            {finding.component_name}
+            {finding.component_version ? `@${finding.component_version}` : ''}
+          </code>{' '}
+          in {finding.domain}
+          {finding.namespace} · {finding.release_version}
+        </div>
+      </div>
+
+      <div className="subnav">
+        {tabs.map((t) => (
+          <button
+            key={t.id}
+            className={`subnav-link${tab === t.id ? ' active' : ''}`}
+            onClick={() => onTabChange(t.id)}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'overview' && (
+        <div>
+          <div className="review-section" style={{ marginTop: 0 }}>
+            <h4>Advisory</h4>
+            {finding.description ? (
+              <div className="finding-description">{finding.description}</div>
+            ) : (
+              <div className="muted">No advisory text cached for this finding yet.</div>
+            )}
+          </div>
+          <div className="review-section">
+            <h4>Where it is</h4>
+            <div className="cell-actions">
+              <button className="btn" onClick={() => onViewManifest(finding.manifest_hash)}>
+                View SBOM
+              </button>
+              <button className="btn" onClick={() => onShowAffected(finding.vulnerability_id)}>
+                Other manifests affected
+              </button>
+            </div>
+          </div>
+          {(finding.reachability_status || finding.analysis_state) && (
+            <div className="review-section">
+              <h4>Signals</h4>
+              {finding.reachability_status && (
+                <div>
+                  <ReachabilityBadge status={finding.reachability_status} priority={finding.reachability_priority} />{' '}
+                  <button className="link-button" onClick={() => onTabChange('reachability')}>
+                    open evidence
+                  </button>
+                </div>
+              )}
+              {finding.analysis_state && (
+                <div className="muted" style={{ marginTop: 4 }}>
+                  Dependency-Track analysis state: {finding.analysis_state}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {tab === 'reachability' && (
+        <ReachabilityPanel
+          manifestHash={finding.manifest_hash}
+          findingKey={finding.finding_key}
+          tenantId={tenantId}
+          componentName={finding.component_name}
+          componentVersion={finding.component_version}
+          onStatusChange={onReachabilityChange}
+        />
+      )}
+
+      {tab === 'triage' && (
+        <div>
+          <div className="review-section" style={{ marginTop: 0 }}>
+            <h4>Decision</h4>
+            {finding.reachability_status === 'completed' && (
+              <div className="muted" style={{ marginBottom: 6 }}>
+                Evidence on file: <ReachabilityBadge status={finding.reachability_status} priority={finding.reachability_priority} />{' '}
+                <button className="link-button" onClick={() => onTabChange('reachability')}>
+                  review it
+                </button>{' '}
+                — it says where the code is referenced, not whether you are affected.
+              </div>
+            )}
+            <FindingTriageControls
+              finding={finding}
+              manifestHash={finding.manifest_hash}
+              tenantId={tenantId}
+              onSaved={onSaved}
+            />
+          </div>
+          <div className="review-section">
+            <h4>Discussion</h4>
+            <FindingComments
+              manifestHash={finding.manifest_hash}
+              findingKey={finding.finding_key}
+              tenantId={tenantId}
+            />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Findings({
   onViewManifest,
   initialManifestHash,
@@ -3923,6 +4899,9 @@ function Findings({
   // guarantee that only the single newest version per namespace is ever
   // included, even for a namespace an admin has hidden from that view.
   const [hideStale, setHideStale] = useState(true);
+  // Off by default: a finding without a mapped repository is still a real
+  // finding. On narrows to the ones reachability evidence can run on.
+  const [knownSource, setKnownSource] = useState(false);
   const [page, setPage] = useState(0);
   const [hasNextPage, setHasNextPage] = useState(false);
   const [manifestFilter, setManifestFilter] = useState(initialManifestHash ?? '');
@@ -3939,7 +4918,10 @@ function Findings({
   const [dtrackEnabled, setDtrackEnabled] = useState<boolean | null>(null);
   const [dtrackSyncDisabled, setDtrackSyncDisabled] = useState(false);
   const [dtrackSyncIntervalSecs, setDtrackSyncIntervalSecs] = useState<number | null>(null);
-  const [expandedKey, setExpandedKey] = useState<string | null>(null);
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  // Kept across selections, so triaging a run of findings stays on the
+  // Triage tab instead of resetting to Overview each time.
+  const [detailTab, setDetailTab] = useState<FindingDetailTab>('overview');
   const [affectedVulnId, setAffectedVulnId] = useState<string | null>(null);
 
   useEffect(() => {
@@ -3971,6 +4953,7 @@ function Findings({
           vexStatus: vexStatus || undefined,
           currentOnly,
           hideStale,
+          knownSource,
           limit: FINDINGS_PAGE_SIZE + 1,
           offset: page * FINDINGS_PAGE_SIZE,
         },
@@ -3985,285 +4968,311 @@ function Findings({
     } finally {
       setBusy(false);
     }
-  }, [severity, manifestFilter, namespace, releaseVersion, vexStatus, currentOnly, hideStale, page, tenantId]);
+  }, [severity, manifestFilter, namespace, releaseVersion, vexStatus, currentOnly, hideStale, knownSource, page, tenantId]);
 
   useEffect(() => {
     load();
   }, [load]);
 
+  const selected = results?.find((f) => `${f.manifest_hash}-${f.finding_key}` === selectedKey) ?? null;
+
   return (
-    <div className="card">
-      <div className="card-header">
-        <h2>Findings</h2>
-        <span className="cell-actions">
-          <button className="btn" onClick={load}>Refresh</button>
-        </span>
-      </div>
-      <p className="muted">
-        Every cached Dependency-Track finding across the archive, within your namespace scope. Cleared
-        (not synced yet) manifests don't appear here — check a manifest's own detail view for that.
-      </p>
-      {dtrackEnabled === false && (
-        <div className="muted">
-          <Badge ok={false}>disabled</Badge> Dependency-Track integration is off for this deployment — see
-          Settings/Dashboard.
-        </div>
-      )}
-      {dtrackEnabled && dtrackSyncDisabled && (
-        <div className="muted">
-          <Badge ok={false}>sync disabled</Badge> This tenant has opted out of sync (see Settings) — results
-          below are whatever was cached before that, nothing new is being pushed/refreshed.
-        </div>
-      )}
-      <div className="form-row">
-        <label className="field" style={{ flex: '0 1 200px', minWidth: 150 }}>
-          <span>Severity</span>
-          <select
-            value={severity}
-            onChange={(e) => {
-              setSeverity(e.target.value);
-              setPage(0);
-            }}
-          >
-            <option value="">all</option>
-            <option value="CRITICAL,HIGH">CRITICAL + HIGH</option>
-            {SEVERITY_OPTIONS.map((s) => (
-              <option key={s} value={s}>
-                {s}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="field" style={{ flex: '0 1 200px', minWidth: 170 }}>
-          <span>Triage status</span>
-          <select
-            value={vexStatus}
-            onChange={(e) => {
-              setVexStatus(e.target.value);
-              setPage(0);
-            }}
-          >
-            <option value="">all</option>
-            <option value="untriaged">untriaged</option>
-            <option value="affected">affected</option>
-            <option value="not_affected">not_affected</option>
-            <option value="fixed">fixed</option>
-            <option value="under_investigation">under_investigation</option>
-          </select>
-        </label>
-        <label className="field" style={{ flex: '0 1 200px', minWidth: 150 }}>
-          <span>Namespace</span>
-          <input
-            type="text"
-            placeholder="/products/v1"
-            value={namespaceDraft}
-            onChange={(e) => setNamespaceDraft(e.target.value)}
-            onBlur={() => {
-              setNamespace(namespaceDraft.trim());
-              setPage(0);
-            }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                setNamespace(namespaceDraft.trim());
-                setPage(0);
-              }
-            }}
-          />
-        </label>
-        <label className="field" style={{ flex: '0 1 160px', minWidth: 130 }}>
-          <span>Version</span>
-          <input
-            type="text"
-            placeholder="1.0.0"
-            value={versionDraft}
-            onChange={(e) => setVersionDraft(e.target.value)}
-            onBlur={() => {
-              setReleaseVersion(versionDraft.trim());
-              setPage(0);
-            }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                setReleaseVersion(versionDraft.trim());
-                setPage(0);
-              }
-            }}
-          />
-        </label>
-        <label
-          className="checkbox-field"
-          style={{ marginBottom: 0 }}
-          title={
-            'Uses the same namespace visibility as the "Currently running" view (Settings → ' +
-            'Manage namespace visibility). A namespace hidden there is excluded here too, even ' +
-            "if it has findings. If you don't have access to Settings, ask an admin to check " +
-            'that list.'
-          }
-        >
-          <input
-            type="checkbox"
-            checked={currentOnly}
-            onChange={(e) => {
-              setCurrentOnly(e.target.checked);
-              setPage(0);
-            }}
-          />
-          <span>
-            Currently running only
-            <span className="muted" style={{ display: 'block', fontSize: 11 }}>
-              latest version per namespace, per Settings visibility
-            </span>
+    <div className="findings-page">
+      <div className="card findings-filters">
+        <div className="card-header">
+          <h2>Findings</h2>
+          <span className="cell-actions">
+            <button className="btn" onClick={load}>Refresh</button>
           </span>
-        </label>
-        <label className="checkbox-field" style={{ marginBottom: 0 }}>
-          <input
-            type="checkbox"
-            checked={hideStale}
-            onChange={(e) => {
-              setHideStale(e.target.checked);
-              setPage(0);
-            }}
-          />
-          <span>
-            Don't show stale versions
-            <span className="muted" style={{ display: 'block', fontSize: 11 }}>
-              always just the newest version per namespace
-            </span>
-          </span>
-        </label>
-        {manifestFilter && (
-          <span className="cell-actions" style={{ alignItems: 'center' }}>
-            <span className="muted">
-              Filtered to SBOM <Hash value={manifestFilter} chars={16} />
-            </span>
-            <button
-              className="btn"
-              onClick={() => {
-                setManifestFilter('');
+        </div>
+        <p className="muted">
+          Every cached Dependency-Track finding across the archive, within your namespace scope. Cleared
+          (not synced yet) manifests don't appear here — check a manifest's own detail view for that.
+        </p>
+        {dtrackEnabled === false && (
+          <div className="muted">
+            <Badge ok={false}>disabled</Badge> Dependency-Track integration is off for this deployment — see
+            Settings/Dashboard.
+          </div>
+        )}
+        {dtrackEnabled && dtrackSyncDisabled && (
+          <div className="muted">
+            <Badge ok={false}>sync disabled</Badge> This tenant has opted out of sync (see Settings) — results
+            below are whatever was cached before that, nothing new is being pushed/refreshed.
+          </div>
+        )}
+        <div className="form-row">
+          <label className="field" style={{ flex: '0 1 200px', minWidth: 150 }}>
+            <span>Severity</span>
+            <select
+              value={severity}
+              onChange={(e) => {
+                setSeverity(e.target.value);
                 setPage(0);
               }}
             >
-              Clear
-            </button>
-          </span>
-        )}
-      </div>
-      {busy && <Spinner label="Loading findings…" />}
-      {error && <ErrorBox message={error} />}
-      {results !== null && results.length === 0 && !busy && (
-        <div className="muted">
-          No findings.
-          {dtrackEnabled && !dtrackSyncDisabled && (
-            <>
-              {' '}
-              If SBOMs were uploaded recently, they may not be fully processed yet — Dependency-Track checks
-              for new uploads every {formatSyncWaitTime(dtrackSyncIntervalSecs)}. Please wait and check back.
-            </>
+              <option value="">all</option>
+              <option value="CRITICAL,HIGH">CRITICAL + HIGH</option>
+              {SEVERITY_OPTIONS.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="field" style={{ flex: '0 1 200px', minWidth: 170 }}>
+            <span>Triage status</span>
+            <select
+              value={vexStatus}
+              onChange={(e) => {
+                setVexStatus(e.target.value);
+                setPage(0);
+              }}
+            >
+              <option value="">all</option>
+              <option value="untriaged">untriaged</option>
+              <option value="affected">affected</option>
+              <option value="not_affected">not_affected</option>
+              <option value="fixed">fixed</option>
+              <option value="under_investigation">under_investigation</option>
+            </select>
+          </label>
+          <label className="field" style={{ flex: '0 1 200px', minWidth: 150 }}>
+            <span>Namespace</span>
+            <input
+              type="text"
+              placeholder="/products/v1"
+              value={namespaceDraft}
+              onChange={(e) => setNamespaceDraft(e.target.value)}
+              onBlur={() => {
+                setNamespace(namespaceDraft.trim());
+                setPage(0);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  setNamespace(namespaceDraft.trim());
+                  setPage(0);
+                }
+              }}
+            />
+          </label>
+          <label className="field" style={{ flex: '0 1 160px', minWidth: 130 }}>
+            <span>Version</span>
+            <input
+              type="text"
+              placeholder="1.0.0"
+              value={versionDraft}
+              onChange={(e) => setVersionDraft(e.target.value)}
+              onBlur={() => {
+                setReleaseVersion(versionDraft.trim());
+                setPage(0);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  setReleaseVersion(versionDraft.trim());
+                  setPage(0);
+                }
+              }}
+            />
+          </label>
+          <label
+            className="checkbox-field"
+            style={{ marginBottom: 0 }}
+            title={
+              'Uses the same namespace visibility as the "Currently running" view (Settings → ' +
+              'Manage namespace visibility). A namespace hidden there is excluded here too, even ' +
+              "if it has findings. If you don't have access to Settings, ask an admin to check " +
+              'that list.'
+            }
+          >
+            <input
+              type="checkbox"
+              checked={currentOnly}
+              onChange={(e) => {
+                setCurrentOnly(e.target.checked);
+                setPage(0);
+              }}
+            />
+            <span>
+              Currently running only
+              <span className="muted" style={{ display: 'block', fontSize: 11 }}>
+                latest version per namespace, per Settings visibility
+              </span>
+            </span>
+          </label>
+          <label className="checkbox-field" style={{ marginBottom: 0 }}>
+            <input
+              type="checkbox"
+              checked={hideStale}
+              onChange={(e) => {
+                setHideStale(e.target.checked);
+                setPage(0);
+              }}
+            />
+            <span>
+              Don't show stale versions
+              <span className="muted" style={{ display: 'block', fontSize: 11 }}>
+                always just the newest version per namespace
+              </span>
+            </span>
+          </label>
+          <label
+            className="checkbox-field"
+            style={{ marginBottom: 0 }}
+            title="Namespaces with a repository under Settings → Source repositories — the findings a reachability analysis can run on."
+          >
+            <input
+              type="checkbox"
+              checked={knownSource}
+              onChange={(e) => {
+                setKnownSource(e.target.checked);
+                setPage(0);
+              }}
+            />
+            <span>
+              Known source only
+              <span className="muted" style={{ display: 'block', fontSize: 11 }}>
+                namespace has a source repository mapped
+              </span>
+            </span>
+          </label>
+          {manifestFilter && (
+            <span className="cell-actions" style={{ alignItems: 'center' }}>
+              <span className="muted">
+                Filtered to SBOM <Hash value={manifestFilter} chars={16} />
+              </span>
+              <button
+                className="btn"
+                onClick={() => {
+                  setManifestFilter('');
+                  setPage(0);
+                }}
+              >
+                Clear
+              </button>
+            </span>
           )}
         </div>
-      )}
-      {results !== null && results.length > 0 && (
-        <table className="table">
-          <thead>
-            <tr>
-              <th>severity</th>
-              <th>vulnerability</th>
-              <th>component</th>
-              <th>namespace / release</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {results.map((f) => {
-              const key = `${f.manifest_hash}-${f.finding_key}`;
-              const expanded = expandedKey === key;
-              return (
-                <React.Fragment key={key}>
-                  <tr
-                    className="row-clickable"
-                    onClick={() => setExpandedKey(expanded ? null : key)}
-                  >
-                    <td>
-                      <Badge ok={severityBadgeOk(f.severity)}>{f.severity}</Badge>
-                    </td>
-                    <td>
-                      <VulnerabilityId vulnerabilityId={f.vulnerability_id} />{' '}
-                      <button
-                        className="link-button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setAffectedVulnId(f.vulnerability_id);
-                        }}
-                        title="Show every manifest in scope affected by this vulnerability"
-                      >
-                        affected elsewhere?
-                      </button>
-                      {f.vex_status && (
-                        <div className="muted">triaged: {f.vex_status}</div>
-                      )}
-                      {f.comment_count > 0 && (
+      </div>
+
+      {/* List on the left, one finding on the right — the same master-detail
+          shape as the Archive Explorer. Opening a finding no longer pushes
+          the rest of the list down the page. */}
+      <div className="explorer-layout">
+        <div className="card explorer-left findings-list">
+          {busy && <Spinner label="Loading findings…" />}
+          {error && <ErrorBox message={error} />}
+          {results !== null && results.length === 0 && !busy && (
+            <div className="muted">
+              No findings.
+              {dtrackEnabled && !dtrackSyncDisabled && (
+                <>
+                  {' '}
+                  If SBOMs were uploaded recently, they may not be fully processed yet — Dependency-Track checks
+                  for new uploads every {formatSyncWaitTime(dtrackSyncIntervalSecs)}. Please wait and check back.
+                </>
+              )}
+            </div>
+          )}
+          {results !== null && results.length > 0 && (
+            <table className="table findings-table">
+              <thead>
+                <tr>
+                  <th>severity</th>
+                  <th>vulnerability · component</th>
+                  <th>status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {results.map((f) => {
+                  const key = `${f.manifest_hash}-${f.finding_key}`;
+                  return (
+                    <tr
+                      key={key}
+                      className={`row-clickable${selectedKey === key ? ' row-selected' : ''}`}
+                      onClick={() => setSelectedKey(key)}
+                    >
+                      <td>
+                        <Badge ok={severityBadgeOk(f.severity)}>{f.severity}</Badge>
+                      </td>
+                      <td>
+                        <div className="finding-id">{f.vulnerability_id}</div>
                         <div className="muted">
-                          {f.comment_count} comment{f.comment_count === 1 ? '' : 's'}
+                          {f.component_name}
+                          {f.component_version ? `@${f.component_version}` : ''}
                         </div>
-                      )}
-                    </td>
-                    <td>
-                      {f.component_name}
-                      {f.component_version ? `@${f.component_version}` : ''}
-                    </td>
-                    <td>
-                      {f.domain}
-                      {f.namespace} <span className="muted">{f.release_version}</span>
-                    </td>
-                    <td>
-                      <span className="cell-actions">
-                        {f.revoked && <Badge ok={false}>revoked</Badge>}
-                        <button
-                          className="btn"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onViewManifest(f.manifest_hash);
-                          }}
-                        >
-                          View SBOM
-                        </button>
-                      </span>
-                    </td>
-                  </tr>
-                  {expanded && (
-                    <tr>
-                      <td colSpan={5} className="findings-detail-cell">
-                        {f.description && <div className="muted">{f.description}</div>}
-                        <FindingTriageControls
-                          finding={f}
-                          manifestHash={f.manifest_hash}
-                          tenantId={tenantId}
-                          onSaved={load}
-                        />
-                        <FindingComments
-                          manifestHash={f.manifest_hash}
-                          findingKey={f.finding_key}
-                          tenantId={tenantId}
-                        />
+                        <div className="muted finding-ns">
+                          {f.domain}
+                          {f.namespace} · {f.release_version}
+                          {f.revoked ? ' · revoked' : ''}
+                        </div>
+                      </td>
+                      <td>
+                        <div className="finding-status">
+                          <span className={f.vex_status ? 'triage-chip triaged' : 'triage-chip'}>
+                            {f.vex_status ?? 'untriaged'}
+                          </span>
+                          <ReachabilityBadge status={f.reachability_status} priority={f.reachability_priority} compact />
+                          {f.comment_count > 0 && (
+                            <span className="muted">
+                              {f.comment_count} comment{f.comment_count === 1 ? '' : 's'}
+                            </span>
+                          )}
+                        </div>
                       </td>
                     </tr>
-                  )}
-                </React.Fragment>
-              );
-            })}
-          </tbody>
-        </table>
-      )}
-      {results !== null && (page > 0 || hasNextPage) && (
-        <div className="form-row" style={{ marginTop: 12, alignItems: 'center' }}>
-          <button className="btn" disabled={page === 0 || busy} onClick={() => setPage((p) => p - 1)}>
-            ← Previous
-          </button>
-          <span className="muted">Page {page + 1}</span>
-          <button className="btn" disabled={!hasNextPage || busy} onClick={() => setPage((p) => p + 1)}>
-            Next →
-          </button>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+          {results !== null && (page > 0 || hasNextPage) && (
+            <div className="form-row" style={{ marginTop: 12, alignItems: 'center' }}>
+              <button className="btn" disabled={page === 0 || busy} onClick={() => setPage((p) => p - 1)}>
+                ← Previous
+              </button>
+              <span className="muted">Page {page + 1}</span>
+              <button className="btn" disabled={!hasNextPage || busy} onClick={() => setPage((p) => p + 1)}>
+                Next →
+              </button>
+            </div>
+          )}
         </div>
-      )}
+
+        <div className="explorer-right">
+          {selected ? (
+            <FindingDetail
+              key={selectedKey ?? ''}
+              finding={selected}
+              tenantId={tenantId}
+              tab={detailTab}
+              onTabChange={setDetailTab}
+              onSaved={load}
+              onReachabilityChange={(status, priority) =>
+                // Patch the one row rather than re-fetching the page: the
+                // panel polls every few seconds while an analysis runs.
+                setResults((rows) =>
+                  rows?.map((r) =>
+                    `${r.manifest_hash}-${r.finding_key}` === selectedKey &&
+                    (r.reachability_status !== status || r.reachability_priority !== priority)
+                      ? { ...r, reachability_status: status, reachability_priority: priority }
+                      : r
+                  ) ?? rows
+                )
+              }
+              onViewManifest={onViewManifest}
+              onShowAffected={setAffectedVulnId}
+            />
+          ) : (
+            <div className="card">
+              <div className="muted">
+                Select a finding to see its details, reachability evidence and triage.
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
       {affectedVulnId && (
         <AffectedManifestsModal
           vulnId={affectedVulnId}
@@ -4982,7 +5991,7 @@ function Settings({
   headError: string;
 }) {
   const tenantId = useTenantOverride();
-  const [settingsGroup, setSettingsGroup] = useState<'info' | 'general' | 'checks' | 'compliance' | 'webhooks'>(
+  const [settingsGroup, setSettingsGroup] = useState<'info' | 'general' | 'checks' | 'compliance' | 'sources' | 'webhooks'>(
     'info'
   );
   const [leaves, setLeaves] = useState<Leaf[] | null>(null);
@@ -5036,6 +6045,11 @@ function Settings({
   const [freshnessDisabledBusy, setFreshnessDisabledBusy] = useState(false);
   const [freshnessDisabledError, setFreshnessDisabledError] = useState('');
   const [maliciousCheckEnabled, setMaliciousCheckEnabled] = useState<boolean | null>(null);
+  // Deployment-wide, like the other integration flags: null until
+  // `GET /api/v1/config` answers, and false when no analyser is configured —
+  // in which case the source-repository settings card is not rendered at
+  // all, since it would only configure something nothing reads.
+  const [reachabilityEnabled, setReachabilityEnabled] = useState<boolean | null>(null);
   const [maliciousCheckDisabled, setMaliciousCheckDisabled] = useState<boolean | null>(null);
   const [maliciousCheckDisabledBusy, setMaliciousCheckDisabledBusy] = useState(false);
   const [maliciousCheckDisabledError, setMaliciousCheckDisabledError] = useState('');
@@ -5103,6 +6117,7 @@ function Settings({
         setReputationEnabled(c.reputation_enabled);
         setFreshnessEnabled(c.freshness_enabled);
         setMaliciousCheckEnabled(c.malicious_check_enabled);
+        setReachabilityEnabled(c.reachability_enabled);
       })
       .catch(() => {
         if (!mounted) return;
@@ -5110,6 +6125,7 @@ function Settings({
         setReputationEnabled(null);
         setFreshnessEnabled(null);
         setMaliciousCheckEnabled(null);
+        setReachabilityEnabled(null);
       });
     api.dtrackSyncSetting(tenantId)
       .then((s) => mounted && setDtrackSyncDisabled(s.disabled))
@@ -5474,6 +6490,14 @@ function Settings({
         >
           Compliance checks
         </button>
+        {reachabilityEnabled && (
+          <button
+            className={`subnav-link ${settingsGroup === 'sources' ? 'active' : ''}`}
+            onClick={() => setSettingsGroup('sources')}
+          >
+            Source repositories
+          </button>
+        )}
         <button
           className={`subnav-link ${settingsGroup === 'webhooks' ? 'active' : ''}`}
           onClick={() => setSettingsGroup('webhooks')}
@@ -5779,6 +6803,8 @@ function Settings({
       </div>
         </>
       )}
+
+      {settingsGroup === 'sources' && reachabilityEnabled && <SourceRepoSettings tenantId={tenantId} />}
 
       {settingsGroup === 'webhooks' && <WebhooksSettings />}
 

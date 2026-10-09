@@ -59,8 +59,14 @@ description):** **CVE reachability evidence.**
   text via `get_vuln`, and `dtrack_findings` carries per-finding
   descriptions — the ingestion side of both the primary and fallback feature
   largely exists.
-- *Current state:* `crates/ai` does not exist yet — nothing AI-related is
-  implemented. See `ROADMAP.md`'s status log.
+- *Current state (2026-08-30):* **built.** The analyser is `reach/` — a
+  standalone Cargo project in this repo, excluded from the root workspace,
+  with its own SQLite database, Dockerfile and compose service; AISE talks to
+  it over REST through `crates/reachability`. There is deliberately no
+  `crates/ai`: all LLM work lives in `reach/src/ai/` (OpenAI-compatible
+  client, all four graded failure modes) because the AI feature is that
+  service. Pipeline, eval suite and limitations: `reach/README.md`. AISE-side
+  UI is v1 scope — a button on a finding plus a minimal report view.
 
 ## Course deliverables to maintain continuously (not at the end)
 
@@ -87,14 +93,20 @@ description):** **CVE reachability evidence.**
 Already satisfied by the codebase: domain responsibility, application logic
 beyond LLM calls, Postgres persistence, React UI, REST API, Docker /
 docker-compose, env-based config, `/health`, unit tests (`cargo test
---workspace` — 165 as of 2026-08-30), audit logging, **automated tests over
-real data** (`test-sboms/` + `tests/test_real_sboms.py`), **AI dev log**
-(`docs/AI_DEVLOG.md`, 8 episodes as of 2026-08-30).
-Missing: OpenAPI document, `crates/ai` + the AI feature (decided 2026-08-30
-— CVE reachability evidence; see above — but not started), eval
-suite (`eval/`), architecture/data-flow doc (partial: `ARCHITECTURE.md` —
-updated 2026-08-30 for the auth change; rest not re-verified), CI
-(`.github/workflows` absent, so nothing runs the tests automatically).
+--workspace` — 192 as of 2026-10-03; plus 227 in `reach/`), audit logging,
+**automated tests over real data** (`test-sboms/` + `tests/test_real_sboms.py`),
+**AI dev log** (`docs/AI_DEVLOG.md`, 14 episodes as of 2026-10-04), **the AI
+feature** (`reach/` — CVE reachability evidence, with all four mandatory
+failure modes), **the eval suite** (`reach/eval/` — 13 cases with aggregated
+metrics and a non-AI baseline), and **an OpenAPI document for the analyser**
+(`utoipa`-generated at `/openapi.json`, with Swagger UI at `/docs`, and a
+test asserting every declared security requirement names a defined scheme).
+Missing: **AISE's own OpenAPI document** (the analyser has one; the main API
+does not). CI exists since 2026-10-09 (`.github/workflows/ci.yml`: both test
+suites, baseline eval, frontend build, real-SBOM tests against a live
+server). Licence: GPL-3.0-or-later (`LICENSE`). Course deliverables index:
+`DELIVERABLES.md`. The architecture/data-flow doc (`ARCHITECTURE.md`) was
+rewritten against the code on 2026-09-17 and now covers `reach/`.
 
 ## Repo conventions
 
@@ -110,7 +122,9 @@ updated 2026-08-30 for the auth change; rest not re-verified), CI
   and CSS patterns.
 - Verification before calling work done: `cargo test --workspace`,
   `cd frontend && npx tsc --noEmit`, and `CI=true npx react-scripts build`
-  (eslint warnings fail CI builds).
+  (eslint warnings fail CI builds). If `reach/` was touched, also
+  `cd reach && cargo test` — it is a separate Cargo project and the root
+  workspace does not build it.
 - Track progress in `ROADMAP.md`'s status log; leave an aidex session note
   before ending a session.
 

@@ -48,6 +48,16 @@ Version resolution order when --version is not given (upload only):
     3. `git describe --tags --always --dirty` (falls back to a bare short
        commit hash if the repo has no tags at all)
 
+Source repository (optional, upload only) -- where this namespace's code
+lives, so CVE-reachability analysis knows what to scan:
+    source_repo=https://github.com/acme/api   (https:// only)
+    source_subpath=services/api               (monorepo sub-directory)
+    source_revision=main                      (used for uploads that carry
+                                               no exact commit)
+Leave them out and nothing changes. When set, the upload records them as
+the namespace's repository mapping -- unless an admin already set one in
+Settings, which always takes precedence (the script says which happened).
+
 Auth: the API key is read only from the MAGNOLIA_API_KEY environment
 variable (never a CLI flag and never the Magnoliafile) so it can't leak via
 shell history or `ps`. Get one with POST /api/v1/keys against your own
@@ -90,6 +100,18 @@ class Config:
     format: str
     namespace: str
     version: str
+    # Full git object id of the tree the SBOM describes, when this is run
+    # inside a clean checkout. Sent with the upload so CVE-reachability
+    # analysis has an exact revision to scan; empty when it cannot be
+    # determined, in which case the server simply records nothing and the
+    # reachability button stays disabled with an explanation.
+    source_commit: str
+    # Optional Magnoliafile source_repo/source_subpath/source_revision:
+    # recorded as the namespace's repository mapping on upload. Empty means
+    # "not declared" and is never an error.
+    source_repo: str
+    source_subpath: str
+    source_revision: str
     json_output: bool
     verbose: bool
 
@@ -138,6 +160,32 @@ def _run_git(args: list[str]) -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+def resolve_source_commit() -> str:
+    """The exact revision the SBOM describes, or "" when it cannot be
+    established.
+
+    Deliberately strict about two things. A dirty working tree yields ""
+    (`git status --porcelain` non-empty): the SBOM would describe files that
+    exist in nobody's history, so an analyser scanning the recorded commit
+    would be reading different code than the SBOM was built from. And only a
+    full object id is sent, never a ref — the whole point is a revision that
+    still means the same thing next month.
+    """
+    head = _run_git(["rev-parse", "HEAD"])
+    if not head or len(head) not in (40, 64):
+        return ""
+    dirty = _run_git(["status", "--porcelain"])
+    if dirty is None or dirty:
+        print(
+            "==> working tree is not clean (or not a git repository); "
+            "not recording a source commit, so reachability analysis will be "
+            "unavailable for this upload",
+            file=sys.stderr,
+        )
+        return ""
+    return head
+
+
 def resolve_version(explicit_or_magnoliafile: str) -> str:
     """Version fallback, upload-only: an explicit value (from --version or
     the Magnoliafile) wins outright; otherwise the exact git tag on HEAD,
@@ -161,9 +209,18 @@ def build_config(args: argparse.Namespace) -> Config:
     namespace = setting(args.namespace, "namespace")
     sbom = setting(args.sbom, "sbom")
     fmt = setting(args.format, "format") or DEFAULT_FORMAT
+    source_repo = setting(args.source_repo, "source_repo").strip()
+    source_subpath = setting(args.source_subpath, "source_subpath").strip()
+    source_revision = setting(args.source_revision, "source_revision").strip()
+    if (source_subpath or source_revision) and not source_repo:
+        die("source_subpath/source_revision need source_repo as well")
+    if source_repo and not source_repo.startswith("https://"):
+        die(f"source_repo must be an https:// URL, got: {source_repo}")
+    source_commit = ""
     version = ""
     if args.mode == "upload":
         version = resolve_version(setting(args.version, "version"))
+        source_commit = resolve_source_commit()
 
     missing = [
         name
@@ -195,6 +252,10 @@ def build_config(args: argparse.Namespace) -> Config:
         format=fmt,
         namespace=namespace,
         version=version,
+        source_commit=source_commit,
+        source_repo=source_repo,
+        source_subpath=source_subpath,
+        source_revision=source_revision,
         json_output=args.json,
         verbose=args.verbose,
     )
@@ -333,12 +394,28 @@ def run_upload(config: Config, target_url: str) -> int:
             "format": config.format,
             "namespace": config.namespace,
             "version": config.version,
+            # Omitted entirely when unknown: the server rejects a malformed
+            # value, and an empty string is not a valid object id.
+            **({"source_commit": config.source_commit} if config.source_commit else {}),
+            **({"source_repo": config.source_repo} if config.source_repo else {}),
+            **({"source_subpath": config.source_subpath} if config.source_subpath else {}),
+            **({"source_revision": config.source_revision} if config.source_revision else {}),
         },
         "sbom_file",
         config.sbom,
     )
     if status != 200:
         die(f"upload failed (HTTP {status}): {body}")
+    if config.source_repo:
+        outcome = json.loads(body).get("source_repo")
+        message = {
+            "recorded": f"recorded {config.source_repo} as the source repository for {config.namespace}",
+            "kept_existing": f"{config.namespace} already has a source repository set in Settings; "
+            "that one is kept (the Magnoliafile's source_repo was ignored)",
+            "not_recorded": "the upload succeeded, but the source repository could not be saved; "
+            "set it under Settings -> Source repositories",
+        }.get(outcome, f"source repository: server did not report an outcome ({outcome!r})")
+        print(f"==> {message}", file=sys.stderr)
     print(body)
     return 0
 
@@ -395,6 +472,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sbom", help="path to the SBOM file to upload/verify")
     parser.add_argument("--format", help=f"cyclonedx|spdx (default: {DEFAULT_FORMAT})")
     parser.add_argument("--version", help="free-text release label (upload only)")
+    parser.add_argument(
+        "--source-repo",
+        help="optional, upload only: https:// URL of this namespace's source repository",
+    )
+    parser.add_argument(
+        "--source-subpath", help="optional, upload only: monorepo sub-directory to scan"
+    )
+    parser.add_argument(
+        "--source-revision",
+        help="optional, upload only: branch/tag to scan when no exact commit is recorded",
+    )
     parser.add_argument(
         "--file", help="path to the Magnoliafile (default: search upward from cwd)"
     )

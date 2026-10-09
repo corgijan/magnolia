@@ -1,0 +1,24 @@
+{
+  "id": "10-lexical-false-positive",
+  "category": "ambiguous",
+  "description": "The repository defines an unrelated local function with the same name as the vulnerable symbol. Measures whether stage D separates a real dependency call from a coincidental name collision - the thing a plain grep cannot do at all.",
+  "advisory_text": "fastyaml 2.x: the `unsafeLoad` API of the fastyaml package deserializes arbitrary constructors. Only calls made through the fastyaml module are affected; unrelated functions of the same name are not.",
+  "osv_id": "GHSA-TEST-0007",
+  "package_name": "fastyaml",
+  "ecosystem": "npm",
+  "fixture": "demo-app",
+  "expect": {
+    "symbols": [
+      "unsafeLoad"
+    ],
+    "priority_in": [
+      "direct_references"
+    ],
+    "relevant_sites": [
+      "src/importer.js"
+    ],
+    "irrelevant_sites": [
+      "src/util/cache.js"
+    ]
+  }
+}

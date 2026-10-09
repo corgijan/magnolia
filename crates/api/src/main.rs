@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use magnolia_api::{
-    create_router, run_freshness_sync_loop, run_malicious_sync_loop, run_reputation_sync_loop,
+    create_router, run_freshness_sync_loop, run_malicious_sync_loop, run_reachability_auto_loop,
+    run_reputation_sync_loop,
     run_sync_loop, run_webhook_delivery_loop, AppState,
 };
 use magnolia_audit::AuditLogger;
@@ -11,6 +12,7 @@ use magnolia_db::Database;
 use magnolia_depsdev::DepsDevClient;
 use magnolia_dtrack::DtrackClient;
 use magnolia_osv::OsvClient;
+use magnolia_reachability::ReachClient;
 use magnolia_signer::LocalFileSigner;
 use magnolia_storage::{FileStore, InMemoryStore, ObjectStore};
 use tokio::sync::Mutex;
@@ -175,6 +177,26 @@ async fn main() {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(30);
 
+    // Optional CVE-reachability analyser (the standalone `reach/` service).
+    // Presence-gated on both env vars, exactly like the dtrack pair above:
+    // an operator either runs the analyser or doesn't, and when they don't,
+    // the "Analyze reachability" button explains itself as unavailable and
+    // nothing else in the application changes.
+    let reach_base_url = std::env::var("AISE_REACH_BASE_URL").ok().filter(|s| !s.is_empty());
+    let reach_token = std::env::var("AISE_REACH_TOKEN").ok().filter(|s| !s.is_empty());
+    let reach = match (reach_base_url, reach_token) {
+        (Some(url), Some(token)) => {
+            tracing::info!(url = %url, "CVE reachability analyser enabled");
+            Some(Arc::new(ReachClient::new(url, token)))
+        }
+        _ => {
+            tracing::info!(
+                "AISE_REACH_BASE_URL/AISE_REACH_TOKEN not both set — CVE reachability analysis disabled"
+            );
+            None
+        }
+    };
+
     let db = Arc::new(db);
 
     tokio::spawn(run_webhook_delivery_loop(
@@ -199,6 +221,42 @@ async fn main() {
             sync_burst_interval,
         ));
     }
+    // Background reachability analysis for namespaces opted in with
+    // `auto_analyze`. Only meaningful with an analyser configured; the
+    // concurrency cap is deliberately small because the analyser works one
+    // job at a time and each takes minutes against a local model.
+    if let Some(client) = reach.clone() {
+        if std::env::var("DISABLE_REACHABILITY_AUTO").is_ok() {
+            tracing::info!("DISABLE_REACHABILITY_AUTO set — background reachability analysis disabled");
+        } else {
+            let interval_secs = std::env::var("REACHABILITY_AUTO_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(120);
+            let max_in_flight = std::env::var("REACHABILITY_AUTO_MAX_IN_FLIGHT")
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(2);
+            // Announced like every other sync loop: this one starts spending
+            // inference the moment any namespace flips `auto_analyze`, so an
+            // operator must be able to see from the log that it is running,
+            // and with what budget, rather than inferring it from the
+            // analyser being configured at all.
+            tracing::info!(
+                interval_secs,
+                max_in_flight,
+                "background reachability analysis enabled for namespaces with auto_analyze"
+            );
+            tokio::spawn(run_reachability_auto_loop(
+                Arc::clone(&db),
+                client,
+                std::time::Duration::from_secs(interval_secs),
+                sync_burst_interval,
+                max_in_flight,
+            ));
+        }
+    }
     if let Some(client) = osv.clone() {
         tokio::spawn(run_malicious_sync_loop(
             Arc::clone(&db),
@@ -219,6 +277,7 @@ async fn main() {
         dtrack_sync_interval_secs,
         osv,
         depsdev,
+        reach,
     };
 
     if let Some(client) = dtrack {

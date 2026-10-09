@@ -1,0 +1,60 @@
+# Standalone project: `reach` is deliberately NOT a member of the AISE root
+# workspace (root `members` stays `crates/*`). It lives in this repo for one
+# history and one submission, but the boundary between it and AISE is REST
+# only — build and test it from inside `reach/` with plain `cargo test`.
+# The empty `[workspace]` table below is what makes cargo treat this
+# directory as its own workspace root instead of complaining that a nested
+# package believes it is in the parent workspace.
+[workspace]
+
+[package]
+name = "reach"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "CVE reachability evidence analyzer — evidence for an analyst, never a verdict"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["cors"] }
+sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio", "chrono", "uuid"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
+sha2 = "0.10"
+hex = "0.4"
+subtle = "2"
+walkdir = "2"
+# Structural search (Ruleset nested-call patterns) and function/class
+# boundary detection for report snippets. Vendored for a small, deliberately
+# limited set of languages -- the lexer (src/lexer.rs) stays the universal
+# baseline for every other file; tree-sitter only refines what it can.
+tree-sitter = "0.27"
+tree-sitter-rust = "0.24"
+tree-sitter-javascript = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-go = "0.25"
+# Used by the eval harness (a bin target) to stage fixtures and cache
+# checkouts; also a dev-dependency for the unit tests.
+tempfile = "3"
+async-trait = "0.1"
+# Loads `reach/.env` on startup for native `cargo run` / `cargo run --bin eval`.
+# In Docker this does nothing useful (compose injects real env vars, and no
+# .env is copied into the image) — it exists so the documented "copy
+# .env.example to .env and edit" workflow actually works outside a container.
+dotenvy = "0.15"
+
+[dev-dependencies]
+tempfile = "3"
+# Mocks the inference endpoint for the startup-reachability-probe tests.
+wiremock = "0.6"
+# Drives the axum router in-process for the API tests -- no listening socket,
+# no port, so the whole HTTP surface is testable under `cargo test`.
+tower = { version = "0.5", features = ["util"] }

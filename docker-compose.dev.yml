@@ -1,0 +1,14 @@
+# Local-development override: runs only Dependency-Track in Docker and
+# publishes it on loopback, so the API can be run natively with `cargo run`.
+# Postgres for AISE itself is expected on 127.0.0.1:5432 (e.g. a standalone
+# `postgres:15` container — see README "Local Development Setup").
+#
+# Usage (with the dtrack override, which mints the API key automatically):
+#   docker compose -f docker-compose.yml -f docker-compose.dtrack.yml \
+#     -f docker-compose.dev.yml up -d dtrack-bootstrap
+#
+# Loopback-only mapping — never use this file on an internet-facing host.
+services:
+  dependency-track:
+    ports:
+      - "127.0.0.1:8081:8080"

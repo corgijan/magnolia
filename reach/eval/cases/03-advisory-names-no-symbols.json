@@ -1,0 +1,22 @@
+{
+  "id": "03-advisory-names-no-symbols",
+  "category": "no_symbols",
+  "description": "A real advisory that describes the flaw only in prose. The correct extraction is an empty symbol list; inventing a plausible-sounding symbol here is the failure being measured.",
+  "advisory_text": "A heap-based buffer overflow was discovered in fastyaml 2.1.0. Parsing a deeply nested document causes memory corruption which may lead to a crash or, under some allocators, code execution. Users should upgrade to 2.2.0.",
+  "osv_id": "GHSA-TEST-0002",
+  "package_name": "fastyaml",
+  "ecosystem": "npm",
+  "fixture": "demo-app",
+  "expect": {
+    "symbols": [],
+    "forbidden_symbols": [
+      "unsafeLoad",
+      "parseDocument",
+      "loadAll",
+      "parse"
+    ],
+    "priority_in": [
+      "package_present_only"
+    ]
+  }
+}

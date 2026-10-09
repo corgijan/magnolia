@@ -1,0 +1,357 @@
+# AISE / Magnolia
+
+> Multi-tenant service for software supply-chain observability and transparency:
+> a signed, append-only Merkle transparency log of SBOMs, enriched with
+> vulnerability, malicious-package, reputation, freshness and license signals,
+> plus an LLM-assisted **CVE reachability evidence** analyser (`reach/`).
+> Rust (axum + sqlx/Postgres) backend, React/TypeScript frontend. University
+> course project (AISE module); EU CRA compliance is one application, not the
+> whole purpose.
+
+This file is an orientation map for LLM agents. It was written by reading the
+code on 2026-09-17; where the prose docs disagree with the code, this file
+follows the code and says so (see "Doc trust levels"). Hard rules for agents
+live in `CLAUDE.md`. Read that first; it overrides anything here.
+
+## Names
+
+- **AISE**: the repo and course project. **Magnolia**: the product name used in
+  the README, UI, crate names (`magnolia-*`) and binary (`magnolia-server`).
+  They mean the same system.
+- **reach**: the separate CVE-reachability analyser service in `reach/`.
+- API keys look like `mag_<43 base64url chars>`; the upload config file is `Magnoliafile`.
+
+## Hard rules you must not break (summary of CLAUDE.md)
+
+1. All LLM calls go through an OpenAI-compatible `POST {base_url}/v1/chat/completions`.
+   Endpoint, model, key and inference settings come only from env vars. The
+   submission target is a local 4–8B model (Ollama / llama.cpp).
+2. The AI gives **evidence, never a verdict.** "Symbol X is referenced at path:line"
+   is fine. "This CVE is not exploitable" is out of scope, including in UI copy.
+3. Confidence and priority values are **labels, not probabilities**.
+4. Four failure modes are graded: server unavailable, timeout, invalid model
+   output (validate, retry once, degrade), and processing failure. An inference
+   failure must never break a non-AI flow.
+5. Follow existing patterns: tenant toggle, sync loop, pure check in core.
+   Migrations are append-only. Commit messages must be meaningful.
+6. Never put secrets in the repo. Ask before destructive operations.
+
+## Repository map
+
+```
+Cargo.toml            root workspace: crates/* only (reach is excluded on purpose)
+crates/
+  api/                axum HTTP server + background loops (binary: magnolia-server)
+  core/               pure domain logic, no I/O: Merkle MMR, DSSE, compliance profiles,
+                      license policy, purl, freshness, VEX import, schema validation
+  auth/               API keys (SHA-256 hashed, constant-time), RBAC engine
+                      examples/bootstrap_key.rs, keygen.rs
+  signer/             Signer trait + LocalFileSigner (Ed25519)
+  storage/            ObjectStore trait + FileStore + InMemoryStore (no S3 impl yet)
+  db/                 ALL Postgres queries (lib.rs, ~2.8k lines) + models.rs
+  audit/              audit log types
+  dtrack/             Dependency-Track REST client
+  osv/                OSV REST client (malicious-package advisories)
+  depsdev/            deps.dev REST client (OpenSSF Scorecard reputation, freshness)
+  reachability/       thin typed REST client for reach (create/get analysis, health)
+migrations/           Postgres schema, YYYYMMDD00000N_name.sql, applied on server startup
+frontend/src/         React UI. App.tsx is one ~7k-line file; api.ts is the typed client
+reach/                SEPARATE Cargo project: CVE reachability analyser (own lockfile,
+                      own [workspace], own SQLite DB, own Dockerfile)
+  src/ai/             OpenAI-compatible ChatClient, prompts, startup probe
+  src/pipeline/       stages A–E + baseline.rs (non-AI heuristic baseline)
+  src/fetcher/        git fetch (hardened) + local + checkout cache
+  src/lexer.rs        language-agnostic identifier scanner
+  src/treesitter.rs   structural refinement (Rust, JS, Python, Go grammars)
+  src/bin/eval.rs     eval harness
+  eval/cases/         12 JSON eval cases; eval/fixtures/ plain dirs; eval/results/ (gitignored)
+  scripts/reach-check.py  one-shot CLI (its default "verdict" mode is NOT submission-compliant)
+scripts/              magnolia-upload.py/.sh (CI upload/verify CLI), bootstrap-dtrack.sh
+tests/test_real_sboms.py  automated tests over real SBOMs in test-sboms/
+docs/AI_DEVLOG.md     graded AI development log (append an episode after major agent work)
+docker-compose.yml    db, api, frontend (profile), reach, ollama (profile), dtrack (profile)
+docker-compose.dtrack.yml  full Dependency-Track stack + automatic bootstrap
+```
+
+## Runtime architecture
+
+```
+ browser ──▶ frontend (nginx :4000, profile "frontend") ──/api──▶ api (magnolia-server :3000)
+                                                                   │  Postgres (db)
+ CI ──▶ magnolia-upload.py ──────────────────────────────────────▶│  signing key / SBOM files (volume)
+                                                                   │
+                  background loops in api ─────────────────────────┤──▶ Dependency-Track (optional)
+                  (dtrack, malicious, reputation, freshness,       │──▶ OSV, deps.dev
+                   webhook delivery)                               │──▶ tenant webhooks
+                                                                   │
+                                   crates/reachability ────────────┴──▶ reach (:3100, SQLite)
+                                                                          └──▶ OpenAI-compatible LLM
+                                                                               (ollama profile or hosted)
+```
+
+- Only `api` publishes a host port by default. `db`, `dependency-track` and `reach` stay
+  on the internal compose network.
+- The api migrates its own schema on startup (`sqlx::migrate!`) and rebuilds each
+  tenant's in-memory MMR from `merkle_leaves`.
+- Optional integrations are **presence-gated** by env vars. If they are unset, the feature
+  is off and the UI hides it: `DTRACK_URL`+`DTRACK_API_KEY`(`_FILE`),
+  `AISE_REACH_BASE_URL`+`AISE_REACH_TOKEN`. They can also be killed with
+  `DISABLE_MALICIOUS_PACKAGE_CHECK` or `DISABLE_REPUTATION_CHECK`.
+
+## Core concepts (AISE side)
+
+- **Tenant** = one domain. Each tenant has its own full data isolation and its own
+  Merkle tree / signed-tree-head chain. Exactly one tenant is `is_platform` (the
+  bootstrap tenant). It is admin-only and rejects SBOM uploads.
+- **Namespace**: a hierarchical path like `/product/v1`. A key's `namespace_scope` is a
+  segment-aware prefix match. Tenants can require namespaces to be registered before upload.
+- **Roles**: `super_admin`, `domain_admin`, `uploader`, `auditor`.
+  **Actions** (`crates/auth/src/rbac.rs`): Upload, Read, Annotate, ManageKeys, ManageAcls,
+  ManageSettings, ManageTenants (platform-level), and ManageTenantData, a privileged tenant-data action
+  that is withheld from domain_admin. Only a platform-tenant super_admin may pass
+  `?tenant_id=` to act across tenants.
+  The extractor is `AuthGrant` (`crates/api/src/auth.rs`).
+- **Manifest**: signed metadata for one uploaded SBOM or document (namespace, version,
+  hash chain via previous manifest, optional `source_commit`). It is signed as a
+  **DSSE envelope** around an in-toto Statement whose subject digest is the SBOM hash.
+  Revocation is a status flag, never a delete.
+- **Signed Tree Head (STH)**: signed MMR root + size. Inclusion and consistency proofs are
+  served by the API and verified client-side in the UI (`frontend/src/merkle.ts`).
+- **Findings**: `dtrack_findings` (cached from Dependency-Track) plus
+  `malicious_component_findings` (OSV). Analysts set a VEX status
+  (`affected|not_affected|fixed|under_investigation`; `not_affected` needs a justification)
+  and add comments. VEX export/import is per manifest.
+
+### Upload path (`handlers::upload_sbom`)
+
+1. Parse the multipart body (`sbom_file`, `format`, `namespace`, `version`, optional
+   `source_commit`, which is rejected if malformed).
+2. Run the RBAC/namespace-scope check, then `validate_sbom_content`.
+3. Run `enforce_compliance` (tenant-enabled NTIA / BSI TR-03183 profiles) and
+   `enforce_license_policy`.
+4. Run the registered-namespace check and reject uploads to the platform tenant.
+5. Store the bytes, append the MMR leaf, sign the STH, and insert it.
+6. Build the in-toto Statement, sign it over the DSSE PAE and store the manifest.
+7. Index components (`sbom_components`), then the later sync loops push and enrich.
+   Webhooks and audit logs record the event.
+
+`POST /api/v1/verify` runs the same policy checks as a dry run (no storage, no leaf). This
+is the CI gate.
+
+### Postgres tables (from migrations)
+
+tenants, api_keys, audit_logs, signed_tree_heads, merkle_leaves, merkle_nodes, manifests,
+namespace_current_hidden, registered_namespaces, sbom_components,
+compliance_profile_settings, tenant_license_policies, dtrack_projects, dtrack_findings,
+dtrack_push_failures, finding_comments, malicious_component_findings,
+component_reputation, component_freshness, webhook_endpoints, webhook_deliveries,
+namespace_repos, finding_reachability. Many per-tenant toggles are columns on `tenants`.
+
+### Background loops (`crates/api/src/*_sync.rs`, spawned in `main.rs`)
+
+- `dtrack_sync::run_sync_loop` pushes BOMs and pulls findings.
+- `malicious_sync` runs OSV checks (via `malicious_check.rs`, which also fetches advisory
+  text with `get_vuln`).
+- `reputation_sync` pulls deps.dev / Scorecard data, bucketed in `reputation_bucket.rs`.
+- `freshness_sync` checks freshness and EOL.
+- `webhooks::run_webhook_delivery_loop` delivers webhooks.
+- Shared cadence helper: `sync_loop::run_burst_loop`. Intervals come from
+  `*_SYNC_INTERVAL_SECS` and `SYNC_BURST_INTERVAL_SECS`.
+- Each signal has a tenant toggle, a `POST /api/v1/<signal>/sync` force endpoint and a
+  `GET …/status` endpoint.
+
+### REST API route groups (`crates/api/src/lib.rs::create_router`)
+
+All routes use `Authorization: Bearer mag_…`. **There is no OpenAPI spec for this API yet.**
+
+| Group | Routes |
+|---|---|
+| Meta | `/health`, `/install.sh`, `/install.py`, `/api/v1/whoami`, `/config`, `/signing-key` |
+| Log & proofs | `POST /upload`, `POST /verify`, `/tree-head/latest`, `/tree-head/:size`, `/proof/inclusion/:i`, `/proof/consistency/:old/:new`, `/leaves`, `POST /snapshot` |
+| Manifests | `/manifest/:hash`, `…/vex`, `POST …/vex/import`, `…/diff`, `POST …/revoke`, `/manifests/current`, `/namespaces/manifests` |
+| Findings | `/findings`, `POST …/findings/:key/triage`, `…/findings/:key/comments`, `…/findings/:key/reachability` (GET status, POST request) |
+| Search / blast radius | `/search/components`, `POST /search/reindex`, `/components/affected`, `/vulnerabilities/:id/affected` |
+| Signals | `/dtrack/sync`, `/reputation/{sync,status,components}`, `/freshness/{sync,status}`, `/malicious/{sync,status}` |
+| Settings (tenant toggles) | `/settings/{dtrack-sync,semver-version,reputation-sync,freshness,malicious-check,namespace-registration,license-policy,namespace-repos}`, `/compliance/{profiles,settings}` |
+| Namespaces | `/namespaces/hidden`, `/namespaces/registered` |
+| Admin | `/keys`, `/keys/:id/revoke`, `/tenants`, `DELETE /tenants/:id`, `POST /tenants/cache/clear`, `/audit-logs` |
+| Webhooks | `/webhooks`, `/webhooks/:id` (PATCH/DELETE), `…/test`, `…/deliveries` |
+
+(The `/api/v1` prefix is omitted after the first rows.) Handlers are in
+`crates/api/src/handlers.rs` (~5.6k lines). Search it by handler name.
+
+## The AI feature: `reach/` (CVE reachability evidence)
+
+Question it answers: *given this advisory and this exact commit, where does the code
+reference the symbols the advisory names?*
+
+| Stage | Kind | What it does |
+|---|---|---|
+| A | deterministic | Package presence from manifests and lock files, plus an identifier index. Zero evidence short-circuits with **no LLM call**. |
+| B | LLM | Advisory → ruleset (symbols, patterns, preconditions, optional `NestedCallPattern`). Schema-validated, one repair retry. **Grounding check:** a symbol not in the advisory text is dropped and counted. |
+| C | deterministic | Ranked occurrence search (prod > tests > comments), capped, with snippets. Tree-sitter widens snippets to function boundaries. |
+| D | LLM, per site | Ordinal label `likely_relevant / unclear / likely_irrelevant` plus a cited line. **Citation check:** the line must exist and lie inside the shown snippet. |
+| E | pure fn | `rubric.rs` turns the fired rules into a priority label plus a trace. |
+
+- Every stage degrades and records a StageOutcome. The only hard failure is being unable
+  to fetch the requested source. An inference outage produces a deterministic-only
+  report, never a 5xx.
+- `src/ai/mod.rs`: `ChatClient::{complete, complete_json, probe}`, `AiError` (all four
+  graded failure modes), `parse_lenient` / `extract_json_object`.
+- **Startup probe is fatal.** `main.rs` *awaits* a real json-mode test completion before
+  binding. On `unreachable`, `responded_with_error` or `responded_but_unusable`, the
+  process exits 1. The result is exposed at `GET /health` → `ai_probe`.
+- REST: `POST /api/v1/analyses` (`advisory_text`, `osv_id`, `package_name`, `ecosystem`,
+  `repo_url`, `commit` as full 40/64-hex *or* `ref` — a branch/tag resolved once at request
+  time via `src/fetcher/resolve.rs` and returned as `commit`), `GET /api/v1/analyses[/:id]`, `/health`,
+  `/openapi.json` (utoipa), `/docs` (Swagger UI). Auth uses one static bearer token,
+  `REACH_API_TOKEN`. If `repo_url` is omitted, only stage B runs. That is the declared
+  fallback feature: grounded advisory extraction.
+- Security: https/local-path allowlist (`GIT_ALLOW_PROTOCOL`), no leading `-`, no
+  userinfo, token via `GIT_CONFIG_*`, `core.symlinks=false`, exact commits only, repo
+  content never executed. Advisory text and code are fenced as data in prompts, with the
+  fence markers scrubbed.
+- Config (`src/config.rs`): `REACH_AI_{BASE_URL,MODEL,API_KEY,TIMEOUT_SECS,MAX_TOKENS,TEMPERATURE}`,
+  `REACH_API_TOKEN`, `REACH_SERVER_ADDR`, `REACH_DB_PATH`, `REACH_CACHE_{DIR,MB}`,
+  `REACH_MAX_{SITES,SCORED_SITES,REPO_MB,FILE_KB,ADVISORY_CHARS}`, `REACH_GIT_TOKEN`.
+  Reasoning models (deepseek-r1) need `REACH_AI_MAX_TOKENS` of 6000 or more.
+  `REACH_MAX_SCORED_SITES` is the main latency knob (one LLM call per site).
+- Eval: `cd reach && cargo run --bin eval` (full), `-- --baseline-only` (no LLM server;
+  also exercises degradation), `-- --case 06`. 12 cases cover nominal, package absent, no
+  symbols, ambiguous, injection via advisory, injection via code comment, malformed,
+  out of scope, advisory-only, lexical false positive, monorepo subpath and hallucination
+  bait. Metrics: extraction P/R/F1 vs. the heuristic baseline, priority accuracy, citation
+  pass rate, first-try structured-output rate, per-label precision, injection resistance
+  and latency. Forbidden-text checks search only **model-authored** text
+  (`model_authored_text()` in `src/bin/eval.rs`). Do not "simplify" that back into
+  searching the whole report.
+
+### AISE ↔ reach integration
+
+- The migration `20260830000003_reachability.sql` adds these:
+  - `namespace_repos`, which records where a namespace's *own* source lives. It is set
+    explicitly and never inferred from SBOM component URLs.
+  - `manifests.source_commit`, which the upload CLI sends only from a clean git tree.
+  - `finding_reachability`, which links a finding to an analysis. It is append-only in
+    practice.
+- AISE resolves the repo, commit and advisory text (the `dtrack_findings` description),
+  calls `ReachClient::create_analysis`, stores the id and proxies the report verbatim on
+  read. If reach is unreachable, it shows status `unavailable`.
+- Revision choice (`crates/api/src/reachability.rs::choose_revision`): the manifest's own
+  `source_commit` wins; otherwise the namespace mapping's `revision` is sent as `ref`
+  (`commit_source = namespace_revision`); with neither, the analysis is blocked.
+- Background loop `run_reachability_auto_loop` queues analyses for untriaged findings on
+  the current manifest of namespaces with `auto_analyze`, capped by
+  `REACHABILITY_AUTO_MAX_IN_FLIGHT`, audited as `system:reachability-auto`, and keeps the
+  `finding_reachability.status/priority` cache fresh for list badges.
+- UI: `ReachabilityPanel` (button, provenance line, "review help": advisory summary, things
+  to confirm, call sites linked to the forge at the analysed commit, false matches collapsed,
+  "How was this determined?" trace), `ReachabilityBadge` in the Findings list, and
+  `SourceRepoSettings` (revision + automatic toggle) in `App.tsx`.
+
+## Frontend
+
+- CRA app. `App.tsx` holds nearly all components as top-level functions. The main ones are
+  Dashboard, Upload, VerifyGateCheck, Leaves / NamespaceTree, SbomDetailPanel, Findings,
+  FindingTriageControls, FindingComments, ReachabilityPanel, ComponentSearch, Proofs
+  (InclusionCard / ConsistencyCard), Keys, Tenants / TenantSelector, Audit, Settings,
+  WebhooksSettings and ConnectionGate. Small extracted components live in
+  `src/components/`, and API key state lives in `src/context/ApiContext.tsx`.
+- `api.ts` holds typed fetch wrappers for every endpoint. Add new endpoints there.
+- The dev server runs on :4000 and proxies `/api` and `/health` to 127.0.0.1:3000.
+
+## Commands
+
+```sh
+# AISE backend
+cargo run --bin magnolia-server                 # needs DATABASE_URL; listens 127.0.0.1:3000
+cargo run -p magnolia-auth --example bootstrap_key   # mint BOOTSTRAP_SUPER_ADMIN_KEY
+cargo test --workspace                          # does NOT build reach/
+
+# reach (always from inside reach/)
+cd reach && cargo test && cargo clippy
+cd reach && cargo run                           # :3100; exits 1 if the LLM probe fails
+
+# frontend
+cd frontend && npm start
+cd frontend && npx tsc --noEmit && CI=true npx react-scripts build   # eslint warnings fail CI builds
+
+# full stack
+docker compose up --build
+docker compose --profile ollama up -d ollama && docker compose exec ollama ollama pull gemma3:4b
+docker compose -f docker-compose.yml -f docker-compose.dtrack.yml up -d
+
+# upload / CI gate
+MAGNOLIA_API_KEY=mag_… scripts/magnolia-upload.py            # reads ./Magnoliafile
+MAGNOLIA_API_KEY=mag_… scripts/magnolia-upload.py verify
+```
+
+Before calling work done, run `cargo test --workspace`, then `tsc`, then the `CI=true`
+build. If `reach/` changed, also run `cd reach && cargo test`.
+
+## Key env vars (api)
+
+`DATABASE_URL`, `SERVER_ADDR`, `SIGNING_KEY_PATH`, and `STORAGE_PATH`. If `STORAGE_PATH`
+is unset, SBOM bytes are kept in memory and lost on restart. Also:
+
+- `BOOTSTRAP_SUPER_ADMIN_KEY`, `BOOTSTRAP_TENANT_DOMAIN`, `BOOTSTRAP_TENANT_NAME`
+- `DEV_MODE`, which relaxes one RBAC check. Never enable it in prod.
+- `DTRACK_URL`, `DTRACK_API_KEY`, `DTRACK_API_KEY_FILE`
+- `*_SYNC_INTERVAL_SECS`, `WEBHOOK_DELIVERY_INTERVAL_SECS`, `SYNC_BURST_INTERVAL_SECS`
+- `REACHABILITY_AUTO_INTERVAL_SECS`, `REACHABILITY_AUTO_MAX_IN_FLIGHT`, `DISABLE_REACHABILITY_AUTO`
+- `DISABLE_MALICIOUS_PACKAGE_CHECK`, `DISABLE_REPUTATION_CHECK`
+- `AISE_REACH_BASE_URL`, `AISE_REACH_TOKEN`
+
+`.env.example` covers the compose deployment.
+
+## Gotchas
+
+- `reach/` is not a workspace member. Root `cargo test --workspace` never compiles it.
+- sqlx queries are **runtime-checked**. SQL errors only show up when the query runs, so
+  smoke-test new queries against a live DB. All queries belong in `crates/db/src/lib.rs`.
+- New per-tenant settings follow the pattern: migration → `set_tenant_*` in db → GET/POST
+  `/settings/…` → frontend switch.
+- New pure policy or compliance logic goes in `crates/core` with unit tests and no I/O
+  (see the `ComplianceProfile` trait in `compliance.rs`).
+- `/verify` and upload share their policy checks. Change them together.
+- Reachability refuses to run without `source_commit` and a `namespace_repos` mapping, by
+  design. Don't add a fallback to a branch head.
+- reach error paths must not echo raw panic payloads or repo contents. `worker.rs` runs
+  each job in its own task as a panic boundary.
+- In `lexer.rs`, use `str::get` or the `starts_with_at` helper, never `text[i..]` at byte
+  offsets. Multi-byte UTF-8 in source files caused a real panic there.
+- CLAUDE.md names the AI env vars `AISE_AI_*`, but the code uses **`REACH_AI_*`**, because
+  all LLM work lives in reach. There is no `crates/ai`.
+
+## Doc trust levels
+
+- **Current:** `CLAUDE.md`, `reach/README.md`, `reach/eval/README.md`, `.env.example`,
+  `docs/AI_DEVLOG.md`, `ROADMAP.md` (see its "Status log" section), `ARCHITECTURE.md`
+  (rewritten against the code on 2026-09-17), and the reach sections of `README.md`.
+- **Partly stale:** the rest of `README.md`. Its endpoint table lists only the original
+  subset of routes, and its "Design Philosophy" section still describes S3/WORM as if
+  implemented.
+- **Historical planning notes** (useful for intent only, not truth): `Features.md`,
+  `tech.md`, `DTRACK_PLAN.md`, `SUPPLY_CHAIN_SIGNALS_PLAN.md`, `SUPPLY_CHAIN_TODO.md`,
+  `VEX_TODO.md`, `IMPLEMENTATION_STATUS.md`.
+
+## Known gaps (course deliverables still open, as of 2026-09-17)
+
+- No OpenAPI document for the AISE API. Only reach has one.
+- No CI: `.github/workflows` is absent.
+- The full real-model eval run is incomplete. Rerun it against a Gemma-class local model,
+  and force-add a results file, since `eval/results/` is gitignored.
+- The reachability UI has not been visually verified.
+- Production items are not done: S3/Object Lock storage, KMS signer, Postgres RLS, rate
+  limiting, TLS termination (left to a reverse proxy).
+
+## Optional
+
+- [CLAUDE.md](CLAUDE.md): agent rules and course constraints
+- [reach/README.md](reach/README.md): analyser pipeline, security, degradation, limitations
+- [reach/eval/README.md](reach/eval/README.md): eval suite
+- [docs/AI_DEVLOG.md](docs/AI_DEVLOG.md): AI development episodes
+- [ROADMAP.md](ROADMAP.md): feature roadmap and status log
+- [README.md](README.md): setup, deployment, Dependency-Track integration
+- [ARCHITECTURE.md](ARCHITECTURE.md): crates, crypto, RBAC matrix, tables, upload flow, reach integration
+- [test-sboms/README.md](test-sboms/README.md): real-SBOM test fixtures

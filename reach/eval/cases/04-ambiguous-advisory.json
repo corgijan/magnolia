@@ -1,0 +1,20 @@
+{
+  "id": "04-ambiguous-advisory",
+  "category": "ambiguous",
+  "description": "The advisory names a symbol but is vague about the conditions. A good answer extracts the symbol and records the uncertainty in notes or preconditions rather than resolving it by guessing.",
+  "advisory_text": "Certain uses of `unsafeLoad` in fastyaml may be unsafe depending on how the application supplies input and which schema is configured. The maintainers were not able to reproduce the issue in all configurations. Consider reviewing call sites.",
+  "osv_id": "GHSA-TEST-0003",
+  "package_name": "fastyaml",
+  "ecosystem": "npm",
+  "fixture": "demo-app",
+  "expect": {
+    "symbols": [
+      "unsafeLoad"
+    ],
+    "priority_in": [
+      "direct_references",
+      "references_unclear"
+    ],
+    "expect_uncertainty_noted": true
+  }
+}

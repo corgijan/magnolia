@@ -7,6 +7,7 @@ use magnolia_db::Database;
 use magnolia_depsdev::DepsDevClient;
 use magnolia_dtrack::DtrackClient;
 use magnolia_osv::OsvClient;
+use magnolia_reachability::ReachClient;
 use magnolia_signer::Signer;
 use magnolia_storage::ObjectStore;
 use tokio::sync::Mutex;
@@ -53,6 +54,13 @@ pub struct AppState {
     /// `force_reputation_sync` can run an on-demand pass from a request
     /// handler.
     pub depsdev: Option<Arc<DepsDevClient>>,
+    /// `None` when `AISE_REACH_BASE_URL`/`AISE_REACH_TOKEN` were not both
+    /// set at startup — the CVE-reachability analyser is optional in exactly
+    /// the same presence-gated way as `dtrack`. Every reachability code path
+    /// must treat `None` as "the feature is off for this deployment", never
+    /// as an error: the "Analyze reachability" button explains itself as
+    /// unavailable and nothing else in the app changes.
+    pub reach: Option<Arc<ReachClient>>,
 }
 
 impl Clone for AppState {
@@ -69,6 +77,7 @@ impl Clone for AppState {
             dtrack_sync_interval_secs: self.dtrack_sync_interval_secs,
             osv: self.osv.clone(),
             depsdev: self.depsdev.clone(),
+            reach: self.reach.clone(),
         }
     }
 }

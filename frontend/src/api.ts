@@ -1,6 +1,97 @@
 // Typed client for the Magnolia API. In dev, requests go through the CRA
 // proxy (see "proxy" in package.json) to the server on 127.0.0.1:3000.
 
+// ---------- CVE reachability evidence ----------
+// The analyser (`reach/`) owns the report schema; these types mirror only
+// what the UI reads. Everything past `priority` is optional so a newer
+// analyser can add fields without breaking this build.
+
+export interface NamespaceRepo {
+  namespace: string;
+  repo_url: string;
+  subpath: string | null;
+  /** Default branch/tag/commit, used only for manifests uploaded without a
+   * source commit. Resolved to an exact commit when an analysis starts. */
+  revision: string | null;
+  /** Analyse this namespace's current untriaged findings in the background. */
+  auto_analyze: boolean;
+  /** Testing override: analyse `revision` even when the SBOM recorded its
+   * own commit. */
+  ignore_source_commit: boolean;
+  created_by: string;
+  updated_at: string;
+}
+
+/** One place in the source worth a human's attention. */
+export interface ReachabilitySite {
+  path: string;
+  line: number;
+  term: string;
+  snippet: string;
+  /** null when the model did not classify this occurrence — the location is
+   * still a real, deterministic finding. */
+  label: 'likely_relevant' | 'unclear' | 'likely_irrelevant' | null;
+  reasoning: string;
+  citation_verified: boolean;
+}
+
+export interface ReachabilityStage {
+  stage: string;
+  name: string;
+  status: 'ok' | 'degraded' | 'skipped' | 'failed';
+  detail: string;
+  duration_ms: number;
+}
+
+export interface ReachabilityReport {
+  /** Ordinal label naming which rules fired. NOT a probability. */
+  priority: string;
+  priority_description: string;
+  rubric_trace: string[];
+  ruleset?: {
+    vulnerable_symbols: string[];
+    affected_packages?: string[];
+    search_patterns: string[];
+    preconditions: string[];
+    affected_versions: string | null;
+    summary: string;
+    notes: string[];
+  } | null;
+  package_present: boolean | null;
+  package_evidence: string[];
+  sites: ReachabilitySite[];
+  stages: ReachabilityStage[];
+  counters: Record<string, number>;
+  disclaimer: string;
+  /** Canned report from the analyser's REACH_TEST_MODE — nothing was
+   * analysed. Absent on reports from older analysers. */
+  test_mode?: boolean;
+}
+
+export interface Reachability {
+  enabled: boolean;
+  /** Why an analysis cannot be run right now, phrased for the user. */
+  blocked_reason: string | null;
+  repo_url: string | null;
+  subpath: string | null;
+  commit: string | null;
+  /** 'manifest' = the commit the SBOM was built from; 'namespace_revision' =
+   * resolved from the namespace's default revision, which may differ;
+   * 'revision_override' = that revision was used *instead of* a commit the
+   * SBOM did record (the namespace's testing override). */
+  commit_source: 'manifest' | 'namespace_revision' | 'revision_override' | null;
+  /** The branch/tag the commit was (or will be) resolved from. */
+  revision: string | null;
+  /** Queued by the background loop rather than by a person. */
+  requested_automatically: boolean;
+  analysis_id: string | null;
+  status: string | null;
+  requested_by: string | null;
+  requested_at: string | null;
+  report: ReachabilityReport | null;
+  error: string | null;
+}
+
 export interface TreeHead {
   tree_size: number;
   root_hash: string;
@@ -233,6 +324,10 @@ export interface FindingWithContext extends VulnerabilityFinding {
   release_version: string;
   revoked: boolean;
   comment_count: number;
+  /** Cached state of the latest reachability analysis, if any. */
+  reachability_status: string | null;
+  /** Ordinal label once completed — NOT a probability. */
+  reachability_priority: string | null;
 }
 
 export interface ComponentSummary {
@@ -478,6 +573,7 @@ export interface BackendConfig {
   // ConfigJson.freshness_enabled doc comment.
   freshness_enabled: boolean;
   malicious_check_enabled: boolean;
+  reachability_enabled: boolean;
 }
 
 export interface ReputationSyncResult {
@@ -733,6 +829,60 @@ export const api = {
       body: JSON.stringify({ vex_status: vexStatus, justification, comment }),
     }),
 
+  /** Status + report for one finding's CVE-reachability analysis. */
+  findingReachability: (
+    manifestHash: string,
+    findingKey: string,
+    tenantId?: string
+  ): Promise<Reachability> =>
+    request(
+      `/api/v1/manifest/${manifestHash}/findings/${findingKey}/reachability${tenantQs(tenantId)}`
+    ),
+
+  /** Queues an analysis. Returns immediately; the analysis runs in the
+   * analyser's own worker, so the caller polls `findingReachability`. */
+  requestFindingReachability: (
+    manifestHash: string,
+    findingKey: string,
+    tenantId?: string
+  ): Promise<Reachability> =>
+    request(
+      `/api/v1/manifest/${manifestHash}/findings/${findingKey}/reachability${tenantQs(tenantId)}`,
+      { method: 'POST' }
+    ),
+
+  listNamespaceRepos: (tenantId?: string): Promise<NamespaceRepo[]> =>
+    request(`/api/v1/settings/namespace-repos${tenantQs(tenantId)}`),
+
+  setNamespaceRepo: (
+    repo: {
+      namespace: string;
+      repoUrl: string;
+      subpath?: string;
+      revision?: string;
+      autoAnalyze: boolean;
+      ignoreSourceCommit: boolean;
+    },
+    tenantId?: string
+  ): Promise<NamespaceRepo> =>
+    request(`/api/v1/settings/namespace-repos${tenantQs(tenantId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        namespace: repo.namespace,
+        repo_url: repo.repoUrl,
+        subpath: repo.subpath || null,
+        revision: repo.revision || null,
+        auto_analyze: repo.autoAnalyze,
+        ignore_source_commit: repo.ignoreSourceCommit,
+      }),
+    }),
+
+  deleteNamespaceRepo: (namespace: string, tenantId?: string): Promise<void> =>
+    request(`/api/v1/settings/namespace-repos${tenantQs(tenantId, { namespace })}`, {
+      method: 'DELETE',
+    }),
+
   manifestVex: (manifestHash: string, tenantId?: string): Promise<Record<string, unknown>> =>
     request(`/api/v1/manifest/${manifestHash}/vex${tenantQs(tenantId)}`),
 
@@ -767,6 +917,8 @@ export const api = {
       vexStatus?: string;
       currentOnly?: boolean;
       hideStale?: boolean;
+      /** Only findings whose namespace has a source repository mapped. */
+      knownSource?: boolean;
       limit?: number;
       offset?: number;
     },
@@ -780,6 +932,7 @@ export const api = {
     if (opts.vexStatus) extra.vex_status = opts.vexStatus;
     if (opts.currentOnly) extra.current_only = 'true';
     if (opts.hideStale) extra.hide_stale = 'true';
+    if (opts.knownSource) extra.known_source = 'true';
     if (opts.limit) extra.limit = opts.limit;
     if (opts.offset) extra.offset = opts.offset;
     return request(`/api/v1/findings${tenantQs(tenantId, extra)}`);

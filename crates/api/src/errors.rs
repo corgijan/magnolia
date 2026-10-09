@@ -9,6 +9,10 @@ pub enum ApiError {
     BadRequest(String),
     PayloadTooLarge(String),
     NotFound,
+    /// The request is well-formed but conflicts with the resource's current
+    /// state, and retrying it unchanged will conflict again — distinct from
+    /// `BadRequest`, which says the request itself was wrong.
+    Conflict(String),
     InternalError(String),
 }
 
@@ -20,6 +24,7 @@ impl std::fmt::Display for ApiError {
             ApiError::BadRequest(msg) => write!(f, "Bad request: {}", msg),
             ApiError::PayloadTooLarge(msg) => write!(f, "Payload too large: {}", msg),
             ApiError::NotFound => write!(f, "Not found"),
+            ApiError::Conflict(msg) => write!(f, "Conflict: {}", msg),
             ApiError::InternalError(msg) => write!(f, "Internal error: {}", msg),
         }
     }
@@ -33,6 +38,7 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string()),
+            ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg),
             ApiError::InternalError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
 

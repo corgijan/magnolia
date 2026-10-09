@@ -5,8 +5,9 @@ pub use models::{
     AffectedManifestRow, ApiKeyRecord, AuditLogRecord, ComplianceSettingRecord, ComponentFreshnessRecord,
     ComponentFreshnessStatus, ComponentIdentity,
     ComponentReputationRecord, DtrackFindingRecord, DtrackFindingWithContextRecord,
-    DtrackProjectRecord, DtrackPushFailureRecord, DueWebhookDelivery, FindingCommentRecord, ManifestRecord,
-    MaliciousCheckStatus, MaliciousFindingRecord, MerkleLeafRecord, MerkleNodeRecord, NewDtrackFinding,
+    DtrackProjectRecord, DtrackPushFailureRecord, DueWebhookDelivery, FindingCommentRecord,
+    FindingReachabilityRecord, ManifestRecord, NamespaceRepoRecord, ReachabilityCandidateRecord,
+    MaliciousCheckStatus, MaliciousFindingRecord, MerkleLeafRecord, MerkleNodeRecord, NewDtrackFinding, NewFindingReachability,
     ManifestVersionRow, NewMaliciousFinding, NewSbomComponent, RegisteredNamespaceRecord,
     ComponentReputationSummaryRow, ReputationStatus, SbomComponentRow, SbomComponentSearchRow,
     SignedTreeHeadRecord, TenantLicensePolicyRecord, TenantRecord, WebhookDeliveryRecord,
@@ -568,12 +569,14 @@ impl Database {
         document_type: Option<&str>,
         created_by: &str,
         created_at: chrono::DateTime<chrono::Utc>,
+        source_commit: Option<&str>,
     ) -> Result<(), DbError> {
         sqlx::query(
             r#"
             INSERT INTO manifests (manifest_hash, leaf_seq_id, tenant_id, version, sbom_hash, sbom_format,
-                                   sbom_s3_key, namespace, previous_manifest_hash, dsse_envelope, document_type, created_by, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                                   sbom_s3_key, namespace, previous_manifest_hash, dsse_envelope, document_type, created_by, created_at,
+                                   source_commit)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             "#,
         )
         .bind(manifest_hash)
@@ -589,11 +592,343 @@ impl Database {
         .bind(document_type)
         .bind(created_by)
         .bind(created_at)
+        .bind(source_commit)
         .execute(&self.pool)
         .await
         .map_err(|e| DbError::QueryError(e.to_string()))?;
 
         Ok(())
+    }
+
+    // ---- CVE reachability evidence -------------------------------------
+    // The AISE side of the `reach/` analyser. AISE stores where a
+    // namespace's source lives and which analysis answers which finding;
+    // the reports themselves live in the analyser's own database.
+
+    /// Upserts a namespace's repository mapping. Same shape as the other
+    /// tenant settings: one row per (tenant, namespace), last write wins,
+    /// and the writer is recorded.
+    pub async fn set_namespace_repo(
+        &self,
+        tenant_id: Uuid,
+        namespace: &str,
+        repo_url: &str,
+        subpath: Option<&str>,
+        revision: Option<&str>,
+        auto_analyze: bool,
+        ignore_source_commit: bool,
+        created_by: &str,
+    ) -> Result<NamespaceRepoRecord, DbError> {
+        sqlx::query_as::<_, NamespaceRepoRecord>(
+            r#"
+            INSERT INTO namespace_repos
+                (tenant_id, namespace, repo_url, subpath, revision, auto_analyze, ignore_source_commit, created_by)
+            VALUES ($1, $2, $3, $4, $5, $6, $8, $7)
+            ON CONFLICT (tenant_id, namespace) DO UPDATE
+                SET repo_url = EXCLUDED.repo_url,
+                    subpath = EXCLUDED.subpath,
+                    revision = EXCLUDED.revision,
+                    auto_analyze = EXCLUDED.auto_analyze,
+                    ignore_source_commit = EXCLUDED.ignore_source_commit,
+                    created_by = EXCLUDED.created_by,
+                    updated_at = now()
+            RETURNING tenant_id, namespace, repo_url, subpath, revision, auto_analyze, ignore_source_commit, created_by, created_at, updated_at
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(namespace)
+        .bind(repo_url)
+        .bind(subpath)
+        .bind(revision)
+        .bind(auto_analyze)
+        .bind(created_by)
+        .bind(ignore_source_commit)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// The upload path's version of [`Self::set_namespace_repo`]: records
+    /// a repository declared in an upload's Magnoliafile, but never
+    /// overwrites a mapping an admin saved in Settings — only rows whose
+    /// `created_by` carries the Magnoliafile prefix are updated. `None`
+    /// means an admin-set mapping was kept. `auto_analyze` and
+    /// `ignore_source_commit` are left as they are on update (off on
+    /// insert): both stay Settings decisions.
+    pub async fn set_namespace_repo_from_upload(
+        &self,
+        tenant_id: Uuid,
+        namespace: &str,
+        repo_url: &str,
+        subpath: Option<&str>,
+        revision: Option<&str>,
+        created_by: &str,
+    ) -> Result<Option<NamespaceRepoRecord>, DbError> {
+        sqlx::query_as::<_, NamespaceRepoRecord>(
+            r#"
+            INSERT INTO namespace_repos
+                (tenant_id, namespace, repo_url, subpath, revision, auto_analyze, created_by)
+            VALUES ($1, $2, $3, $4, $5, FALSE, $6)
+            ON CONFLICT (tenant_id, namespace) DO UPDATE
+                SET repo_url = EXCLUDED.repo_url,
+                    subpath = EXCLUDED.subpath,
+                    revision = EXCLUDED.revision,
+                    created_by = EXCLUDED.created_by,
+                    updated_at = now()
+                WHERE starts_with(namespace_repos.created_by, 'magnoliafile:')
+            RETURNING tenant_id, namespace, repo_url, subpath, revision, auto_analyze, ignore_source_commit, created_by, created_at, updated_at
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(namespace)
+        .bind(repo_url)
+        .bind(subpath)
+        .bind(revision)
+        .bind(created_by)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    pub async fn get_namespace_repo(
+        &self,
+        tenant_id: Uuid,
+        namespace: &str,
+    ) -> Result<Option<NamespaceRepoRecord>, DbError> {
+        sqlx::query_as::<_, NamespaceRepoRecord>(
+            r#"
+            SELECT tenant_id, namespace, repo_url, subpath, revision, auto_analyze, ignore_source_commit, created_by, created_at, updated_at
+            FROM namespace_repos
+            WHERE tenant_id = $1 AND namespace = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(namespace)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DbError::QueryError(e.to_string()))
+    }
+
+    pub async fn list_namespace_repos(
+        &self,
+        tenant_id: Uuid,
+    ) -> Result<Vec<NamespaceRepoRecord>, DbError> {
+        sqlx::query_as::<_, NamespaceRepoRecord>(
+            r#"
+            SELECT tenant_id, namespace, repo_url, subpath, revision, auto_analyze, ignore_source_commit, created_by, created_at, updated_at
+            FROM namespace_repos
+            WHERE tenant_id = $1
+            ORDER BY namespace
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbError::QueryError(e.to_string()))
+    }
+
+    /// Returns true when a mapping was actually removed.
+    pub async fn delete_namespace_repo(
+        &self,
+        tenant_id: Uuid,
+        namespace: &str,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "DELETE FROM namespace_repos WHERE tenant_id = $1 AND namespace = $2",
+        )
+        .bind(tenant_id)
+        .bind(namespace)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DbError::QueryError(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Records that `analysis_id` was requested for this finding. Inserting
+    /// rather than upserting is deliberate: a re-run against a newer commit
+    /// is a new analysis, and the previous row stays as the record of what
+    /// was true then.
+    pub async fn record_finding_reachability(
+        &self,
+        link: NewFindingReachability<'_>,
+    ) -> Result<FindingReachabilityRecord, DbError> {
+        sqlx::query_as::<_, FindingReachabilityRecord>(
+            r#"
+            INSERT INTO finding_reachability
+                (manifest_hash, finding_key, analysis_id, repo_url, commit_sha, subpath,
+                 requested_by, commit_source, requested_ref, status, status_checked_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'queued', now())
+            RETURNING id, manifest_hash, finding_key, analysis_id, repo_url, commit_sha, subpath,
+                   requested_by, created_at, commit_source, requested_ref, status, priority,
+                   status_checked_at, report_json, report_stored_at
+            "#,
+        )
+        .bind(link.manifest_hash)
+        .bind(link.finding_key)
+        .bind(link.analysis_id)
+        .bind(link.repo_url)
+        .bind(link.commit_sha)
+        .bind(link.subpath)
+        .bind(link.requested_by)
+        .bind(link.commit_source)
+        .bind(link.requested_ref)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// The analysis the UI should show for a finding: the most recent one.
+    pub async fn latest_finding_reachability(
+        &self,
+        manifest_hash: &str,
+        finding_key: &str,
+    ) -> Result<Option<FindingReachabilityRecord>, DbError> {
+        sqlx::query_as::<_, FindingReachabilityRecord>(
+            r#"
+            SELECT id, manifest_hash, finding_key, analysis_id, repo_url, commit_sha, subpath,
+                   requested_by, created_at, commit_source, requested_ref, status, priority,
+                   status_checked_at, report_json, report_stored_at
+            FROM finding_reachability
+            WHERE manifest_hash = $1 AND finding_key = $2
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(manifest_hash)
+        .bind(finding_key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DbError::QueryError(e.to_string()))
+    }
+
+    /// Caches the analyser's latest answer for one analysis. Only ever
+    /// moves forward in time; the analyser remains the source of truth.
+    /// `report` archives the analyser's answer alongside the status. Pass
+    /// `None` whenever there is nothing new to archive (still in flight, the
+    /// analyser was unreachable): `COALESCE` means an absent report never
+    /// erases one already stored, so a later poll against a reset analyser
+    /// cannot destroy the evidence a human already saw.
+    pub async fn update_finding_reachability_status(
+        &self,
+        analysis_id: Uuid,
+        status: &str,
+        priority: Option<&str>,
+        report: Option<&serde_json::Value>,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            r#"
+            UPDATE finding_reachability
+               SET status = $2,
+                   priority = COALESCE($3, priority),
+                   status_checked_at = now(),
+                   report_json = COALESCE($4, report_json),
+                   report_stored_at = CASE
+                       WHEN $4 IS NOT NULL THEN now()
+                       ELSE report_stored_at
+                   END
+             WHERE analysis_id = $1
+            "#,
+        )
+        .bind(analysis_id)
+        .bind(status)
+        .bind(priority)
+        .bind(report)
+        .execute(&self.pool)
+        .await
+        .map_err(map_query_error)?;
+        Ok(())
+    }
+
+    /// Analyses whose cached status is not terminal (or was never cached),
+    /// least-recently-checked first, so a large backlog is polled fairly.
+    pub async fn list_pending_finding_reachability(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<FindingReachabilityRecord>, DbError> {
+        sqlx::query_as::<_, FindingReachabilityRecord>(
+            r#"
+            SELECT id, manifest_hash, finding_key, analysis_id, repo_url, commit_sha, subpath,
+                   requested_by, created_at, commit_source, requested_ref, status, priority,
+                   status_checked_at, report_json, report_stored_at
+            FROM finding_reachability
+            WHERE status IS NULL OR status IN ('queued', 'running')
+            ORDER BY status_checked_at NULLS FIRST, created_at
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// How many analyses are still queued or running on the analyser, as far
+    /// as the cache knows. Rows older than `since` are ignored, so an
+    /// analysis the analyser silently lost (its database reset) cannot block
+    /// background scheduling forever.
+    pub async fn count_in_flight_finding_reachability(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<i64, DbError> {
+        sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT count(*)
+            FROM finding_reachability
+            WHERE status IN ('queued', 'running') AND created_at > $1
+            "#,
+        )
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
+    /// Findings the background loop should analyse next: untriaged, with
+    /// advisory text, on each opted-in namespace's current (newest
+    /// non-revoked) manifest, with some revision to analyse, and never
+    /// analysed before. Most severe first. Deployment-wide by design — the
+    /// loop runs once for all tenants, and every row carries its tenant.
+    pub async fn list_reachability_candidates(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<ReachabilityCandidateRecord>, DbError> {
+        sqlx::query_as::<_, ReachabilityCandidateRecord>(
+            r#"
+            SELECT m.tenant_id, df.manifest_hash, df.finding_key
+            FROM dtrack_findings df
+            JOIN manifests m ON m.manifest_hash = df.manifest_hash
+            JOIN namespace_repos nr
+              ON nr.tenant_id = m.tenant_id AND nr.namespace = m.namespace
+            WHERE nr.auto_analyze = TRUE
+              AND df.vex_status IS NULL
+              AND df.description IS NOT NULL AND btrim(df.description) <> ''
+              AND (m.source_commit IS NOT NULL OR nr.revision IS NOT NULL)
+              AND m.manifest_hash IN (
+                SELECT DISTINCT ON (tenant_id, namespace) manifest_hash
+                FROM manifests
+                WHERE revoked = FALSE AND document_type IS NULL
+                ORDER BY tenant_id, namespace, created_at DESC, leaf_seq_id DESC
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM finding_reachability fr
+                WHERE fr.manifest_hash = df.manifest_hash AND fr.finding_key = df.finding_key
+              )
+            ORDER BY
+              CASE upper(df.severity)
+                WHEN 'CRITICAL' THEN 0
+                WHEN 'HIGH' THEN 1
+                WHEN 'MEDIUM' THEN 2
+                WHEN 'LOW' THEN 3
+                ELSE 4
+              END,
+              df.synced_at
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)
     }
 
     pub async fn get_manifest(
@@ -604,7 +939,7 @@ impl Database {
             r#"
             SELECT manifest_hash, leaf_seq_id, tenant_id, version, sbom_hash, sbom_format,
                    sbom_s3_key, namespace, previous_manifest_hash, signature, dsse_envelope, document_type, created_by, created_at,
-                   revoked, revoked_at, revoked_by
+                   revoked, revoked_at, revoked_by, source_commit
             FROM manifests
             WHERE manifest_hash = $1
             "#,
@@ -623,7 +958,7 @@ impl Database {
             r#"
             SELECT manifest_hash, leaf_seq_id, tenant_id, version, sbom_hash, sbom_format,
                    sbom_s3_key, namespace, previous_manifest_hash, signature, dsse_envelope, document_type, created_by, created_at,
-                   revoked, revoked_at, revoked_by
+                   revoked, revoked_at, revoked_by, source_commit
             FROM manifests
             WHERE tenant_id = $1
             ORDER BY created_at DESC, leaf_seq_id DESC
@@ -654,7 +989,7 @@ impl Database {
             r#"
             SELECT manifest_hash, leaf_seq_id, tenant_id, version, sbom_hash, sbom_format,
                    sbom_s3_key, namespace, previous_manifest_hash, signature, dsse_envelope, document_type, created_by, created_at,
-                   revoked, revoked_at, revoked_by
+                   revoked, revoked_at, revoked_by, source_commit
             FROM manifests
             WHERE tenant_id = $1
               AND namespace = $2
@@ -713,7 +1048,7 @@ impl Database {
             SELECT DISTINCT ON (namespace)
                    manifest_hash, leaf_seq_id, tenant_id, version, sbom_hash, sbom_format,
                    sbom_s3_key, namespace, previous_manifest_hash, signature, dsse_envelope, document_type, created_by, created_at,
-                   revoked, revoked_at, revoked_by
+                   revoked, revoked_at, revoked_by, source_commit
             FROM manifests
             WHERE tenant_id = $1
               AND revoked = FALSE
@@ -752,7 +1087,7 @@ impl Database {
             r#"
             SELECT manifest_hash, leaf_seq_id, tenant_id, version, sbom_hash, sbom_format,
                    sbom_s3_key, namespace, previous_manifest_hash, signature, dsse_envelope, document_type, created_by, created_at,
-                   revoked, revoked_at, revoked_by
+                   revoked, revoked_at, revoked_by, source_commit
             FROM manifests
             WHERE tenant_id = $1
               AND ($2 = '/' OR namespace = $2 OR starts_with(namespace, $2 || '/'))
@@ -1890,7 +2225,7 @@ impl Database {
             r#"
             SELECT manifest_hash, leaf_seq_id, tenant_id, version, sbom_hash, sbom_format,
                    sbom_s3_key, namespace, previous_manifest_hash, signature, dsse_envelope, document_type, created_by, created_at,
-                   revoked, revoked_at, revoked_by
+                   revoked, revoked_at, revoked_by, source_commit
             FROM manifests
             WHERE tenant_id = $1
               AND document_type IS NULL
@@ -1951,7 +2286,7 @@ impl Database {
             r#"
             SELECT m.manifest_hash, m.leaf_seq_id, m.tenant_id, m.version, m.sbom_hash, m.sbom_format,
                    m.sbom_s3_key, m.namespace, m.previous_manifest_hash, m.signature, m.dsse_envelope, m.document_type, m.created_by, m.created_at,
-                   m.revoked, m.revoked_at, m.revoked_by
+                   m.revoked, m.revoked_at, m.revoked_by, m.source_commit
             FROM manifests m
             JOIN tenants t ON t.id = m.tenant_id
             WHERE m.sbom_format = 'cyclonedx'
@@ -2179,6 +2514,39 @@ impl Database {
         .map_err(map_query_error)
     }
 
+    /// One cached finding by its key.
+    ///
+    /// Exists because the reachability paths want exactly one finding and
+    /// used to get it by calling [`Self::list_dtrack_findings`] and running
+    /// `.find()` over the result in Rust. That is fine for a manifest with a
+    /// handful of findings and wasteful for one with hundreds — and the
+    /// reachability status endpoint is polled every few seconds while an
+    /// analysis runs, so it was the hottest read in the feature.
+    ///
+    /// Performs no authorization: `manifest_hash` must already have been
+    /// established as belonging to the caller's tenant and namespace scope.
+    pub async fn get_dtrack_finding(
+        &self,
+        manifest_hash: &str,
+        finding_key: &str,
+    ) -> Result<Option<DtrackFindingRecord>, DbError> {
+        sqlx::query_as::<_, DtrackFindingRecord>(
+            r#"
+            SELECT manifest_hash, finding_key, component_name, component_version,
+                   vulnerability_id, severity, description, analysis_state, synced_at,
+                   vex_status, vex_justification, vex_comment, triaged_by, triaged_at,
+                   component_uuid, vulnerability_uuid, triage_source
+            FROM dtrack_findings
+            WHERE manifest_hash = $1 AND finding_key = $2
+            "#,
+        )
+        .bind(manifest_hash)
+        .bind(finding_key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_query_error)
+    }
+
     /// Every cached finding across the tenant's archive (within
     /// `namespace_scope`), for the standalone Findings tab — unlike
     /// `list_dtrack_findings` above, which is always scoped to one
@@ -2220,6 +2588,11 @@ impl Database {
         // reusing it, since the two intentionally differ by exactly that
         // one clause.
         hide_stale: bool,
+        // When true, only findings whose namespace has a source repository
+        // mapped (`namespace_repos`) — the ones a reachability analysis can
+        // actually run on. Exact namespace match, same as
+        // `get_namespace_repo`, so the filter and the button never disagree.
+        known_source_only: bool,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<DtrackFindingWithContextRecord>, DbError> {
@@ -2230,9 +2603,17 @@ impl Database {
                    df.vex_status, df.vex_justification, df.vex_comment, df.triaged_by, df.triaged_at,
                    df.triage_source, m.namespace, m.version AS release_version, m.revoked,
                    (SELECT count(*) FROM finding_comments fc
-                    WHERE fc.manifest_hash = df.manifest_hash AND fc.finding_key = df.finding_key) AS comment_count
+                    WHERE fc.manifest_hash = df.manifest_hash AND fc.finding_key = df.finding_key) AS comment_count,
+                   lr.status AS reachability_status, lr.priority AS reachability_priority
             FROM dtrack_findings df
             JOIN manifests m ON m.manifest_hash = df.manifest_hash
+            LEFT JOIN LATERAL (
+              SELECT fr.status, fr.priority
+              FROM finding_reachability fr
+              WHERE fr.manifest_hash = df.manifest_hash AND fr.finding_key = df.finding_key
+              ORDER BY fr.created_at DESC
+              LIMIT 1
+            ) lr ON TRUE
             WHERE m.tenant_id = $1
               AND ($2 = '/' OR m.namespace = $2 OR starts_with(m.namespace, $2 || '/'))
               -- $3 accepts a comma-separated list (e.g. "CRITICAL,HIGH" for
@@ -2273,6 +2654,13 @@ impl Database {
                   ORDER BY namespace, created_at DESC, leaf_seq_id DESC
                 )
               )
+              AND (
+                $12::bool IS NOT TRUE
+                OR EXISTS (
+                  SELECT 1 FROM namespace_repos nr
+                  WHERE nr.tenant_id = m.tenant_id AND nr.namespace = m.namespace
+                )
+              )
             ORDER BY
               CASE upper(df.severity)
                 WHEN 'CRITICAL' THEN 0
@@ -2297,6 +2685,7 @@ impl Database {
         .bind(vex_status_filter)
         .bind(current_only)
         .bind(hide_stale)
+        .bind(known_source_only)
         .fetch_all(&self.pool)
         .await
         .map_err(map_query_error)

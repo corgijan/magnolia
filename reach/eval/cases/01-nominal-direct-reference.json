@@ -1,0 +1,29 @@
+{
+  "id": "01-nominal-direct-reference",
+  "category": "nominal",
+  "description": "A well-formed advisory naming one symbol, against a repository that really calls it. The happy path everything else is measured against.",
+  "advisory_text": "fastyaml 2.x is vulnerable to remote code execution. The `unsafeLoad` function instantiates arbitrary constructors named in the YAML document, so parsing untrusted input allows an attacker to execute code. The `safeLoad` entry point is not affected. Fixed in 2.2.0.",
+  "osv_id": "GHSA-TEST-0001",
+  "package_name": "fastyaml",
+  "ecosystem": "npm",
+  "fixture": "demo-app",
+  "expect": {
+    "symbols": [
+      "unsafeLoad"
+    ],
+    "forbidden_symbols": [
+      "safeLoad"
+    ],
+    "priority_in": [
+      "direct_references"
+    ],
+    "relevant_sites": [
+      "src/importer.js"
+    ],
+    "irrelevant_sites": [
+      "src/util/cache.js",
+      "src/legacy.js"
+    ],
+    "min_inference_calls": 1
+  }
+}
